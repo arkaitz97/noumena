@@ -1,75 +1,186 @@
 <script setup lang="ts">
-import { ref } from 'vue'
-import { RouterView, RouterLink, useRoute } from 'vue-router'
+import { computed, onBeforeUnmount, ref } from 'vue'
+import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
+import {
+  LayoutDashboard,
+  Bookmark,
+  Tv,
+  CreditCard,
+  UserCircle,
+  Settings,
+  LogOut,
+  Users,
+  ChevronDown,
+} from 'lucide-vue-next'
+import { useAuthStore } from '../../stores/auth'
 
-const quotaExceeded = ref(true) // true for demo purposes
 const route = useRoute()
+const router = useRouter()
+const auth = useAuthStore()
 
-const isCurrent = (path: string) => {
-  return route.path.startsWith(path) && (path !== '/dashboard' || route.path === '/dashboard')
+const navItems = [
+  { to: '/dashboard', label: 'Insights Feed', icon: LayoutDashboard, exact: true },
+  { to: '/dashboard/saved', label: 'Saved Comments', icon: Bookmark },
+  { to: '/settings/channels', label: 'Channels', icon: Tv },
+  { to: '/settings/billing', label: 'Billing', icon: CreditCard },
+  { to: '/settings/account', label: 'Account', icon: UserCircle },
+]
+
+function isActive(to: string, exact: boolean | undefined): boolean {
+  if (exact) return route.path === to
+  return route.path === to || route.path.startsWith(to + '/')
+}
+
+// User menu
+const menuOpen = ref(false)
+const menuRef = ref<HTMLElement | null>(null)
+
+function toggleMenu() {
+  menuOpen.value = !menuOpen.value
+}
+
+function closeMenuOnOutside(event: MouseEvent) {
+  if (!menuRef.value) return
+  if (!menuRef.value.contains(event.target as Node)) menuOpen.value = false
+}
+
+document.addEventListener('click', closeMenuOnOutside)
+onBeforeUnmount(() => document.removeEventListener('click', closeMenuOnOutside))
+
+const userInitial = computed(() => (auth.user?.email || '?').slice(0, 1).toUpperCase())
+
+async function handleLogout() {
+  menuOpen.value = false
+  await auth.logout()
+  router.push('/login')
+}
+
+async function handleLogoutAll() {
+  menuOpen.value = false
+  await auth.logoutAll()
+  router.push('/login')
 }
 </script>
 
 <template>
-  <div class="min-h-screen bg-zinc-50 flex flex-col font-sans selection:bg-indigo-100 selection:text-indigo-900">
-    <!-- Optional Quota Banner with premium styling -->
-    <div v-if="quotaExceeded" class="bg-gradient-to-r from-red-600 to-rose-600 shadow-sm">
-      <div class="max-w-7xl mx-auto py-2.5 px-4 sm:px-6 lg:px-8">
-        <div class="flex items-center justify-between flex-wrap gap-2">
-          <div class="w-0 flex-1 flex items-center">
-            <span class="flex p-1.5 rounded-lg bg-white/20 backdrop-blur-sm">
-              <svg class="h-5 w-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
-            </span>
-            <p class="ml-3 font-medium text-white truncate text-sm">
-              <span class="md:hidden">Quota exceeded!</span>
-              <span class="hidden md:inline">You've reached your monthly AI processing limit. Upgrade your plan to keep receiving insights.</span>
-            </p>
+  <div class="min-h-screen bg-zinc-50 flex">
+    <!-- Sidebar -->
+    <aside class="hidden lg:flex flex-col w-64 bg-white border-r border-zinc-200 sticky top-0 h-screen">
+      <div class="px-6 py-5 border-b border-zinc-100">
+        <RouterLink to="/dashboard" class="flex items-center gap-2 group">
+          <div class="w-8 h-8 rounded-lg bg-zinc-900 flex items-center justify-center shadow-md group-hover:scale-105 transition-transform">
+            <svg class="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+            </svg>
           </div>
-          <div class="order-3 mt-2 flex-shrink-0 w-full sm:order-2 sm:mt-0 sm:w-auto">
-            <RouterLink to="/settings/billing" class="flex items-center justify-center px-4 py-1.5 border border-transparent rounded-full shadow-sm text-xs font-semibold text-red-600 bg-white hover:bg-red-50 focus:ring-2 focus:ring-white focus:ring-offset-2 focus:ring-offset-red-600 transition-colors">
-              Upgrade Plan
-            </RouterLink>
-          </div>
-        </div>
+          <span class="font-bold text-lg tracking-tight text-zinc-900">Noumena</span>
+        </RouterLink>
       </div>
-    </div>
 
-    <!-- Premium Navigation -->
-    <nav class="bg-white/80 backdrop-blur-md border-b border-zinc-200 sticky top-0 z-40">
-      <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div class="flex justify-between h-16">
-          <div class="flex items-center gap-8">
-            <!-- Brand -->
-            <RouterLink to="/dashboard" class="flex-shrink-0 flex items-center gap-2 group">
-              <div class="w-8 h-8 rounded-lg bg-zinc-900 flex items-center justify-center shadow-md group-hover:scale-105 transition-transform duration-200">
-                <svg class="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
-                </svg>
-              </div>
-              <span class="font-bold text-lg tracking-tight text-zinc-900">Noumena</span>
-            </RouterLink>
-            
-            <!-- Links -->
-            <div class="hidden sm:flex sm:items-baseline space-x-1">
-              <RouterLink to="/dashboard" :class="[isCurrent('/dashboard') && route.path === '/dashboard' ? 'bg-zinc-100 text-zinc-900' : 'text-zinc-600 hover:text-zinc-900 hover:bg-zinc-50', 'px-3 py-2 rounded-lg text-sm font-medium transition-colors']">Dashboard</RouterLink>
-              <RouterLink to="/dashboard/saved" :class="[isCurrent('/dashboard/saved') ? 'bg-zinc-100 text-zinc-900' : 'text-zinc-600 hover:text-zinc-900 hover:bg-zinc-50', 'px-3 py-2 rounded-lg text-sm font-medium transition-colors']">Saved</RouterLink>
-              <RouterLink to="/settings/channels" :class="[isCurrent('/settings') ? 'bg-zinc-100 text-zinc-900' : 'text-zinc-600 hover:text-zinc-900 hover:bg-zinc-50', 'px-3 py-2 rounded-lg text-sm font-medium transition-colors']">Settings</RouterLink>
+      <nav class="flex-1 px-3 py-4 space-y-1">
+        <RouterLink
+          v-for="item in navItems"
+          :key="item.to"
+          :to="item.to"
+          :class="[
+            isActive(item.to, item.exact)
+              ? 'bg-zinc-100 text-zinc-900'
+              : 'text-zinc-600 hover:text-zinc-900 hover:bg-zinc-50',
+            'flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors',
+          ]"
+        >
+          <component :is="item.icon" class="w-4 h-4" />
+          {{ item.label }}
+        </RouterLink>
+      </nav>
+
+      <div class="px-6 py-4 border-t border-zinc-100 text-xs text-zinc-400">
+        © {{ new Date().getFullYear() }} Noumena
+      </div>
+    </aside>
+
+    <!-- Main column -->
+    <div class="flex-1 flex flex-col min-w-0">
+      <!-- Top bar -->
+      <header class="bg-white/80 backdrop-blur-md border-b border-zinc-200 sticky top-0 z-30">
+        <div class="px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+          <!-- Mobile brand -->
+          <RouterLink to="/dashboard" class="lg:hidden flex items-center gap-2">
+            <div class="w-7 h-7 rounded-lg bg-zinc-900 flex items-center justify-center">
+              <svg class="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+              </svg>
             </div>
-          </div>
-          
-          <!-- User Profile / Avatar Mock -->
-          <div class="flex items-center">
-            <button class="flex items-center justify-center h-8 w-8 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-500 text-white font-medium text-sm focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:ring-offset-2 ring-offset-white border border-white shadow-sm">
-              JD
+            <span class="font-bold tracking-tight text-zinc-900">Noumena</span>
+          </RouterLink>
+          <span class="hidden lg:block"></span>
+
+          <div ref="menuRef" class="relative">
+            <button
+              @click.stop="toggleMenu"
+              class="flex items-center gap-2 pl-2 pr-3 py-1.5 rounded-full border border-zinc-200 hover:border-zinc-300 hover:bg-zinc-50 transition-colors"
+              :aria-expanded="menuOpen"
+            >
+              <span class="h-7 w-7 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-500 text-white font-semibold text-xs flex items-center justify-center">
+                {{ userInitial }}
+              </span>
+              <span class="hidden sm:inline text-sm font-medium text-zinc-700 max-w-[12rem] truncate">
+                {{ auth.user?.email || 'Account' }}
+              </span>
+              <ChevronDown class="w-4 h-4 text-zinc-500" />
             </button>
+
+            <transition name="menu">
+              <div
+                v-if="menuOpen"
+                class="absolute right-0 mt-2 w-64 bg-white shadow-lg ring-1 ring-zinc-950/5 rounded-2xl py-2 origin-top-right"
+              >
+                <div class="px-4 py-3 border-b border-zinc-100">
+                  <p class="text-xs font-medium text-zinc-500">Signed in as</p>
+                  <p class="text-sm font-semibold text-zinc-900 truncate">{{ auth.user?.email || '—' }}</p>
+                </div>
+                <div class="py-1">
+                  <RouterLink
+                    to="/settings/account"
+                    @click="menuOpen = false"
+                    class="flex items-center gap-2 px-4 py-2 text-sm text-zinc-700 hover:bg-zinc-50"
+                  >
+                    <Settings class="w-4 h-4" /> Settings
+                  </RouterLink>
+                  <button
+                    @click="handleLogout"
+                    class="w-full text-left flex items-center gap-2 px-4 py-2 text-sm text-zinc-700 hover:bg-zinc-50"
+                  >
+                    <LogOut class="w-4 h-4" /> Log out
+                  </button>
+                  <button
+                    @click="handleLogoutAll"
+                    class="w-full text-left flex items-center gap-2 px-4 py-2 text-sm text-rose-600 hover:bg-rose-50"
+                  >
+                    <Users class="w-4 h-4" /> Log out of all devices
+                  </button>
+                </div>
+              </div>
+            </transition>
           </div>
         </div>
-      </div>
-    </nav>
+      </header>
 
-    <!-- Main Content Area -->
-    <main class="flex-1 w-full mx-auto relative">
-      <RouterView />
-    </main>
+      <main class="flex-1">
+        <RouterView />
+      </main>
+    </div>
   </div>
 </template>
+
+<style scoped>
+.menu-enter-active,
+.menu-leave-active {
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+.menu-enter-from,
+.menu-leave-to {
+  opacity: 0;
+  transform: translateY(-4px) scale(0.98);
+}
+</style>

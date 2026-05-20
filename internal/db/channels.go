@@ -52,7 +52,7 @@ func (q *PostgresQuery) ConnectChannelTx(ctx context.Context, userID, platform, 
 		return err
 	}
 
-	// Upsert user_channel_tracking
+	// Upsert user_channel_tracking (legacy path — does not manage token_priority)
 	queryUCT := `
 		INSERT INTO user_channel_tracking (user_id, platform_channel_id, access_token_enc, refresh_token_enc, token_expires_at, tracking_status)
 		VALUES ($1, $2, $3, $4, $5, 'active')
@@ -60,7 +60,8 @@ func (q *PostgresQuery) ConnectChannelTx(ctx context.Context, userID, platform, 
 			access_token_enc = EXCLUDED.access_token_enc,
 			refresh_token_enc = EXCLUDED.refresh_token_enc,
 			token_expires_at = EXCLUDED.token_expires_at,
-			tracking_status = 'active'
+			tracking_status = 'active',
+			token_expiry_notified_at = NULL
 	`
 	_, err = tx.Exec(ctx, queryUCT, userID, pcID, accessTokenEnc, refreshTokenEnc, tokenExpiresAt)
 	if err != nil {
@@ -81,7 +82,7 @@ func (q *PostgresQuery) PauseChannelTracking(ctx context.Context, userID, pcID s
 }
 
 func (q *PostgresQuery) RemoveChannelTracking(ctx context.Context, userID, pcID string) error {
-	// PRD says to delete the user_channel_tracking row completely.
+	// Legacy helper retained for tests; new code should use DeleteTracking.
 	query := `
 		DELETE FROM user_channel_tracking
 		WHERE user_id = $1 AND platform_channel_id = $2

@@ -1,22 +1,56 @@
 <script setup lang="ts">
-import { ref } from 'vue'
-import { RouterLink } from 'vue-router'
+import { computed, onMounted, ref } from 'vue'
+import { useRoute, useRouter, RouterLink } from 'vue-router'
+import { useAuthStore } from '../../stores/auth'
+import { toast } from '../../lib/toast'
+import SecondaryButton from '../../components/forms/SecondaryButton.vue'
 
-const email = ref('alex@example.com') // In a real app, read from auth store
+const route = useRoute()
+const router = useRouter()
+const auth = useAuthStore()
+
+type Phase = 'idle' | 'verifying' | 'success' | 'invalid'
+const phase = ref<Phase>('idle')
 const resending = ref(false)
-const resent = ref(false)
+const resendError = ref<string | null>(null)
+const resentAt = ref<number | null>(null)
 
-const resendEmail = async () => {
+const userEmail = computed(() => auth.user?.email || 'your inbox')
+
+onMounted(async () => {
+  const token = (route.query.token as string | undefined) || ''
+  if (!token) return
+  phase.value = 'verifying'
+  try {
+    await auth.verifyEmail(token)
+    phase.value = 'success'
+    setTimeout(() => router.push('/onboarding'), 1200)
+  } catch {
+    phase.value = 'invalid'
+  }
+})
+
+async function handleResend() {
   resending.value = true
-  // Simulate API call
-  await new Promise(resolve => setTimeout(resolve, 1000))
-  resent.value = true
-  resending.value = false
+  resendError.value = null
+  try {
+    await auth.resendVerification()
+    resentAt.value = Date.now()
+    toast.success('Verification email sent.')
+  } catch (err: any) {
+    if (err?.response?.status === 429) {
+      resendError.value = 'You\'ve requested too many emails. Please wait an hour and try again.'
+    } else {
+      resendError.value = err?.response?.data?.error || 'Could not send email. Try again later.'
+    }
+  } finally {
+    resending.value = false
+  }
 }
 </script>
+
 <template>
   <div class="min-h-screen bg-zinc-50 flex flex-col justify-center py-12 sm:px-6 lg:px-8 relative overflow-hidden">
-    <!-- Ambient subtle background blur -->
     <div class="absolute top-[-10%] left-[10%] w-[30rem] h-[30rem] bg-indigo-200 rounded-full mix-blend-multiply filter blur-[100px] opacity-40"></div>
     <div class="absolute bottom-[-10%] right-[10%] w-[30rem] h-[30rem] bg-blue-100 rounded-full mix-blend-multiply filter blur-[100px] opacity-40"></div>
 
@@ -30,37 +64,71 @@ const resendEmail = async () => {
         <span class="text-xl font-bold tracking-tight text-zinc-900">Noumena</span>
       </div>
 
-      <div class="flex justify-center mb-6">
-        <div class="h-20 w-20 bg-white rounded-2xl flex items-center justify-center shadow-sm border border-zinc-100 ring-4 ring-zinc-50 relative">
-          <div class="absolute inset-0 bg-indigo-50 rounded-2xl animate-ping opacity-30"></div>
-          <svg class="h-10 w-10 text-indigo-600 relative z-10" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
-          </svg>
-        </div>
-      </div>
-      <h2 class="text-3xl font-semibold tracking-tight text-zinc-900 mb-4">Check your inbox</h2>
-      <p class="text-lg text-zinc-500 px-4 leading-relaxed mb-10">
-        We've sent a verification link to <br/><span class="font-medium text-zinc-900">{{ email }}</span>. 
-      </p>
+      <!-- Verifying -->
+      <template v-if="phase === 'verifying'">
+        <h2 class="text-3xl font-semibold tracking-tight text-zinc-900 mb-4">Verifying your email…</h2>
+        <p class="text-zinc-500">Hold tight, this only takes a moment.</p>
+      </template>
 
-      <div class="bg-white py-8 px-6 shadow-[0_4px_20px_-4px_rgba(0,0,0,0.05)] rounded-[2rem] border border-zinc-100/80 mx-4 sm:mx-0">
-        <p class="text-sm text-zinc-500 mb-6 font-medium">Didn't receive the email? Check your spam folder or request a new one below.</p>
-        
-        <button @click="resendEmail" :disabled="resending || resent" class="w-full flex justify-center items-center py-3.5 px-4 border border-zinc-200 rounded-xl shadow-sm text-sm font-medium text-zinc-700 bg-white hover:bg-zinc-50 hover:border-zinc-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200">
-          <span v-if="resending" class="flex items-center">
-            <svg class="animate-spin -ml-1 mr-2 h-4 w-4 text-zinc-500" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-            Sending...
-          </span>
-          <span v-else-if="resent" class="text-emerald-600 flex items-center">
-            <svg class="w-4 h-4 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" /></svg>
-            Email sent
-          </span>
+      <!-- Success -->
+      <template v-else-if="phase === 'success'">
+        <div class="flex justify-center mb-6">
+          <div class="h-20 w-20 bg-emerald-50 rounded-2xl flex items-center justify-center ring-1 ring-emerald-600/20">
+            <svg class="h-10 w-10 text-emerald-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+            </svg>
+          </div>
+        </div>
+        <h2 class="text-3xl font-semibold tracking-tight text-zinc-900 mb-3">Email verified</h2>
+        <p class="text-zinc-500">Redirecting you to onboarding…</p>
+      </template>
+
+      <!-- Invalid token -->
+      <template v-else-if="phase === 'invalid'">
+        <div class="flex justify-center mb-6">
+          <div class="h-20 w-20 bg-rose-50 rounded-2xl flex items-center justify-center ring-1 ring-rose-600/20">
+            <svg class="h-10 w-10 text-rose-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+          </div>
+        </div>
+        <h2 class="text-3xl font-semibold tracking-tight text-zinc-900 mb-3">Link expired or invalid</h2>
+        <p class="text-zinc-500 mb-8">Request a new verification email below.</p>
+      </template>
+
+      <!-- Idle (no ?token) — show inbox prompt + resend -->
+      <template v-else>
+        <div class="flex justify-center mb-6">
+          <div class="h-20 w-20 bg-white rounded-2xl flex items-center justify-center shadow-sm border border-zinc-100 ring-4 ring-zinc-50">
+            <svg class="h-10 w-10 text-indigo-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+            </svg>
+          </div>
+        </div>
+        <h2 class="text-3xl font-semibold tracking-tight text-zinc-900 mb-3">Check your inbox</h2>
+        <p class="text-zinc-500 mb-10">
+          We've sent a verification link to <br /><span class="font-medium text-zinc-900">{{ userEmail }}</span>.
+        </p>
+      </template>
+
+      <!-- Resend card (always visible except during success) -->
+      <div v-if="phase !== 'success'" class="bg-white py-8 px-6 shadow-[0_4px_20px_-4px_rgba(0,0,0,0.05)] rounded-[2rem] border border-zinc-100/80 mx-4 sm:mx-0">
+        <p v-if="resendError" class="text-sm text-rose-600 mb-4 font-medium">{{ resendError }}</p>
+        <p v-else class="text-sm text-zinc-500 mb-6 font-medium">
+          Didn't receive the email? Check your spam folder or request a new one.
+        </p>
+
+        <SecondaryButton :loading="resending" :disabled="resending" full-width @click="handleResend">
+          <span v-if="resending">Sending…</span>
+          <span v-else-if="resentAt" class="text-emerald-600 font-medium">Email sent — check your inbox</span>
           <span v-else>Resend verification link</span>
-        </button>
+        </SecondaryButton>
 
         <div class="mt-8 pt-6 border-t border-zinc-100 text-sm">
           <RouterLink to="/login" class="font-medium text-zinc-500 hover:text-zinc-900 transition-colors inline-flex items-center">
-            <svg class="w-4 h-4 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18" /></svg>
+            <svg class="w-4 h-4 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18" />
+            </svg>
             Back to sign in
           </RouterLink>
         </div>

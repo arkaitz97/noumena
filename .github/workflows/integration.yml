@@ -1,0 +1,29 @@
+name: integration
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+
+      - name: Run integration tests
+        run: make test-integration
+        env:
+          # testcontainers-go uses the host Docker daemon provided by
+          # ubuntu-latest. Disable the Ryuk reaper sidecar in CI to
+          # avoid privileged-container requirements.
+          TESTCONTAINERS_RYUK_DISABLED: "true"

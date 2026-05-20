@@ -189,3 +189,128 @@ CREATE TABLE comment_usage_logs (
 - `internal/api/billing_test.go` — webhook tests
 - `internal/db/db.go` — add billing-related queries
 - `frontend/src/views/settings/BillingView.vue` — billing UI
+
+## Operations
+
+### Environment Variables (task 11.1)
+
+The following variables are read by `internal/config/config.go` at boot.
+When `BILLING_ENABLED=true` the validator refuses to start unless every
+required variable is set.
+
+| Variable | Required when `BILLING_ENABLED=true` | Notes |
+|----------|--------------------------------------|-------|
+| `BILLING_ENABLED` | always | `true` / `false`. Default `false`. |
+| `STRIPE_SECRET_KEY` | yes | `sk_test_...` or `sk_live_...`. |
+| `STRIPE_WEBHOOK_SECRET` | yes | `whsec_...` from the Stripe dashboard webhook page. |
+| `STRIPE_PRICE_CREATOR_MONTHLY` | yes | Stripe price ID for Creator monthly. |
+| `STRIPE_PRICE_CREATOR_ANNUAL` | yes | |
+| `STRIPE_PRICE_STUDIO_MONTHLY` | yes | |
+| `STRIPE_PRICE_STUDIO_ANNUAL` | yes | |
+| `STRIPE_PRICE_AGENCY_MONTHLY` | yes | |
+| `STRIPE_PRICE_AGENCY_ANNUAL` | yes | |
+| `BILLING_CHECKOUT_SUCCESS_URL` | yes | Absolute URL — typically `https://app.noumena.io/settings/billing/success`. |
+| `BILLING_CHECKOUT_CANCEL_URL` | yes | Absolute URL — typically `https://app.noumena.io/settings/billing/cancel`. |
+
+When `BILLING_ENABLED=false` (the rollback default), the missing variables
+do NOT prevent startup; instead the API uses a mock billing client and the
+`/webhooks/stripe` endpoint returns 200 with no side effects.
+
+### Stripe Dashboard Setup (task 11.2)
+
+Perform these steps once per environment (test mode for staging, live mode
+for production). Save the resulting price IDs into the env vars above.
+
+1. **Create products.** In *Products → Add product* create three products:
+   `Creator`, `Studio`, `Agency`. Add a one-line description.
+2. **Create prices.** For each product, add two recurring prices:
+   - Monthly USD: $29 / $99 / $299, billing period = `monthly`.
+   - Annual USD: $278 / $950 / $2,870, billing period = `yearly`.
+   Copy each `price_…` ID into the matching `STRIPE_PRICE_*` env var.
+3. **Configure the Customer Portal.** *Settings → Billing → Customer
+   portal*. Enable "Allow customers to switch plans" with all six prices
+   listed; allow "Cancel subscriptions"; set an appropriate "Business
+   information" header.
+4. **Create the webhook endpoint.** *Developers → Webhooks → Add
+   endpoint*. URL = `https://api.noumena.io/webhooks/stripe`. Select
+   events:
+   - `checkout.session.completed`
+   - `invoice.payment_succeeded`
+   - `invoice.payment_failed`
+   - `customer.subscription.updated`
+   - `customer.subscription.deleted`
+   Reveal the **Signing secret** and copy it into `STRIPE_WEBHOOK_SECRET`.
+5. **Configure billing portal return URL.** Use the same
+   `BILLING_CHECKOUT_SUCCESS_URL` so users land back in the app after
+   cancelling/updating.
+
+### `BILLING_ENABLED` Rollout & Rollback (task 11.3)
+
+`BILLING_ENABLED` is the master switch.
+
+- **Rollout (off → on)**: set `BILLING_ENABLED=true` in the production
+  environment, set every `STRIPE_*` and `BILLING_CHECKOUT_*` variable, and
+  redeploy. The boot-time validator refuses to start if anything is
+  missing, so a partial config can never reach traffic.
+- **Rollback (on → off)**: flip `BILLING_ENABLED=false` and redeploy.
+  Effects:
+  - The mock billing client is used; `/api/billing/checkout`,
+    `/api/billing/portal`, `/api/billing/status` continue to respond but
+    do not talk to Stripe.
+  - `/webhooks/stripe` returns 200 with no side effects (any in-flight
+    Stripe deliveries during the redeploy window are absorbed without
+    mutating users).
+  - The daily quota cron (`StartQuotaCron`) keeps running; it has no
+    Stripe dependency.
+  - Existing user rows keep their `subscription_plan` /
+    `subscription_status` values — no automatic downgrade.
+
+### Runbook: User Stuck in `past_due` (task 11.4)
+
+Symptom: a paying user reports their account is in `past_due` and they
+believe they have paid.
+
+1. Confirm in Stripe Dashboard → Customers that the most recent invoice
+   for the customer is **paid**. If it is not paid, ask the user to
+   retry the invoice via the Customer Portal — that path will trigger a
+   fresh `invoice.payment_succeeded` webhook on completion.
+2. If the invoice is paid in Stripe but our user row is still
+   `past_due`:
+   - Check `processed_stripe_events` for the event id of the relevant
+     `invoice.payment_succeeded`. If present, the webhook arrived but
+     either failed or was lost between Stripe and us — replay it from
+     *Webhooks → Endpoints → (this endpoint) → Resend*.
+   - If no audit row exists, our endpoint never received the delivery.
+     Replay the event from the same Stripe panel.
+3. If a replay fails because of a code-level handler bug, you can
+   manually unstick the user with a single SQL transaction:
+   ```sql
+   UPDATE users
+      SET subscription_status = 'active',
+          past_due_since      = NULL,
+          comments_used_this_period = 0,
+          updated_at = NOW()
+    WHERE id = '<user_uuid>';
+   ```
+   Always insert a row in `processed_stripe_events` referencing the
+   manual recovery so a later replay is idempotent:
+   ```sql
+   INSERT INTO processed_stripe_events (stripe_event_id, event_type)
+   VALUES ('manual-recovery-<ticket>', 'manual.recovery')
+   ON CONFLICT DO NOTHING;
+   ```
+4. Document the incident: which event id was missing, root cause, and
+   whether the daily `ExpirePastDueGrace` cron would have correctly
+   transitioned the user to `paused` after the 3-day grace.
+
+### Open blocker — live Stripe test E2E
+
+End-to-end testing against a real Stripe test account (a checkout flow
+that produces a real `checkout.session.completed` webhook delivery
+verified by signature) is **not exercised in CI**. Setting it up
+requires a live Stripe test-mode account with the price IDs above and a
+publicly-reachable webhook receiver (e.g. via `stripe listen --forward-to`
+in a developer environment). The Go-level handler is fully covered by
+unit tests using `MockClient`; the live-fire test must be run manually
+during release validation and is the documented blocker for tasks
+6.1 / 6.2 / 6.3 going to production traffic.

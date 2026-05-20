@@ -1,100 +1,286 @@
 <script setup lang="ts">
+import { computed, onBeforeUnmount, ref } from 'vue'
 import { useRouter } from 'vue-router'
+import { useAuthStore } from '../../stores/auth'
+import { toast } from '../../lib/toast'
+import { generateState, openOAuthPopup } from '../../lib/oauthPopup'
+import * as channels from '../../services/channels'
+import type { SyncStatus } from '../../services/types'
+import PrimaryButton from '../../components/forms/PrimaryButton.vue'
+import SecondaryButton from '../../components/forms/SecondaryButton.vue'
 
 const router = useRouter()
+const auth = useAuthStore()
 
-const connectYouTube = () => {
-  // Redirect to backend OAuth initiation route
-  window.location.href = '/api/channels/connect/youtube'
+type StepIdx = 1 | 2 | 3 | 4
+const step = ref<StepIdx>(1)
+const stepLabels = ['Welcome', 'Connect', 'Backfill', 'Tour']
+
+// Step 2 state
+const connecting = ref(false)
+const connectError = ref<string | null>(null)
+const connectedChannel = ref<{ id: string; display_name: string } | null>(null)
+
+// Step 3 state — polling
+const syncStatus = ref<SyncStatus | null>(null)
+const progressPct = computed<number>(() => syncStatus.value?.backfill_progress_percent ?? 0)
+const pollIntervalMs = ref(5000)
+let pollTimer: number | null = null
+let pollStartedAt = 0
+const stableCount = ref(0)
+const lastProgress = ref<number | null>(null)
+const escapeHatchVisible = ref(false)
+const POLL_MAX_MS = 30 * 60 * 1000 // 30 min
+const PROGRESS_THRESHOLD = 10
+
+function stopPolling() {
+  if (pollTimer !== null) {
+    window.clearTimeout(pollTimer)
+    pollTimer = null
+  }
 }
 
-const skipForNow = () => {
-  localStorage.setItem('hasChannels', 'true')
+async function pollOnce(): Promise<void> {
+  if (!connectedChannel.value) return
+  try {
+    const s = await channels.syncStatus(connectedChannel.value.id)
+    syncStatus.value = s
+    const pct = s.backfill_progress_percent ?? 0
+    if (lastProgress.value !== null && Math.abs(pct - lastProgress.value) < 0.01) {
+      stableCount.value++
+    } else {
+      stableCount.value = 0
+    }
+    lastProgress.value = pct
+    if (stableCount.value >= 4 && pollIntervalMs.value < 60000) {
+      pollIntervalMs.value = Math.min(60000, pollIntervalMs.value * 2)
+    }
+  } catch (err) {
+    // Transient failure — continue polling.
+  }
+}
+
+function schedulePoll() {
+  if (Date.now() - pollStartedAt > POLL_MAX_MS) {
+    escapeHatchVisible.value = true
+    stopPolling()
+    return
+  }
+  pollTimer = window.setTimeout(async () => {
+    await pollOnce()
+    if (progressPct.value < PROGRESS_THRESHOLD) {
+      schedulePoll()
+    }
+  }, pollIntervalMs.value)
+}
+
+async function startBackfillPolling() {
+  pollStartedAt = Date.now()
+  pollIntervalMs.value = 5000
+  stableCount.value = 0
+  lastProgress.value = null
+  escapeHatchVisible.value = false
+  await pollOnce()
+  if (progressPct.value < PROGRESS_THRESHOLD) schedulePoll()
+}
+
+onBeforeUnmount(() => {
+  stopPolling()
+})
+
+// --- Step navigation ---
+function goToStep(s: StepIdx) {
+  step.value = s
+}
+
+function startOnboarding() {
+  goToStep(2)
+}
+
+async function connectYouTube() {
+  if (connecting.value) return
+  connecting.value = true
+  connectError.value = null
+  const state = generateState('youtube')
+  try {
+    const { auth_url } = await channels.connectYouTubeUrl()
+    try {
+      const result = await openOAuthPopup('youtube', auth_url, { state })
+      const exchange = await channels.exchangeYouTube(result.code, result.state, 90)
+      connectedChannel.value = { id: exchange.id, display_name: exchange.display_name }
+      await auth.refreshChannelsCount()
+      toast.success(`Connected ${exchange.display_name}`)
+      goToStep(3)
+      await startBackfillPolling()
+    } catch (popupErr: any) {
+      const m = popupErr?.message
+      if (m === 'popup_blocked')
+        connectError.value = 'Pop-up blocked. Please allow pop-ups and try again.'
+      else if (m === 'popup_closed') connectError.value = 'Connection cancelled.'
+      else if (m === 'popup_timeout') connectError.value = 'Connection timed out. Please try again.'
+      else connectError.value = popupErr?.response?.data?.error || popupErr?.message || 'Connection failed.'
+    }
+  } catch (err: any) {
+    connectError.value = err?.response?.data?.error || 'Could not start connection.'
+  } finally {
+    connecting.value = false
+  }
+}
+
+const continueEnabled = computed(
+  () => progressPct.value >= PROGRESS_THRESHOLD || escapeHatchVisible.value,
+)
+
+function continueToStep4() {
+  stopPolling()
+  goToStep(4)
+}
+
+function skipTour() {
+  router.push('/dashboard')
+}
+
+function finishOnboarding() {
   router.push('/dashboard')
 }
 </script>
 
 <template>
-  <div class="min-h-screen bg-white flex">
-    <!-- Left Panel -->
-    <div class="flex-1 flex flex-col justify-center px-6 sm:px-12 lg:flex-none lg:w-1/2 xl:w-5/12 mx-auto lg:mx-0 relative z-10">
-      <div class="mx-auto w-full max-w-sm lg:max-w-md">
-        <!-- Brand/Logo -->
-        <div class="flex items-center gap-2 mb-16">
-          <div class="w-8 h-8 rounded-lg bg-zinc-900 flex items-center justify-center shadow-md">
-            <svg class="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
-            </svg>
-          </div>
-          <span class="text-xl font-bold tracking-tight text-zinc-900">Noumena</span>
+  <div class="min-h-screen bg-zinc-50 flex flex-col">
+    <header class="px-6 sm:px-12 py-6 flex items-center justify-between">
+      <div class="flex items-center gap-2">
+        <div class="w-8 h-8 rounded-lg bg-zinc-900 flex items-center justify-center shadow-md">
+          <svg class="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+          </svg>
         </div>
+        <span class="text-xl font-bold tracking-tight text-zinc-900">Noumena</span>
+      </div>
+      <span class="text-xs font-medium text-zinc-500">Step {{ step }} of 4 · {{ stepLabels[step - 1] }}</span>
+    </header>
 
-        <h1 class="text-4xl font-semibold tracking-tight text-zinc-900 mb-4">Connect your channel</h1>
-        <p class="text-zinc-500 text-lg mb-10 leading-relaxed">
-          Unlock AI-powered insights by connecting your first platform. We'll automatically sync and analyze your latest audience interactions.
-        </p>
+    <!-- Progress bar -->
+    <div class="px-6 sm:px-12">
+      <div class="h-1.5 bg-zinc-200 rounded-full overflow-hidden">
+        <div
+          class="h-full bg-gradient-to-r from-indigo-500 to-purple-500 transition-all duration-500"
+          :style="{ width: ((step / 4) * 100) + '%' }"
+        ></div>
+      </div>
+    </div>
 
-        <!-- Actions -->
-        <div class="space-y-4">
-          <button @click="connectYouTube" class="group relative w-full flex justify-center items-center py-3.5 px-4 rounded-xl border border-zinc-200 bg-white text-base font-medium text-zinc-900 shadow-[0_1px_2px_rgba(0,0,0,0.05)] hover:border-zinc-300 hover:bg-zinc-50 hover:shadow-[0_4px_12px_rgba(0,0,0,0.05)] focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:ring-offset-2 transition-all duration-200">
-            <svg class="w-6 h-6 mr-3 text-[#FF0000] drop-shadow-sm group-hover:scale-105 transition-transform duration-200" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+    <main class="flex-1 flex items-center justify-center px-6 sm:px-12 py-12">
+      <div class="bg-white shadow-sm ring-1 ring-zinc-950/5 rounded-2xl max-w-xl w-full p-8 sm:p-12 relative overflow-hidden">
+        <div class="absolute top-0 right-0 -mt-16 -mr-16 w-48 h-48 bg-gradient-to-br from-indigo-500 to-purple-400 rounded-full blur-[80px] opacity-20 pointer-events-none"></div>
+
+        <!-- STEP 1: Welcome -->
+        <template v-if="step === 1">
+          <h1 class="text-3xl font-semibold tracking-tight text-zinc-900 mb-3">Welcome to Noumena</h1>
+          <p class="text-zinc-500 leading-relaxed mb-8">
+            Let's connect your first channel. We'll automatically pull in your latest comments and
+            start surfacing the insights hidden in them.
+          </p>
+          <ul class="space-y-3 text-sm text-zinc-700 mb-10">
+            <li class="flex items-start gap-3">
+              <span class="mt-1 w-5 h-5 rounded-full bg-emerald-50 text-emerald-600 flex items-center justify-center ring-1 ring-emerald-600/20">
+                <svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7" /></svg>
+              </span>
+              Read-only access — we never post or modify anything.
+            </li>
+            <li class="flex items-start gap-3">
+              <span class="mt-1 w-5 h-5 rounded-full bg-emerald-50 text-emerald-600 flex items-center justify-center ring-1 ring-emerald-600/20">
+                <svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7" /></svg>
+              </span>
+              First insights ready in under 30 minutes.
+            </li>
+            <li class="flex items-start gap-3">
+              <span class="mt-1 w-5 h-5 rounded-full bg-emerald-50 text-emerald-600 flex items-center justify-center ring-1 ring-emerald-600/20">
+                <svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7" /></svg>
+              </span>
+              You can disconnect at any time from Settings.
+            </li>
+          </ul>
+          <PrimaryButton full-width @click="startOnboarding">Get started</PrimaryButton>
+        </template>
+
+        <!-- STEP 2: Connect -->
+        <template v-else-if="step === 2">
+          <h1 class="text-3xl font-semibold tracking-tight text-zinc-900 mb-3">Connect your YouTube channel</h1>
+          <p class="text-zinc-500 leading-relaxed mb-8">
+            We'll open a Google sign-in window and ask for read-only access to your channel's
+            comments.
+          </p>
+          <div v-if="connectError" class="bg-rose-50 p-4 rounded-xl text-rose-700 text-sm border border-rose-100 mb-6">
+            {{ connectError }}
+          </div>
+
+          <button
+            @click="connectYouTube"
+            :disabled="connecting"
+            class="group relative w-full flex justify-center items-center py-3.5 px-4 rounded-xl border border-zinc-200 bg-white text-base font-medium text-zinc-900 shadow-sm hover:border-zinc-300 hover:bg-zinc-50 focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:ring-offset-2 transition-all duration-200 disabled:opacity-60"
+          >
+            <svg class="w-6 h-6 mr-3 text-[#FF0000]" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
               <path fill-rule="evenodd" d="M21.582,6.186c-0.23-0.86-0.908-1.538-1.768-1.768C18.254,4,12,4,12,4S5.746,4,4.186,4.418 c-0.86,0.23-1.538,0.908-1.768,1.768C2,7.746,2,12,2,12s0,4.254,0.418,5.814c0.23,0.86,0.908,1.538,1.768,1.768 C5.746,20,12,20,12,20s6.254,0,7.814-0.418c0.86-0.23,1.538-0.908,1.768-1.768C22,16.254,22,12,22,12S22,7.746,21.582,6.186z M9.996,15.005l0-6.01l5.418,3.004L9.996,15.005z" clip-rule="evenodd" />
             </svg>
-            Continue with YouTube
+            <span v-if="connecting">Opening Google…</span>
+            <span v-else>Continue with YouTube</span>
           </button>
-          
-          <button @click="skipForNow" class="w-full flex justify-center py-3.5 px-4 text-sm font-medium text-zinc-500 hover:text-zinc-800 transition-colors duration-200">
-            I'll do this later
-          </button>
-        </div>
-      </div>
-    </div>
+        </template>
 
-    <!-- Right Panel (Decorative) -->
-    <div class="hidden lg:flex relative w-0 flex-1 bg-zinc-950 overflow-hidden items-center justify-center">
-      <!-- Ambient glow circles for premium feel -->
-      <div class="absolute top-[-10%] left-[-10%] w-[40rem] h-[40rem] bg-indigo-500 rounded-full mix-blend-screen filter blur-[120px] opacity-20 animate-blob"></div>
-      <div class="absolute bottom-[-10%] right-[-10%] w-[40rem] h-[40rem] bg-violet-600 rounded-full mix-blend-screen filter blur-[120px] opacity-20 animate-blob animation-delay-2000"></div>
+        <!-- STEP 3: Backfill -->
+        <template v-else-if="step === 3">
+          <h1 class="text-3xl font-semibold tracking-tight text-zinc-900 mb-3">Syncing your channel</h1>
+          <p v-if="connectedChannel" class="text-zinc-500 mb-2">
+            Connected: <span class="font-medium text-zinc-900">{{ connectedChannel.display_name }}</span>
+          </p>
+          <p class="text-zinc-500 leading-relaxed mb-8">
+            We're pulling in your recent comments. You can continue once we have enough data to show
+            useful insights.
+          </p>
 
-      <!-- Sophisticated Glassmorphism Card -->
-      <div class="relative z-10 max-w-lg p-10 rounded-[2rem] bg-white/5 border border-white/10 backdrop-blur-3xl shadow-2xl">
-        <div class="inline-flex items-center px-3 py-1 rounded-full bg-white/10 border border-white/10 mb-8">
-          <span class="flex h-2 w-2 rounded-full bg-green-400 mr-2 shadow-[0_0_8px_rgba(74,222,128,0.8)]"></span>
-          <span class="text-xs font-medium text-zinc-300 uppercase tracking-widest">System Online</span>
-        </div>
-        
-        <blockquote class="text-2xl font-medium text-zinc-100 leading-snug mb-8">
-          "The level of insight provided by Noumena is simply unparalleled. It feels less like a tool and more like an extension of our team's intuition."
-        </blockquote>
-        
-        <div class="flex items-center">
-          <div class="h-12 w-12 rounded-full bg-gradient-to-br from-indigo-400 to-violet-600 flex items-center justify-center text-white font-semibold text-lg ring-2 ring-white/20">
-            A
+          <div class="mb-8">
+            <div class="flex items-center justify-between text-sm font-medium text-zinc-700 mb-2">
+              <span>Backfill progress</span>
+              <span>{{ Math.floor(progressPct) }}%</span>
+            </div>
+            <div class="h-2 bg-zinc-100 rounded-full overflow-hidden">
+              <div
+                class="h-full bg-gradient-to-r from-indigo-500 to-purple-500 transition-all duration-500"
+                :style="{ width: Math.min(100, progressPct) + '%' }"
+              ></div>
+            </div>
+            <p v-if="syncStatus?.recent_error" class="mt-3 text-xs text-rose-600">
+              {{ syncStatus.recent_error.message }}
+            </p>
           </div>
-          <div class="ml-4">
-            <div class="text-base font-semibold text-white">Alex Chen</div>
-            <div class="text-sm text-zinc-400 font-medium">Head of Operations, Nexus</div>
+
+          <p v-if="escapeHatchVisible" class="text-sm text-zinc-500 mb-6">
+            This is taking longer than usual — you can continue and we'll keep syncing in the background.
+          </p>
+
+          <PrimaryButton full-width :disabled="!continueEnabled" @click="continueToStep4">
+            <span v-if="continueEnabled">Continue</span>
+            <span v-else>Syncing… ({{ Math.floor(progressPct) }}%)</span>
+          </PrimaryButton>
+        </template>
+
+        <!-- STEP 4: Tour -->
+        <template v-else>
+          <h1 class="text-3xl font-semibold tracking-tight text-zinc-900 mb-3">You're all set</h1>
+          <p class="text-zinc-500 leading-relaxed mb-8">
+            A quick tour of the dashboard, or jump straight in?
+          </p>
+          <ul class="space-y-3 text-sm text-zinc-700 mb-10">
+            <li><span class="font-semibold text-zinc-900">Insights Feed</span> — your prioritized comment stream.</li>
+            <li><span class="font-semibold text-zinc-900">Saved Comments</span> — flagged items for follow-up.</li>
+            <li><span class="font-semibold text-zinc-900">Channels</span> — connect more or pause syncing.</li>
+          </ul>
+          <div class="flex flex-col sm:flex-row gap-3">
+            <PrimaryButton full-width @click="finishOnboarding">Take me to the dashboard</PrimaryButton>
+            <SecondaryButton full-width @click="skipTour">Skip</SecondaryButton>
           </div>
-        </div>
+        </template>
       </div>
-      
-      <!-- Subtle dot grid overlay for texture -->
-      <div class="absolute inset-0 bg-[url('data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PGNpcmNsZSBjeD0iMSIgY3k9IjEiIHI9IjEiIGZpbGw9InJnYmEoMjU1LCAyNTUsIDI1NSwgMC4wNSkiLz48L3N2Zz4=')] opacity-60"></div>
-    </div>
+    </main>
   </div>
 </template>
-
-<style scoped>
-@keyframes blob {
-  0% { transform: translate(0px, 0px) scale(1); }
-  33% { transform: translate(30px, -50px) scale(1.1); }
-  66% { transform: translate(-20px, 20px) scale(0.9); }
-  100% { transform: translate(0px, 0px) scale(1); }
-}
-.animate-blob {
-  animation: blob 7s infinite alternate;
-}
-.animation-delay-2000 {
-  animation-delay: 2s;
-}
-</style>

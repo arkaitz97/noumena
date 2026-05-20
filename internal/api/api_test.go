@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
 
 	"noumena/internal/api"
 	"noumena/internal/auth"
@@ -18,7 +19,47 @@ import (
 
 // MockQuery implements db.DBQuery for testing
 type MockQuery struct {
-	users map[string]*db.User
+	users          map[string]*db.User
+	refreshTokens  map[string]struct {
+		userID  string
+		expires time.Time
+	}
+	emailVerifTokens map[string]struct {
+		userID  string
+		expires time.Time
+		usedAt  *time.Time
+	}
+	passwordResetTokens map[string]struct {
+		userID  string
+		expires time.Time
+		usedAt  *time.Time
+	}
+	verifResendCount    map[string]int
+	forgotPwSentCount   map[string]int
+	lockoutEmailsSent   int
+	verifyEmailsSent    int
+	resetEmailsSent     int
+	googleNoticesSent   int
+	// weekly-digest fixtures (read-only handler tests)
+	latestDigests map[string]*db.WeeklyDigest
+	digestsByUser map[string][]*db.WeeklyDigest
+	digestOptIn   map[string]bool
+
+	// billing fixtures
+	processedEvents       map[string]string // eventID -> event_type
+	usersByStripeCustomer map[string]*db.User
+	activeChannelCount    map[string]int
+	overageCost           map[string]float64
+	subscriptionUpdates   []db.SubscriptionUpdate
+	usageLogs             []struct {
+		UserID                string
+		Count                 int
+		PeriodStart, PeriodEnd time.Time
+	}
+	pauseAlphaCalls []struct {
+		UserID    string
+		KeepCount int
+	}
 }
 
 func (m *MockQuery) CreateUser(ctx context.Context, email, passwordHash string) (*db.User, error) {
@@ -122,7 +163,35 @@ func (m *MockQuery) GetUnprocessedComments(ctx context.Context, limit int) ([]*d
 	return nil, nil
 }
 
-func (m *MockQuery) UpdateCommentLLMData(ctx context.Context, id, category, topic string, sentiment, confidence float64) error {
+func (m *MockQuery) GetUnprocessedCommentsByChannel(ctx context.Context, limit int) (map[string][]*db.Comment, error) {
+	return nil, nil
+}
+
+func (m *MockQuery) UpdateCommentLLMData(ctx context.Context, id, category, topic, provider, model string, sentiment, confidence float64) error {
+	return nil
+}
+
+func (m *MockQuery) IncrementCommentsUsed(ctx context.Context, userID string, count int) error {
+	return nil
+}
+
+func (m *MockQuery) GetPrimaryTracker(ctx context.Context, platformChannelID string) (*db.User, error) {
+	return nil, db.ErrNoPrimaryTracker
+}
+
+func (m *MockQuery) EnqueueLLMJob(ctx context.Context, commentIDs []string, provider string) (string, error) {
+	return "", nil
+}
+
+func (m *MockQuery) MarkLLMJobProcessing(ctx context.Context, jobID string) error {
+	return nil
+}
+
+func (m *MockQuery) MarkLLMJobCompleted(ctx context.Context, jobID string) error {
+	return nil
+}
+
+func (m *MockQuery) MarkLLMJobFailed(ctx context.Context, jobID string, msg string) error {
 	return nil
 }
 
@@ -136,6 +205,489 @@ func (m *MockQuery) GetUsersForDigest(ctx context.Context) ([]*db.User, error) {
 
 func (m *MockQuery) GetRecentProcessedCommentsForUser(ctx context.Context, userID string, since time.Time) ([]*db.Comment, error) {
 	return nil, nil
+}
+
+// --- weekly-digest mock stubs ----------------------------------------------
+
+func (m *MockQuery) GetEligibleCommentsForUser(ctx context.Context, userID string, since, until time.Time) ([]*db.Comment, error) {
+	return nil, nil
+}
+func (m *MockQuery) InsertWeeklyDigestPending(ctx context.Context, userID string, weekStart time.Time) (string, bool, error) {
+	return "", false, nil
+}
+func (m *MockQuery) UpdateDigestContent(ctx context.Context, digestID string, contentJSON []byte, status string) error {
+	return nil
+}
+func (m *MockQuery) UpdateDigestStatus(ctx context.Context, digestID, status string) error {
+	return nil
+}
+func (m *MockQuery) GetPreviousWeekDigest(ctx context.Context, userID string, weekStart time.Time) (*db.WeeklyDigest, error) {
+	return nil, db.ErrNotFound
+}
+func (m *MockQuery) GetLatestDigestForUser(ctx context.Context, userID string) (*db.WeeklyDigest, error) {
+	if d, ok := m.latestDigests[userID]; ok && d != nil {
+		return d, nil
+	}
+	return nil, db.ErrNotFound
+}
+func (m *MockQuery) ListDigests(ctx context.Context, userID string, limit, offset int) ([]*db.WeeklyDigest, error) {
+	all := m.digestsByUser[userID]
+	if offset >= len(all) {
+		return []*db.WeeklyDigest{}, nil
+	}
+	end := offset + limit
+	if end > len(all) {
+		end = len(all)
+	}
+	return all[offset:end], nil
+}
+func (m *MockQuery) GetStalePendingDigests(ctx context.Context, olderThan time.Time) ([]*db.WeeklyDigest, error) {
+	return nil, nil
+}
+func (m *MockQuery) UpdateUserDigestOptIn(ctx context.Context, userID string, optIn bool) error {
+	if m.digestOptIn == nil {
+		m.digestOptIn = map[string]bool{}
+	}
+	m.digestOptIn[userID] = optIn
+	return nil
+}
+
+func (m *MockQuery) MarkDigestEmailed(context.Context, string, string, time.Time) error {
+	return nil
+}
+
+// --- Auth-extension stubs (no-ops sufficient for tests) ---------------------
+
+func (m *MockQuery) CreateUserWithPassword(ctx context.Context, email, passwordHash string) (*db.User, error) {
+	return m.CreateUser(ctx, email, passwordHash)
+}
+
+func (m *MockQuery) CreateUserGoogle(ctx context.Context, email, googleSub string) (*db.User, error) {
+	if m.users == nil {
+		m.users = make(map[string]*db.User)
+	}
+	now := time.Now()
+	u := &db.User{
+		ID:              "test-user-id",
+		Email:           email,
+		GoogleSub:       &googleSub,
+		EmailVerifiedAt: &now,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	m.users[email] = u
+	return u, nil
+}
+
+func (m *MockQuery) GetUserByGoogleSub(ctx context.Context, sub string) (*db.User, error) {
+	for _, u := range m.users {
+		if u.GoogleSub != nil && *u.GoogleSub == sub {
+			return u, nil
+		}
+	}
+	return nil, nil
+}
+
+func (m *MockQuery) IncrementFailedLoginAttempts(ctx context.Context, userID string) (int, error) {
+	for _, u := range m.users {
+		if u.ID == userID {
+			u.FailedLoginAttempts++
+			return u.FailedLoginAttempts, nil
+		}
+	}
+	return 0, nil
+}
+
+func (m *MockQuery) LockUser(ctx context.Context, userID string, until time.Time) error {
+	for _, u := range m.users {
+		if u.ID == userID {
+			u.LockedUntil = &until
+			return nil
+		}
+	}
+	return nil
+}
+
+func (m *MockQuery) ResetLoginFailures(ctx context.Context, userID string) error {
+	for _, u := range m.users {
+		if u.ID == userID {
+			u.FailedLoginAttempts = 0
+			u.LockedUntil = nil
+			return nil
+		}
+	}
+	return nil
+}
+
+func (m *MockQuery) IncrementTokenVersion(ctx context.Context, userID string) error {
+	for _, u := range m.users {
+		if u.ID == userID {
+			u.TokenVersion++
+			return nil
+		}
+	}
+	return nil
+}
+
+func (m *MockQuery) GetUserTokenVersion(ctx context.Context, userID string) (int, error) {
+	for _, u := range m.users {
+		if u.ID == userID {
+			return u.TokenVersion, nil
+		}
+	}
+	return 0, nil
+}
+
+func (m *MockQuery) SetEmailVerified(ctx context.Context, userID string) error {
+	for _, u := range m.users {
+		if u.ID == userID {
+			now := time.Now()
+			u.EmailVerifiedAt = &now
+			return nil
+		}
+	}
+	return nil
+}
+
+func (m *MockQuery) UpdatePasswordHash(ctx context.Context, userID, hash string) error {
+	for _, u := range m.users {
+		if u.ID == userID {
+			u.PasswordHash = &hash
+			return nil
+		}
+	}
+	return nil
+}
+
+func (m *MockQuery) LinkGoogleSub(ctx context.Context, userID, sub string) error {
+	for _, u := range m.users {
+		if u.ID == userID {
+			u.GoogleSub = &sub
+			return nil
+		}
+	}
+	return nil
+}
+
+func (m *MockQuery) DeleteStaleUnverifiedUsers(ctx context.Context, olderThan time.Duration) (int64, error) {
+	return 0, nil
+}
+
+func (m *MockQuery) InsertEmailVerificationToken(ctx context.Context, userID, tokenHash string, expiresAt time.Time) error {
+	if m.emailVerifTokens == nil {
+		m.emailVerifTokens = make(map[string]struct {
+			userID  string
+			expires time.Time
+			usedAt  *time.Time
+		})
+	}
+	m.emailVerifTokens[tokenHash] = struct {
+		userID  string
+		expires time.Time
+		usedAt  *time.Time
+	}{userID: userID, expires: expiresAt}
+	if m.verifResendCount == nil {
+		m.verifResendCount = make(map[string]int)
+	}
+	m.verifResendCount[userID]++
+	return nil
+}
+func (m *MockQuery) ConsumeEmailVerificationToken(ctx context.Context, tokenHash string) (string, error) {
+	row, ok := m.emailVerifTokens[tokenHash]
+	if !ok || row.usedAt != nil || time.Now().After(row.expires) {
+		return "", nil
+	}
+	now := time.Now()
+	row.usedAt = &now
+	m.emailVerifTokens[tokenHash] = row
+	return row.userID, nil
+}
+func (m *MockQuery) InvalidateEmailVerificationTokensForUser(ctx context.Context, userID string) error {
+	for h, r := range m.emailVerifTokens {
+		if r.userID == userID && r.usedAt == nil {
+			now := time.Now()
+			r.usedAt = &now
+			m.emailVerifTokens[h] = r
+		}
+	}
+	return nil
+}
+func (m *MockQuery) CountVerificationResendsInWindow(ctx context.Context, userID string, since time.Time) (int, error) {
+	return m.verifResendCount[userID], nil
+}
+func (m *MockQuery) InsertPasswordResetToken(ctx context.Context, userID, tokenHash string, expiresAt time.Time) error {
+	if m.passwordResetTokens == nil {
+		m.passwordResetTokens = make(map[string]struct {
+			userID  string
+			expires time.Time
+			usedAt  *time.Time
+		})
+	}
+	m.passwordResetTokens[tokenHash] = struct {
+		userID  string
+		expires time.Time
+		usedAt  *time.Time
+	}{userID: userID, expires: expiresAt}
+	// Track per-user/email count
+	if m.forgotPwSentCount == nil {
+		m.forgotPwSentCount = make(map[string]int)
+	}
+	for _, u := range m.users {
+		if u.ID == userID {
+			m.forgotPwSentCount[u.Email]++
+		}
+	}
+	return nil
+}
+func (m *MockQuery) ConsumePasswordResetToken(ctx context.Context, tokenHash string) (string, error) {
+	row, ok := m.passwordResetTokens[tokenHash]
+	if !ok || row.usedAt != nil || time.Now().After(row.expires) {
+		return "", nil
+	}
+	now := time.Now()
+	row.usedAt = &now
+	m.passwordResetTokens[tokenHash] = row
+	return row.userID, nil
+}
+func (m *MockQuery) InvalidatePasswordResetTokensForUser(ctx context.Context, userID string) error {
+	for h, r := range m.passwordResetTokens {
+		if r.userID == userID && r.usedAt == nil {
+			now := time.Now()
+			r.usedAt = &now
+			m.passwordResetTokens[h] = r
+		}
+	}
+	return nil
+}
+func (m *MockQuery) CountForgotPasswordEmailsInWindow(ctx context.Context, email string, since time.Time) (int, error) {
+	return m.forgotPwSentCount[email], nil
+}
+func (m *MockQuery) InsertRefreshToken(ctx context.Context, userID, tokenHash string, expiresAt time.Time) error {
+	if m.refreshTokens == nil {
+		m.refreshTokens = make(map[string]struct {
+			userID  string
+			expires time.Time
+		})
+	}
+	m.refreshTokens[tokenHash] = struct {
+		userID  string
+		expires time.Time
+	}{userID: userID, expires: expiresAt}
+	return nil
+}
+func (m *MockQuery) GetRefreshTokenByHash(ctx context.Context, tokenHash string) (string, time.Time, error) {
+	row, ok := m.refreshTokens[tokenHash]
+	if !ok {
+		return "", time.Time{}, nil
+	}
+	return row.userID, row.expires, nil
+}
+func (m *MockQuery) DeleteRefreshTokenByHash(ctx context.Context, tokenHash string) error {
+	delete(m.refreshTokens, tokenHash)
+	return nil
+}
+func (m *MockQuery) DeleteAllRefreshTokensForUser(ctx context.Context, userID string) error {
+	for h, r := range m.refreshTokens {
+		if r.userID == userID {
+			delete(m.refreshTokens, h)
+		}
+	}
+	return nil
+}
+
+// ----- channel-management stubs (no-op for unit tests) -----
+
+func (m *MockQuery) InsertOAuthState(ctx context.Context, stateHash, userID string, expiresAt time.Time) error {
+	return nil
+}
+func (m *MockQuery) ConsumeOAuthState(ctx context.Context, stateHash, userID string) (bool, error) {
+	return true, nil
+}
+func (m *MockQuery) CleanupExpiredOAuthStates(ctx context.Context) (int64, error) { return 0, nil }
+func (m *MockQuery) UpsertPlatformChannel(ctx context.Context, platform, platformChannelID, displayName string) (string, bool, error) {
+	return platformChannelID, true, nil
+}
+func (m *MockQuery) GetChannelByPlatformID(ctx context.Context, platform, platformChannelID string) (*db.PlatformChannel, error) {
+	return nil, db.ErrNotFound
+}
+func (m *MockQuery) ScheduleChannelDeletion(ctx context.Context, platformChannelID string, graceHours int) error {
+	return nil
+}
+func (m *MockQuery) ClearChannelDeletion(ctx context.Context, platformChannelID string) error {
+	return nil
+}
+func (m *MockQuery) GetActiveTrackerCount(ctx context.Context, platformChannelID string) (int, error) {
+	return 0, nil
+}
+func (m *MockQuery) PurgeChannelData(ctx context.Context, platformChannelID string) error {
+	return nil
+}
+func (m *MockQuery) CreateUserChannelTracking(ctx context.Context, userID, platformChannelID, encryptedAccess, encryptedRefresh string, expiresAt time.Time, backfillDays, tokenPriority int) (*db.UserChannelTracking, error) {
+	return &db.UserChannelTracking{
+		UserID:            userID,
+		PlatformChannelID: platformChannelID,
+		BackfillDays:      backfillDays,
+		TokenPriority:     tokenPriority,
+		TrackingStatus:    "active",
+	}, nil
+}
+func (m *MockQuery) GetUserTracking(ctx context.Context, userID, platformChannelID string) (*db.UserChannelTracking, error) {
+	return nil, db.ErrNotFound
+}
+func (m *MockQuery) ListUserChannels(ctx context.Context, userID string) ([]db.ChannelListItem, error) {
+	return nil, nil
+}
+func (m *MockQuery) PauseTracking(ctx context.Context, userID, platformChannelID string) error {
+	return nil
+}
+func (m *MockQuery) ResumeTracking(ctx context.Context, userID, platformChannelID string) error {
+	return nil
+}
+func (m *MockQuery) DeleteTracking(ctx context.Context, userID, platformChannelID string) error {
+	return nil
+}
+func (m *MockQuery) UpdateBackfillDays(ctx context.Context, userID, platformChannelID string, days int) error {
+	return nil
+}
+func (m *MockQuery) GetMaxTokenPriority(ctx context.Context, platformChannelID string) (int, error) {
+	return 0, nil
+}
+func (m *MockQuery) GetIngestionTokenRow(ctx context.Context, platformChannelID string) (*db.UserChannelTracking, bool, error) {
+	return nil, false, nil
+}
+func (m *MockQuery) UpdateTokenAndExpiry(ctx context.Context, trackingID, encryptedAccess, encryptedRefresh string, expiresAt time.Time) error {
+	return nil
+}
+func (m *MockQuery) GetExpiringTokens(ctx context.Context, withinDays int) ([]db.UserChannelTracking, error) {
+	return nil, nil
+}
+func (m *MockQuery) MarkTokenExpiryNotified(ctx context.Context, trackingID string) error {
+	return nil
+}
+func (m *MockQuery) GetCommentCountForChannel(ctx context.Context, platformChannelID string) (int, error) {
+	return 0, nil
+}
+
+// ----- billing stubs (no-op-ish; tests can prime fixtures via fields) -----
+
+func (m *MockQuery) IsStripeEventProcessed(ctx context.Context, eventID string) (bool, error) {
+	if m.processedEvents == nil {
+		return false, nil
+	}
+	_, ok := m.processedEvents[eventID]
+	return ok, nil
+}
+
+func (m *MockQuery) InsertProcessedStripeEvent(ctx context.Context, tx pgx.Tx, eventID, eventType string) error {
+	if m.processedEvents == nil {
+		m.processedEvents = map[string]string{}
+	}
+	m.processedEvents[eventID] = eventType
+	return nil
+}
+
+func (m *MockQuery) ApplySubscriptionUpdate(ctx context.Context, tx pgx.Tx, u db.SubscriptionUpdate) error {
+	m.subscriptionUpdates = append(m.subscriptionUpdates, u)
+	if u.UserID == "" {
+		return nil
+	}
+	for _, usr := range m.users {
+		if usr.ID != u.UserID {
+			continue
+		}
+		if u.SubscriptionPlan != nil {
+			usr.SubscriptionPlan = *u.SubscriptionPlan
+		}
+		if u.BillingIntervalClear {
+			usr.BillingInterval = nil
+		} else if u.BillingInterval != nil {
+			v := *u.BillingInterval
+			usr.BillingInterval = &v
+		}
+		if u.StripeCustomerID != nil {
+			v := *u.StripeCustomerID
+			usr.StripeCustomerID = &v
+		}
+		if u.CommentQuotaMonthly != nil {
+			usr.CommentQuotaMonthly = *u.CommentQuotaMonthly
+		}
+		if u.CommentsUsedThisPeriod != nil {
+			usr.CommentsUsedThisPeriod = *u.CommentsUsedThisPeriod
+		}
+		if u.SubscriptionStatus != nil {
+			usr.SubscriptionStatus = *u.SubscriptionStatus
+		}
+		if u.CurrentPeriodEnd != nil {
+			t := *u.CurrentPeriodEnd
+			usr.CurrentPeriodEnd = &t
+		}
+		if u.QuotaResetAt != nil {
+			t := *u.QuotaResetAt
+			usr.QuotaResetAt = &t
+		}
+		if u.PastDueSinceClear {
+			usr.PastDueSince = nil
+		} else if u.PastDueSince != nil {
+			t := *u.PastDueSince
+			usr.PastDueSince = &t
+		}
+		if u.StripeSubscriptionIDClear {
+			usr.StripeSubscriptionID = nil
+		} else if u.StripeSubscriptionID != nil {
+			v := *u.StripeSubscriptionID
+			usr.StripeSubscriptionID = &v
+		}
+		break
+	}
+	return nil
+}
+
+func (m *MockQuery) GetUserByStripeCustomerID(ctx context.Context, customerID string) (*db.User, error) {
+	if u, ok := m.usersByStripeCustomer[customerID]; ok {
+		return u, nil
+	}
+	for _, u := range m.users {
+		if u.StripeCustomerID != nil && *u.StripeCustomerID == customerID {
+			return u, nil
+		}
+	}
+	return nil, nil
+}
+
+func (m *MockQuery) GetActiveChannelCount(ctx context.Context, userID string) (int, error) {
+	if m.activeChannelCount == nil {
+		return 0, nil
+	}
+	return m.activeChannelCount[userID], nil
+}
+
+func (m *MockQuery) GetOverageCostForCurrentPeriod(ctx context.Context, userID string, periodStart, periodEnd time.Time) (float64, error) {
+	if m.overageCost == nil {
+		return 0, nil
+	}
+	return m.overageCost[userID], nil
+}
+
+func (m *MockQuery) InsertCommentUsageLog(ctx context.Context, tx pgx.Tx, userID string, count int, periodStart, periodEnd time.Time) error {
+	m.usageLogs = append(m.usageLogs, struct {
+		UserID                string
+		Count                 int
+		PeriodStart, PeriodEnd time.Time
+	}{userID, count, periodStart, periodEnd})
+	return nil
+}
+
+func (m *MockQuery) PauseChannelsAlphabetically(ctx context.Context, tx pgx.Tx, userID string, keepCount int) error {
+	m.pauseAlphaCalls = append(m.pauseAlphaCalls, struct {
+		UserID    string
+		KeepCount int
+	}{userID, keepCount})
+	return nil
+}
+
+func (m *MockQuery) ResetFreeTierQuotas(ctx context.Context) (int64, error) { return 0, nil }
+func (m *MockQuery) ExpirePastDueGrace(ctx context.Context, graceHours int) (int64, error) {
+	return 0, nil
 }
 
 func setupRouter(queries db.DBQuery) *chi.Mux {
@@ -259,10 +811,10 @@ func TestChannelHandlers(t *testing.T) {
 		t.Errorf("Expected 200 OK for List, got %v", rr.Code)
 	}
 
-	// 2. Connect YouTube (Redirects)
+	// 2. Connect YouTube — new design returns 200 JSON with auth_url
 	rr = doRequest("GET", "/api/channels/connect/youtube", nil)
-	if rr.Code != http.StatusTemporaryRedirect {
-		t.Errorf("Expected 307 Redirect, got %v", rr.Code)
+	if rr.Code != http.StatusOK {
+		t.Errorf("Expected 200 OK with auth_url JSON, got %v", rr.Code)
 	}
 
 	// 3. Exchange YouTube Code (Mocked to fail oauth due to no real code, but let's test bad request)
@@ -271,10 +823,10 @@ func TestChannelHandlers(t *testing.T) {
 		t.Errorf("Expected 400 Bad Request, got %v", rr.Code)
 	}
 
-	// 4. Pause
+	// 4. Pause — MockQuery's GetUserTracking returns ErrNotFound, so handler returns 404
 	rr = doRequest("PATCH", "/api/channels/yt123/pause", nil)
-	if rr.Code != http.StatusOK {
-		t.Errorf("Expected 200 OK, got %v", rr.Code)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("Expected 404 Not Found (mock has no tracking row), got %v", rr.Code)
 	}
 }
 

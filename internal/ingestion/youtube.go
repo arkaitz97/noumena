@@ -2,90 +2,174 @@ package ingestion
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
+	"net/http"
+	"strconv"
 	"time"
 
 	"golang.org/x/oauth2"
-	"google.golang.org/api/option"
-	"google.golang.org/api/youtube/v3"
-
-	"noumena/internal/auth"
-	"noumena/internal/db"
-	"noumena/internal/oauth"
 )
 
-// FetchAndStoreComments connects to YouTube, fetches recent comments for the channel, and stores them.
-func FetchAndStoreComments(ctx context.Context, q db.DBQuery, pc *db.PlatformChannel) error {
-	accessEnc, refreshEnc, err := q.GetIngestionToken(ctx, pc.ID)
-	if err != nil {
-		return fmt.Errorf("no active ingestion token available: %w", err)
-	}
+// ChannelInfo is the minimal YouTube channel metadata returned by
+// `channels?mine=true&part=snippet`. It is used at OAuth-exchange time to
+// resolve the authorizing user's primary channel id and display name.
+type ChannelInfo struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
 
-	access, err := auth.Decrypt(accessEnc)
-	if err != nil {
-		return err
-	}
-	refresh, err := auth.Decrypt(refreshEnc)
-	if err != nil {
-		return err
-	}
-
-	// We reconstruct the token. Expiry isn't strictly needed here as the Google client will try to refresh if it gets a 401
-	// provided the refresh token is present. (In production we should save and use the expiry).
-	token := &oauth2.Token{
-		AccessToken:  access,
-		RefreshToken: refresh,
-		TokenType:    "Bearer",
-	}
-
-	if oauth.YouTubeConfig == nil {
-		oauth.InitOAuth()
-	}
-
-	client := oauth.YouTubeConfig.Client(ctx, token)
-	ytService, err := youtube.NewService(ctx, option.WithHTTPClient(client))
-	if err != nil {
-		return err
-	}
-
-	call := ytService.CommentThreads.List([]string{"snippet"}).AllThreadsRelatedToChannelId(pc.PlatformChannelID).MaxResults(50)
-	response, err := call.Do()
-	if err != nil {
-		// If authorization fails, the worker can promote the next token.
-		return fmt.Errorf("youtube api call failed: %w", err)
-	}
-
-	for _, item := range response.Items {
-		tlc := item.Snippet.TopLevelComment
-		if tlc == nil {
-			continue
-		}
-
-		postedAt := tlc.Snippet.PublishedAt // simplify parse error handling for this prototype
-
-		t, err := parseTime(postedAt)
-		if err != nil {
-			continue
-		}
-
-		comment := &db.Comment{
-			PlatformChannelID: pc.ID,
-			PlatformCommentID: tlc.Id,
-			AuthorHandle:      &tlc.Snippet.AuthorDisplayName,
-			Body:              tlc.Snippet.TextOriginal,
-			PostedAt:          t,
-		}
-
-		if dbErr := q.InsertComment(ctx, comment); dbErr != nil {
-			log.Printf("Failed to insert comment %s: %v", tlc.Id, dbErr)
-		}
-	}
-
-	return nil
+	// Title is a legacy alias for DisplayName retained for callers that
+	// still reference the old scaffolding's field name.
+	Title string `json:"-"`
 }
 
-// Simple time parser helper for ISO8601 subset that YT sends
-func parseTime(dt string) (time.Time, error) {
-	return time.Parse(time.RFC3339, dt)
+// Comment is the shape produced by the YouTube ingestion poller. The full
+// ingestion implementation (mapping snippets to comments, threading, etc.)
+// lives in Spec 03; this type pins the contract used by callers in this
+// change.
+type Comment struct {
+	PlatformCommentID string
+	ParentCommentID   *string
+	AuthorHandle      string
+	Body              string
+	PostedAt          time.Time
+}
+
+// FetchChannelInfo calls `GET /youtube/v3/channels?mine=true&part=snippet`
+// using the supplied access token. It never logs or persists the token.
+func FetchChannelInfo(ctx context.Context, accessToken string) (*ChannelInfo, error) {
+	if accessToken == "" {
+		return nil, errors.New("access token required")
+	}
+	endpoint := "https://www.googleapis.com/youtube/v3/channels?mine=true&part=snippet"
+
+	doReq := func(ctx context.Context) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+		req.Header.Set("Accept", "application/json")
+		client := &http.Client{Timeout: 15 * time.Second}
+		return client.Do(req)
+	}
+
+	var body []byte
+	err := withBackoff(ctx, func(ctx context.Context) (retry bool, retryAfter time.Duration, err error) {
+		resp, err := doReq(ctx)
+		if err != nil {
+			// Network errors are treated as retryable.
+			return true, 0, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+			retryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
+			return true, retryAfter, fmt.Errorf("youtube channels.list: HTTP %d", resp.StatusCode)
+		}
+		if resp.StatusCode != http.StatusOK {
+			return false, 0, fmt.Errorf("youtube channels.list: HTTP %d", resp.StatusCode)
+		}
+		body = readAll(resp)
+		return false, 0, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var parsed struct {
+		Items []struct {
+			ID      string `json:"id"`
+			Snippet struct {
+				Title string `json:"title"`
+			} `json:"snippet"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("decode channels.list: %w", err)
+	}
+	if len(parsed.Items) == 0 {
+		return nil, errors.New("no youtube channel found for this account")
+	}
+	return &ChannelInfo{
+		ID:          parsed.Items[0].ID,
+		DisplayName: parsed.Items[0].Snippet.Title,
+		Title:       parsed.Items[0].Snippet.Title,
+	}, nil
+}
+
+// FetchComments is the ingestion-side comment fetcher. The full
+// implementation belongs to Spec 03; this stub pins the signature and lets
+// callers (and tests) wire it up. It always returns an empty slice today.
+//
+// The token argument is intentionally an *oauth2.Token so the eventual
+// implementation can use the standard oauth2 HTTP client to refresh the
+// access token transparently.
+func FetchComments(ctx context.Context, token *oauth2.Token, channelID string, since time.Time) ([]Comment, error) {
+	_ = ctx
+	_ = token
+	_ = channelID
+	_ = since
+	return nil, nil
+}
+
+// withBackoff runs op with exponential backoff: 1s, 2s, 4s, 8s, 16s. It
+// honours an explicit retryAfter when present.
+func withBackoff(ctx context.Context, op func(ctx context.Context) (retry bool, retryAfter time.Duration, err error)) error {
+	delays := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second}
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		retry, retryAfter, err := op(ctx)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !retry || attempt >= len(delays) {
+			return lastErr
+		}
+		wait := delays[attempt]
+		if retryAfter > 0 {
+			wait = retryAfter
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
+func parseRetryAfter(h string) time.Duration {
+	if h == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(h); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(h); err == nil {
+		d := time.Until(t)
+		if d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
+func readAll(resp *http.Response) []byte {
+	const max = 4 << 20 // 4 MiB cap
+	buf := make([]byte, 0, 4096)
+	tmp := make([]byte, 4096)
+	for {
+		n, err := resp.Body.Read(tmp)
+		if n > 0 {
+			if len(buf)+n > max {
+				return append(buf, tmp[:max-len(buf)]...)
+			}
+			buf = append(buf, tmp[:n]...)
+		}
+		if err != nil {
+			break
+		}
+	}
+	return buf
 }

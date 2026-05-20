@@ -113,7 +113,7 @@ func TestDBQueries_Full(t *testing.T) {
 		t.Fatalf("GetUnprocessedComments failed: %v", err)
 	}
 
-	err = queries.UpdateCommentLLMData(ctx, commID, "Praise", "none", 0.5, 0.9)
+	err = queries.UpdateCommentLLMData(ctx, commID, "praise", "none", "openai", "gpt-4o", 0.5, 0.9)
 	if err != nil {
 		t.Fatalf("UpdateCommentLLMData failed: %v", err)
 	}
