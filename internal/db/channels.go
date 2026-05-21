@@ -2,17 +2,18 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"time"
 )
 
-func (q *PostgresQuery) ListChannelsForUser(ctx context.Context, userID string) ([]*PlatformChannel, error) {
+func (q *SQLiteQuery) ListChannelsForUser(ctx context.Context, userID string) ([]*PlatformChannel, error) {
 	query := `
 		SELECT pc.id, pc.platform, pc.platform_channel_id, pc.display_name, pc.last_synced_at, pc.created_at
 		FROM platform_channels pc
 		JOIN user_channel_tracking uct ON pc.id = uct.platform_channel_id
-		WHERE uct.user_id = $1 AND uct.tracking_status != 'removed'
+		WHERE uct.user_id = ? AND uct.tracking_status != 'removed'
 	`
-	rows, err := q.pool.Query(ctx, query, userID)
+	rows, err := q.db.QueryContext(ctx, query, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -21,83 +22,88 @@ func (q *PostgresQuery) ListChannelsForUser(ctx context.Context, userID string) 
 	var channels []*PlatformChannel
 	for rows.Next() {
 		var pc PlatformChannel
+		var lastSyncedAt, createdAt sql.NullString
 		if err := rows.Scan(
 			&pc.ID, &pc.Platform, &pc.PlatformChannelID, &pc.DisplayName,
-			&pc.LastSyncedAt, &pc.CreatedAt,
+			&lastSyncedAt, &createdAt,
 		); err != nil {
 			return nil, err
 		}
+		pc.LastSyncedAt = parseTimePtr(lastSyncedAt)
+		pc.CreatedAt = parseTime(createdAt.String)
 		channels = append(channels, &pc)
 	}
 	return channels, nil
 }
 
-func (q *PostgresQuery) ConnectChannelTx(ctx context.Context, userID, platform, platformChannelID, displayName, accessTokenEnc, refreshTokenEnc string, tokenExpiresAt *time.Time) error {
-	tx, err := q.pool.Begin(ctx)
+func (q *SQLiteQuery) ConnectChannelTx(ctx context.Context, userID, platform, platformChannelID, displayName, accessTokenEnc, refreshTokenEnc string, tokenExpiresAt *time.Time) error {
+	tx, err := q.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback()
 
-	// Upsert platform_channels (ignore if exists, but we want the ID regardless)
-	var pcID string
+	pcID := generateUUID()
 	queryPC := `
-		INSERT INTO platform_channels (platform, platform_channel_id, display_name)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (platform, platform_channel_id) DO UPDATE SET display_name = EXCLUDED.display_name
+		INSERT INTO platform_channels (id, platform, platform_channel_id, display_name, created_at)
+		VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+		ON CONFLICT (platform, platform_channel_id) DO UPDATE SET display_name = excluded.display_name
 		RETURNING id
 	`
-	err = tx.QueryRow(ctx, queryPC, platform, platformChannelID, displayName).Scan(&pcID)
+	err = tx.QueryRowContext(ctx, queryPC, pcID, platform, platformChannelID, displayName).Scan(&pcID)
 	if err != nil {
 		return err
 	}
 
-	// Upsert user_channel_tracking (legacy path — does not manage token_priority)
+	var expiresAtStr string
+	if tokenExpiresAt != nil {
+		expiresAtStr = tokenExpiresAt.Format(time.RFC3339)
+	}
 	queryUCT := `
-		INSERT INTO user_channel_tracking (user_id, platform_channel_id, access_token_enc, refresh_token_enc, token_expires_at, tracking_status)
-		VALUES ($1, $2, $3, $4, $5, 'active')
-		ON CONFLICT (user_id, platform_channel_id) DO UPDATE SET 
-			access_token_enc = EXCLUDED.access_token_enc,
-			refresh_token_enc = EXCLUDED.refresh_token_enc,
-			token_expires_at = EXCLUDED.token_expires_at,
+		INSERT INTO user_channel_tracking (id, user_id, platform_channel_id, access_token_enc, refresh_token_enc, token_expires_at, tracking_status, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, 'active', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+		ON CONFLICT (user_id, platform_channel_id) DO UPDATE SET
+			access_token_enc = excluded.access_token_enc,
+			refresh_token_enc = excluded.refresh_token_enc,
+			token_expires_at = excluded.token_expires_at,
 			tracking_status = 'active',
 			token_expiry_notified_at = NULL
 	`
-	_, err = tx.Exec(ctx, queryUCT, userID, pcID, accessTokenEnc, refreshTokenEnc, tokenExpiresAt)
+	_, err = tx.ExecContext(ctx, queryUCT, generateUUID(), userID, pcID, accessTokenEnc, refreshTokenEnc, expiresAtStr)
 	if err != nil {
 		return err
 	}
 
-	return tx.Commit(ctx)
+	return tx.Commit()
 }
 
-func (q *PostgresQuery) PauseChannelTracking(ctx context.Context, userID, pcID string) error {
+func (q *SQLiteQuery) PauseChannelTracking(ctx context.Context, userID, pcID string) error {
 	query := `
 		UPDATE user_channel_tracking
 		SET tracking_status = 'paused'
-		WHERE user_id = $1 AND platform_channel_id = $2
+		WHERE user_id = ? AND platform_channel_id = ?
 	`
-	_, err := q.pool.Exec(ctx, query, userID, pcID)
+	_, err := q.db.ExecContext(ctx, query, userID, pcID)
 	return err
 }
 
-func (q *PostgresQuery) RemoveChannelTracking(ctx context.Context, userID, pcID string) error {
-	// Legacy helper retained for tests; new code should use DeleteTracking.
+func (q *SQLiteQuery) RemoveChannelTracking(ctx context.Context, userID, pcID string) error {
 	query := `
 		DELETE FROM user_channel_tracking
-		WHERE user_id = $1 AND platform_channel_id = $2
+		WHERE user_id = ? AND platform_channel_id = ?
 	`
-	_, err := q.pool.Exec(ctx, query, userID, pcID)
+	_, err := q.db.ExecContext(ctx, query, userID, pcID)
 	return err
 }
 
-func (q *PostgresQuery) GetChannelsForSync(ctx context.Context, minutes int) ([]*PlatformChannel, error) {
+func (q *SQLiteQuery) GetChannelsForSync(ctx context.Context, minutes int) ([]*PlatformChannel, error) {
+	cutoff := time.Now().UTC().Add(-time.Duration(minutes) * time.Minute).Format(time.RFC3339)
 	query := `
 		SELECT id, platform, platform_channel_id, display_name, last_synced_at, created_at
 		FROM platform_channels
-		WHERE last_synced_at IS NULL OR last_synced_at < NOW() - make_interval(mins => $1)
+		WHERE last_synced_at IS NULL OR last_synced_at < ?
 	`
-	rows, err := q.pool.Query(ctx, query, minutes)
+	rows, err := q.db.QueryContext(ctx, query, cutoff)
 	if err != nil {
 		return nil, err
 	}
@@ -106,18 +112,28 @@ func (q *PostgresQuery) GetChannelsForSync(ctx context.Context, minutes int) ([]
 	var channels []*PlatformChannel
 	for rows.Next() {
 		var pc PlatformChannel
+		var lastSyncedAt, createdAt sql.NullString
 		if err := rows.Scan(
 			&pc.ID, &pc.Platform, &pc.PlatformChannelID, &pc.DisplayName,
-			&pc.LastSyncedAt, &pc.CreatedAt,
+			&lastSyncedAt, &createdAt,
 		); err != nil {
 			return nil, err
 		}
+		pc.LastSyncedAt = parseTimePtr(lastSyncedAt)
+		pc.CreatedAt = parseTime(createdAt.String)
 		channels = append(channels, &pc)
 	}
 	return channels, nil
 }
 
-func (q *PostgresQuery) UpdateSyncTime(ctx context.Context, id string) error {
-	_, err := q.pool.Exec(ctx, "UPDATE platform_channels SET last_synced_at = NOW() WHERE id = $1", id)
+func (q *SQLiteQuery) UpdateSyncTime(ctx context.Context, id string) error {
+	_, err := q.db.ExecContext(ctx, "UPDATE platform_channels SET last_synced_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?", id)
 	return err
+}
+
+func parseNullString(s string) sql.NullString {
+	if s == "" {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: s, Valid: true}
 }

@@ -1,8 +1,8 @@
 package llm
 
 import (
+	"encoding/json"
 	"testing"
-	"time"
 
 	"noumena/internal/db"
 )
@@ -10,62 +10,37 @@ import (
 func ptrFloat(f float64) *float64 { return &f }
 func ptrStr(s string) *string     { return &s }
 
-func TestComputeSentimentAverage(t *testing.T) {
-	if got := computeSentimentAverage(nil); got != 0 {
-		t.Errorf("nil → 0 want, got %v", got)
+func TestComputeTopActionableInsights(t *testing.T) {
+	insights := []Insight{
+		{Type: "video_idea", Description: "Make a tutorial", Confidence: 0.9},
+		{Type: "video_idea", Description: "Make a tutorial", Confidence: 0.8},
+		{Type: "editing_tip", Description: "Use crossfade", Confidence: 0.7},
 	}
+	b, _ := json.Marshal(insights)
 	cs := []*db.Comment{
-		{SentimentScore: ptrFloat(1.0)},
-		{SentimentScore: ptrFloat(-1.0)},
-		{SentimentScore: ptrFloat(0.5)},
+		{ActionableInsights: b},
+		{ActionableInsights: b},
+		{ActionableInsights: []byte("[]")},
 	}
-	got := computeSentimentAverage(cs)
-	want := (1.0 - 1.0 + 0.5) / 3.0
-	if got != want {
-		t.Errorf("avg got %v want %v", got, want)
+	got := computeTopActionableInsights(cs, 5)
+	if len(got) != 2 {
+		t.Fatalf("want 2 insights got %d", len(got))
 	}
-	// All-NULL comments → 0, not panic.
-	cs = []*db.Comment{{}, {}}
-	if got := computeSentimentAverage(cs); got != 0 {
-		t.Errorf("all-NULL → 0 want, got %v", got)
+	if got[0].Type != "video_idea" || got[0].Count != 4 {
+		t.Errorf("rank-1 want video_idea/4 got %+v", got[0])
 	}
 }
 
-func TestComputeSentimentTrend(t *testing.T) {
-	// No baseline.
-	if d, p := computeSentimentTrend(0.5, 0); d != "stable" || p != 0 {
-		t.Errorf("zero baseline want stable/0 got %s/%v", d, p)
-	}
-	// Improving (well above +1%).
-	if d, _ := computeSentimentTrend(0.5, 0.3); d != "improving" {
-		t.Errorf("0.3→0.5 want improving got %s", d)
-	}
-	// Declining.
-	if d, _ := computeSentimentTrend(0.3, 0.5); d != "declining" {
-		t.Errorf("0.5→0.3 want declining got %s", d)
-	}
-	// Stable: tiny change inside ±1.0 pp.
-	if d, _ := computeSentimentTrend(0.5005, 0.5); d != "stable" {
-		t.Errorf("0.5→0.5005 want stable got %s", d)
-	}
-}
-
-func TestComputeSentimentQuality(t *testing.T) {
-	if got := computeSentimentQuality(-1.0); got != 0 {
-		t.Errorf("-1 → 0 got %d", got)
-	}
-	if got := computeSentimentQuality(1.0); got != 100 {
-		t.Errorf("1 → 100 got %d", got)
-	}
-	if got := computeSentimentQuality(0.0); got != 50 {
-		t.Errorf("0 → 50 got %d", got)
+func TestComputeTopActionableInsights_Empty(t *testing.T) {
+	if got := computeTopActionableInsights(nil, 5); got != nil {
+		t.Errorf("nil → nil want, got %v", got)
 	}
 }
 
 func TestComputeHealthScore(t *testing.T) {
-	got := computeHealthScore(HealthScoreBreakdown{ResponseRate: 60, SentimentQuality: 90, EngagementDepth: 30})
-	if got != 60 {
-		t.Errorf("equal-weight mean want 60 got %d", got)
+	got := computeHealthScore(HealthScoreBreakdown{ResponseRate: 60, EngagementDepth: 30})
+	if got != 45 {
+		t.Errorf("equal-weight mean want 45 got %d", got)
 	}
 }
 
@@ -114,19 +89,17 @@ func TestComputeCategoryDistribution(t *testing.T) {
 }
 
 func TestSelectSampleComments(t *testing.T) {
-	now := time.Now()
 	cs := []*db.Comment{
-		{Body: "neutral", SentimentScore: ptrFloat(0.0), PostedAt: now},
-		{Body: "very-negative", SentimentScore: ptrFloat(-0.95), PostedAt: now},
-		{Body: "very-positive", SentimentScore: ptrFloat(0.9), PostedAt: now.Add(-time.Hour)},
-		{Body: "no-score", PostedAt: now},
+		{Body: "high-conf", Confidence: ptrFloat(0.95)},
+		{Body: "low-conf", Confidence: ptrFloat(0.3)},
+		{Body: "no-conf"},
 	}
 	got := selectSampleComments(cs, 2)
 	if len(got) != 2 {
 		t.Fatalf("want 2 got %d", len(got))
 	}
-	// Expect very-negative first (|0.95|), very-positive second (|0.9|).
-	if got[0] != "very-negative" || got[1] != "very-positive" {
+	// Expect high-conf first, low-conf second.
+	if got[0] != "high-conf" || got[1] != "low-conf" {
 		t.Errorf("ranking got %+v", got)
 	}
 }

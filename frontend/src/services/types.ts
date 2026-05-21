@@ -75,6 +75,14 @@ export interface ApiErrorBody {
 
 import type { Category } from '../lib/categories'
 
+export type InsightType = 'video_idea' | 'editing_tip' | 'feature_request' | 'collaboration_ask' | 'improvement_suggestion' | 'content_format_request' | 'other'
+
+export interface Insight {
+  type: InsightType
+  description: string
+  confidence: number
+}
+
 export interface Comment {
   id: string
   channel_id: string
@@ -87,7 +95,7 @@ export interface Comment {
   processed_at: string | null
   category: Category | null
   topic?: string | null
-  sentiment_score: number | null
+  actionable_insights: Insight[] | null
   is_starred: boolean
   starred_at?: string | null
 }
@@ -95,13 +103,12 @@ export interface Comment {
 export interface FeedFilters {
   channels: string[]
   categories: Category[]
-  sentiment_min: number | null
-  sentiment_max: number | null
+  insight_type: InsightType | null
   date_from: string | null
   date_to: string | null
   search: string
   include_toxic: boolean
-  sort: 'newest' | 'sentiment_desc' | 'sentiment_asc'
+  sort: 'newest'
 }
 
 export interface FeedResponse {
@@ -112,21 +119,17 @@ export interface FeedResponse {
 
 export type WindowKey = '7d' | '30d' | '90d'
 
-export interface SentimentBucket {
-  bucket: string // ISO date or window slot
-  avg: number
+export interface InsightDistributionItem {
+  type: InsightType
   count: number
-  positive_pct?: number
-  negative_pct?: number
-  neutral_pct?: number
 }
 
-export interface SentimentResponse {
+export interface InsightAggregatesResponse {
   window: WindowKey
   channel_id: string | null
-  series: SentimentBucket[]
-  avg: number
-  count: number
+  distribution: InsightDistributionItem[]
+  top_insights: Array<{ type: InsightType; description: string; count: number }>
+  total_insights: number
 }
 
 export interface ToxicityBucket {
@@ -168,7 +171,7 @@ export interface WeeklyDigest {
   week_end: string
   top_ideas: Array<{ title: string; summary?: string; source_count?: number }>
   top_questions: Array<{ title: string; summary?: string; source_count?: number }>
-  sentiment_trend: { avg_7d: number; avg_30d: number; delta?: number; direction?: 'up' | 'down' | 'flat' }
+  top_actionable_insights: Array<{ type: InsightType; description: string; count: number }>
   health_score: number | null
 }
 

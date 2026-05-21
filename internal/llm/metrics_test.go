@@ -37,7 +37,7 @@ func rebindLLMMeters() {
 	llmRequestsTotal, _ = llmMeter.Int64Counter("noumena_llm_requests_total")
 	llmTokensTotal, _ = llmMeter.Int64Counter("noumena_llm_tokens_total")
 	llmRequestDurationSecs, _ = llmMeter.Float64Histogram("noumena_llm_request_duration_seconds")
-	llmFailoverSwitchTotal, _ = llmMeter.Int64Counter("noumena_llm_failover_switch_total")
+	llmFailoverTotal, _ = llmMeter.Int64Counter("noumena_llm_failover_total")
 }
 
 func sumWithAttrs(rm *metricdata.ResourceMetrics, name string, want map[string]string) int64 {
@@ -114,23 +114,6 @@ func TestRecordLLMRequestTimeout(t *testing.T) {
 	}
 }
 
-// TestRecordLLMFailoverSwitch covers the spec scenario "Failover
-// switch is recorded once per transition".
-func TestRecordLLMFailoverSwitch(t *testing.T) {
-	reader, restore := installManualReader(t)
-	defer restore()
-
-	recordLLMFailoverSwitch(context.Background(), "opencode", "anthropic")
-
-	rm := &metricdata.ResourceMetrics{}
-	_ = reader.Collect(context.Background(), rm)
-	if got := sumWithAttrs(rm, "noumena_llm_failover_switch_total", map[string]string{
-		"from_provider": "opencode", "to_provider": "anthropic",
-	}); got != 1 {
-		t.Errorf("failover_switch_total: got %d, want 1", got)
-	}
-}
-
 // errWrap returns an error that satisfies errors.Is(err, target).
 type wrappedErr struct{ inner error }
 
@@ -138,3 +121,33 @@ func (w *wrappedErr) Error() string { return "wrapped: " + w.inner.Error() }
 func (w *wrappedErr) Unwrap() error { return w.inner }
 
 func errWrap(target error) error { return &wrappedErr{inner: target} }
+
+// TestNoOpMetricsDoNotPanic verifies that with the default no-op
+// MeterProvider, calling every record function is safe.
+func TestNoOpMetricsDoNotPanic(t *testing.T) {
+	ctx := context.Background()
+	recordLLMRequest(ctx, "openai", "gpt-4o", time.Now(), nil)
+	recordLLMTokens(ctx, "openai", "gpt-4o", 100)
+	recordLLMFailover(ctx, "openai", "anthropic")
+}
+
+// TestRecordLLMFailover asserts that a failover event increments the
+// failover counter with the correct (from_provider, to_provider) attrs.
+func TestRecordLLMFailover(t *testing.T) {
+	reader, restore := installManualReader(t)
+	defer restore()
+
+	recordLLMFailover(context.Background(), "openai", "anthropic")
+	recordLLMFailover(context.Background(), "openai", "anthropic")
+
+	rm := &metricdata.ResourceMetrics{}
+	if err := reader.Collect(context.Background(), rm); err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	got := sumWithAttrs(rm, "noumena_llm_failover_total", map[string]string{
+		"from_provider": "openai", "to_provider": "anthropic",
+	})
+	if got != 2 {
+		t.Errorf("failover_total: got %d, want 2", got)
+	}
+}

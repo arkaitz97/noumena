@@ -27,10 +27,8 @@ useFilterUrlSync<FeedFilters>({
   serialise: (f) => {
     const q: Record<string, string> = {}
     if (f.channels.length > 0) q.channels = f.channels.join(',')
-    // The saved view doesn't surface include_toxic / sort, so don't emit them.
     if (f.categories.length > 0) q.categories = f.categories.join(',')
-    if (f.sentiment_min !== null && f.sentiment_min > -1) q.sentiment_min = String(f.sentiment_min)
-    if (f.sentiment_max !== null && f.sentiment_max < 1) q.sentiment_max = String(f.sentiment_max)
+    if (f.insight_type) q.insight_type = f.insight_type
     if (f.date_from) q.date_from = f.date_from
     if (f.date_to) q.date_to = f.date_to
     if (f.search) q.search = f.search
@@ -46,16 +44,8 @@ useFilterUrlSync<FeedFilters>({
         .split(',')
         .filter((c): c is Category => (CATEGORIES as readonly string[]).includes(c))
     }
-    const sMin = asString(query.sentiment_min)
-    if (sMin !== null) {
-      const n = Number(sMin)
-      if (Number.isFinite(n)) out.sentiment_min = n
-    }
-    const sMax = asString(query.sentiment_max)
-    if (sMax !== null) {
-      const n = Number(sMax)
-      if (Number.isFinite(n)) out.sentiment_max = n
-    }
+    const insightType = asString(query.insight_type)
+    if (insightType) out.insight_type = insightType as FeedFilters['insight_type']
     const df = asString(query.date_from)
     if (df) out.date_from = df
     const dt = asString(query.date_to)

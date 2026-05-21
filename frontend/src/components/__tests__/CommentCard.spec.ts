@@ -1,9 +1,3 @@
-// CommentCard.spec.ts — colocated component test for CommentCard.vue.
-//
-// Contract under test (per `openspec/changes/frontend-component-extraction/specs/frontend-component-library/spec.md`):
-//   - typed props `comment: Comment`, `isStarred?: boolean`
-//   - emits `toggle-star` with the comment id when the star button is activated
-//   - shows a "Processing…" badge when `comment.processed_at === null`
 import { describe, it, expect } from 'vitest'
 import { mount } from '@vue/test-utils'
 import CommentCard from '../CommentCard.vue'
@@ -22,7 +16,7 @@ function makeComment(overrides: Partial<Comment> = {}): Comment {
     processed_at: new Date().toISOString(),
     category: 'idea',
     topic: null,
-    sentiment_score: 0.5,
+    actionable_insights: null,
     is_starred: false,
     starred_at: null,
     ...overrides,
@@ -53,5 +47,19 @@ describe('CommentCard', () => {
     const events = wrapper.emitted('toggle-star')
     expect(events).toBeTruthy()
     expect(events![0][0]).toBe('abc')
+  })
+
+  it('shows insights count badge when comment has actionable_insights', () => {
+    const wrapper = mount(CommentCard, {
+      props: {
+        comment: makeComment({
+          actionable_insights: [
+            { type: 'video_idea', description: 'Make a tutorial', confidence: 0.85 },
+          ],
+        }),
+        isStarred: false,
+      },
+    })
+    expect(wrapper.text()).toContain('1 insight')
   })
 })

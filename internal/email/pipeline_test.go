@@ -38,9 +38,16 @@ func TestRenderAllTemplates(t *testing.T) {
 			"SentimentDirection": "up",
 			"SentimentChangePct": 5,
 		},
+		TemplateDigestDelayed:        {"WeekRange": "2026-04-20 - 2026-04-26"},
 		TemplateExportReady:        {"DownloadURL": "https://app/export?sig=x&exp=1", "ExpiresAt": time.Now().Add(48 * time.Hour).Format(time.RFC3339)},
 		TemplateDeletionScheduled:  {"ReversibleUntil": time.Now().Add(48 * time.Hour).Format(time.RFC3339)},
 		TemplateDeletionCompleted:  map[string]any{},
+		TemplatePlanDowngrade: {
+			"OldPlan":        "Creator",
+			"NewPlan":        "Free",
+			"ChannelLimit":   1,
+			"PausedChannels": true,
+		},
 	}
 
 	for _, id := range TemplateIDs {

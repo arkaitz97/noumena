@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { Search, X, Download, RefreshCw } from 'lucide-vue-next'
-import type { Channel, FeedFilters } from '../services/types'
+import type { Channel, FeedFilters, InsightType } from '../services/types'
 import {
   CATEGORY_COLORS,
   CATEGORY_LABELS,
@@ -9,6 +9,26 @@ import {
   TOXIC_CATEGORIES,
   type Category,
 } from '../lib/categories'
+
+const INSIGHT_TYPE_LABELS: Record<InsightType, string> = {
+  video_idea: 'Video Ideas',
+  editing_tip: 'Editing Tips',
+  feature_request: 'Feature Requests',
+  collaboration_ask: 'Collaboration Asks',
+  improvement_suggestion: 'Improvements',
+  content_format_request: 'Format Requests',
+  other: 'Other',
+}
+
+const INSIGHT_TYPES: InsightType[] = [
+  'video_idea',
+  'editing_tip',
+  'feature_request',
+  'collaboration_ask',
+  'improvement_suggestion',
+  'content_format_request',
+  'other',
+]
 
 const props = defineProps<{
   filters: FeedFilters
@@ -25,7 +45,6 @@ const emit = defineEmits<{
 const variant = computed(() => props.variant ?? 'feed')
 const isFeed = computed(() => variant.value === 'feed')
 
-// Debounced search input.
 const searchInput = ref<string>(props.filters.search)
 let searchTimer: number | null = null
 watch(
@@ -42,7 +61,6 @@ function onSearchInput(e: Event): void {
   }, 300)
 }
 
-// Channel multi-select via simple checkbox menu.
 function toggleChannel(id: string): void {
   const set = new Set(props.filters.channels)
   if (set.has(id)) set.delete(id)
@@ -50,7 +68,6 @@ function toggleChannel(id: string): void {
   emit('update:filters', { channels: Array.from(set) })
 }
 
-// Category pills.
 const visibleCategories = computed<Category[]>(() => {
   if (!isFeed.value) return HIGH_SIGNAL_CATEGORIES
   return props.filters.include_toxic
@@ -71,7 +88,6 @@ function toggleIncludeToxic(): void {
   const next = !props.filters.include_toxic
   const partial: Partial<FeedFilters> = { include_toxic: next }
   if (!next) {
-    // Drop toxic categories when toggling off.
     partial.categories = props.filters.categories.filter(
       (c) => !TOXIC_CATEGORIES.includes(c),
     )
@@ -79,25 +95,13 @@ function toggleIncludeToxic(): void {
   emit('update:filters', partial)
 }
 
-// Sentiment range.
-function setSentimentMin(v: number): void {
-  let min = v
-  let max = props.filters.sentiment_max ?? 1
-  if (min > max) min = max
-  emit('update:filters', { sentiment_min: Number(min.toFixed(2)) })
-}
-function setSentimentMax(v: number): void {
-  let max = v
-  let min = props.filters.sentiment_min ?? -1
-  if (max < min) max = min
-  emit('update:filters', { sentiment_max: Number(max.toFixed(2)) })
+function setInsightType(t: InsightType | null): void {
+  emit('update:filters', { insight_type: t })
 }
 
-// Date range presets.
 type DatePreset = '7d' | '30d' | '90d' | 'custom' | null
 const datePreset = computed<DatePreset>(() => {
   if (!props.filters.date_from && !props.filters.date_to) return null
-  // If both are set with no specific preset → custom.
   return 'custom'
 })
 function setDatePreset(p: DatePreset): void {
@@ -118,10 +122,6 @@ function setDatePreset(p: DatePreset): void {
   }
 }
 
-function setSort(s: FeedFilters['sort']): void {
-  emit('update:filters', { sort: s })
-}
-
 const showCustom = ref(false)
 watch(
   () => datePreset.value,
@@ -131,7 +131,6 @@ watch(
   { immediate: true },
 )
 
-// Export menu.
 const exportOpen = ref(false)
 function toggleExportMenu(): void {
   exportOpen.value = !exportOpen.value
@@ -143,7 +142,6 @@ function doReset(): void {
 
 <template>
   <div class="bg-white shadow-sm ring-1 ring-zinc-950/5 rounded-2xl p-4 sm:p-5 space-y-4">
-    <!-- Top row: search + sort + actions -->
     <div class="flex flex-col sm:flex-row gap-3">
       <div class="relative flex-1">
         <Search class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-400" />
@@ -155,19 +153,6 @@ function doReset(): void {
           aria-label="Search comments"
           class="appearance-none block w-full pl-9 pr-4 py-2.5 border border-zinc-200 rounded-xl shadow-sm placeholder-zinc-400 text-sm focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900 transition-colors bg-zinc-50/50 focus:bg-white text-zinc-900"
         />
-      </div>
-      <div v-if="isFeed" class="flex items-center gap-2">
-        <label for="filterbar-sort" class="sr-only">Sort by</label>
-        <select
-          id="filterbar-sort"
-          :value="filters.sort"
-          @change="setSort(($event.target as HTMLSelectElement).value as FeedFilters['sort'])"
-          class="block pl-3 pr-8 py-2.5 text-sm text-zinc-900 border border-zinc-200 focus:outline-none focus:ring-zinc-900 focus:border-zinc-900 rounded-xl bg-zinc-50/50 hover:bg-zinc-50 transition-colors cursor-pointer"
-        >
-          <option value="newest">Newest</option>
-          <option value="sentiment_desc">Most positive</option>
-          <option value="sentiment_asc">Most negative</option>
-        </select>
       </div>
       <div class="flex items-center gap-2">
         <button
@@ -205,7 +190,6 @@ function doReset(): void {
       </div>
     </div>
 
-    <!-- Channels chips -->
     <div v-if="channels.length > 0">
       <p class="text-xs font-medium text-zinc-500 uppercase tracking-wider mb-2">Channels</p>
       <div class="flex flex-wrap gap-1.5">
@@ -227,7 +211,6 @@ function doReset(): void {
       </div>
     </div>
 
-    <!-- Categories pill group -->
     <div>
       <div class="flex items-center justify-between mb-2">
         <p class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Categories</p>
@@ -258,52 +241,40 @@ function doReset(): void {
       </div>
     </div>
 
-    <!-- Sentiment range slider -->
-    <div>
-      <div class="flex items-center justify-between mb-1">
-        <p class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Sentiment</p>
-        <span class="text-[11px] tabular-nums text-zinc-500">
-          {{ (filters.sentiment_min ?? -1).toFixed(2) }} to {{ (filters.sentiment_max ?? 1).toFixed(2) }}
-        </span>
-      </div>
-      <div class="grid grid-cols-2 gap-3">
-        <label class="flex flex-col gap-1">
-          <span class="text-[11px] text-zinc-500">Min (Negative ←)</span>
-          <input
-            type="range"
-            min="-1"
-            max="1"
-            step="0.05"
-            :value="filters.sentiment_min ?? -1"
-            @input="setSentimentMin(Number(($event.target as HTMLInputElement).value))"
-            class="accent-zinc-900"
-            aria-label="Sentiment minimum"
-          />
-        </label>
-        <label class="flex flex-col gap-1">
-          <span class="text-[11px] text-zinc-500">Max (→ Positive)</span>
-          <input
-            type="range"
-            min="-1"
-            max="1"
-            step="0.05"
-            :value="filters.sentiment_max ?? 1"
-            @input="setSentimentMax(Number(($event.target as HTMLInputElement).value))"
-            class="accent-zinc-900"
-            aria-label="Sentiment maximum"
-          />
-        </label>
-      </div>
-      <div class="flex justify-between text-[10px] text-zinc-400 mt-1 px-1">
-        <span>-1</span>
-        <span>-0.3</span>
-        <span>0</span>
-        <span>+0.3</span>
-        <span>+1</span>
+    <div v-if="isFeed">
+      <p class="text-xs font-medium text-zinc-500 uppercase tracking-wider mb-2">Insight type</p>
+      <div class="flex flex-wrap gap-1.5">
+        <button
+          type="button"
+          @click="setInsightType(null)"
+          :aria-pressed="filters.insight_type === null"
+          :class="[
+            'inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium ring-1 ring-inset transition-colors',
+            filters.insight_type === null
+              ? 'bg-zinc-900 text-white ring-zinc-900'
+              : 'bg-white text-zinc-700 ring-zinc-200 hover:bg-zinc-50',
+          ]"
+        >
+          All
+        </button>
+        <button
+          v-for="t in INSIGHT_TYPES"
+          :key="t"
+          type="button"
+          @click="setInsightType(t)"
+          :aria-pressed="filters.insight_type === t"
+          :class="[
+            'inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium ring-1 ring-inset transition-colors',
+            filters.insight_type === t
+              ? 'bg-indigo-600 text-white ring-indigo-600'
+              : 'bg-white text-zinc-700 ring-zinc-200 hover:bg-zinc-50',
+          ]"
+        >
+          {{ INSIGHT_TYPE_LABELS[t] }}
+        </button>
       </div>
     </div>
 
-    <!-- Date range -->
     <div>
       <p class="text-xs font-medium text-zinc-500 uppercase tracking-wider mb-2">Date range</p>
       <div class="flex flex-wrap items-center gap-1.5">

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -96,7 +97,17 @@ func OtelMiddleware() func(http.Handler) http.Handler {
 			start := time.Now()
 			sr := &statusRecorder{ResponseWriter: w}
 			next.ServeHTTP(sr, r)
-			elapsed := time.Since(start).Seconds()
+			elapsed := time.Since(start)
+			elapsedSec := elapsed.Seconds()
+
+			// Slow request logging (>1000ms threshold).
+			if elapsed > 1000*time.Millisecond {
+				route := "unknown"
+				if rc := chi.RouteContext(r.Context()); rc != nil && rc.RoutePattern() != "" {
+					route = rc.RoutePattern()
+				}
+				log.Printf("[slow-request] %s %s took %s", r.Method, route, elapsed)
+			}
 
 			// Resolve the chi route pattern AFTER the handler ran;
 			// chi populates RouteContext during routing.
@@ -116,7 +127,7 @@ func OtelMiddleware() func(http.Handler) http.Handler {
 				attribute.String("status", strconv.Itoa(status)),
 			)
 			httpRequestsTotal.Add(r.Context(), 1, attrs)
-			httpRequestDuration.Record(r.Context(), elapsed, attrs)
+			httpRequestDuration.Record(r.Context(), elapsedSec, attrs)
 		})
 	}
 }

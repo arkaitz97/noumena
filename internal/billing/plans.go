@@ -108,3 +108,14 @@ func IsPaidPlan(plan string) bool {
 func TracksOverage(plan string) bool {
 	return plan == PlanCreator || plan == PlanStudio
 }
+
+// AnnualDiscountPercent returns the discount percentage for annual billing
+// (20% for all paid plans). Used by the checkout session and dashboard.
+func AnnualDiscountPercent() float64 {
+	return 20.0
+}
+
+// AnnualPriceFromMonthly calculates the annual price with 20% discount.
+func AnnualPriceFromMonthly(monthlyCents int) int {
+	return int(float64(monthlyCents) * 12 * 0.8)
+}

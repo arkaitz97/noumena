@@ -30,7 +30,7 @@ type opencodeClient struct {
 
 // NewOpenCodeClient constructs an LLMClient backed by the OpenCode HTTP API.
 // Empty arguments fall back to documented defaults.
-func NewOpenCodeClient(apiKey, baseURL, model string) LLMClient {
+func NewOpenCodeClient(apiKey, baseURL, model string) *opencodeClient {
 	if baseURL == "" {
 		baseURL = "https://api.opencode.local/v1"
 	}
@@ -68,6 +68,87 @@ func newOpenCodeClientWithHTTP(client *http.Client, baseURL, apiKey, model strin
 
 func (c *opencodeClient) ProviderName() string { return "opencode" }
 func (c *opencodeClient) ModelName() string    { return c.model }
+
+// GenerateDigestRaw sends a digest prompt to the OpenCode chat completions
+// endpoint with retry-with-backoff (reuses the same transport and retry
+// logic as ClassifyBatch). Returns the raw model content string.
+func (c *opencodeClient) GenerateDigestRaw(ctx context.Context, prompt string) (string, error) {
+	reqBody := opencodeChatRequest{
+		Model: c.model,
+		Messages: []opencodeChatMessage{
+			{Role: "system", Content: "You are a creator-audience analyst. Return ONLY a single JSON object."},
+			{Role: "user", Content: prompt},
+		},
+		Temperature: 0.4,
+	}
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("opencode: marshal digest request: %w", err)
+	}
+
+	endpoint := c.baseURL + "/chat/completions"
+	backoff := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
+	var lastErr error
+	for attempt := 0; attempt < len(backoff)+1; attempt++ {
+		content, retryAfter, retryable, err := c.doOnceDigest(ctx, endpoint, bodyBytes)
+		if err == nil {
+			return content, nil
+		}
+		lastErr = err
+		if !retryable || attempt == len(backoff) {
+			break
+		}
+		wait := backoff[attempt]
+		if retryAfter > 0 {
+			wait = retryAfter
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+	return "", fmt.Errorf("opencode: digest retries exhausted: %w", lastErr)
+}
+
+// doOnceDigest performs a single HTTP attempt for digest generation.
+// Returns (content, retryAfter, retryable, err).
+func (c *opencodeClient) doOnceDigest(ctx context.Context, endpoint string, body []byte) (string, time.Duration, bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return "", 0, false, fmt.Errorf("opencode: build digest request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", 0, true, fmt.Errorf("opencode: digest transport: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+		retryAfter := parseRetryAfterSeconds(resp.Header.Get("Retry-After"))
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return "", retryAfter, true, fmt.Errorf("opencode: digest HTTP %d", resp.StatusCode)
+	}
+	if resp.StatusCode >= 400 {
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", 0, false, fmt.Errorf("opencode: digest HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet)))
+	}
+
+	var parsed opencodeChatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return "", 0, false, fmt.Errorf("opencode: digest decode response: %w", err)
+	}
+	if len(parsed.Choices) == 0 {
+		return "", 0, false, fmt.Errorf("opencode: digest empty response choices")
+	}
+	return parsed.Choices[0].Message.Content, 0, false, nil
+}
 
 // chatCompletionRequest mirrors the small subset of the OpenAI-compatible
 // /v1/chat/completions request body that we actually populate.

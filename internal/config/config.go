@@ -48,22 +48,14 @@ type Config struct {
 	IngestionDeadLetterAlertTo   string
 
 	// LLM batch-processing (llm-processing change)
-	LLMProcessorEnabled        bool
-	LLMProcessorTickInterval   time.Duration
-	LLMBatchSize               int
-	LLMPrimaryProvider         string
-	LLMFallbackProvider        string
-	LLMFailoverErrorThreshold  int
-	LLMFailoverWindowSeconds   int
-	LLMConfidenceThreshold     float64
-	LLMProcessorShutdownGrace  time.Duration
-	OpenAIAPIKey               string
-	OpenAIModel                string
-	AnthropicAPIKey            string
-	AnthropicModel             string
-	OpenCodeAPIKey             string
-	OpenCodeBaseURL            string
-	OpenCodeModel              string
+	LLMProcessorEnabled       bool
+	LLMProcessorTickInterval  time.Duration
+	LLMBatchSize              int
+	LLMConfidenceThreshold    float64
+	LLMProcessorShutdownGrace time.Duration
+	OpenCodeAPIKey            string
+	OpenCodeBaseURL           string
+	OpenCodeModel             string
 
 	// Insights API (insights-api change)
 	InsightsAPIEnabled       bool
@@ -128,6 +120,15 @@ type Config struct {
 	OTELExporterOTLPEndpoint string
 	OTELServiceName          string
 	OTELResourceAttributes   string
+
+	// Rate limiting (spec-gap-improvements). PostgreSQL-backed sliding window.
+	RateLimitEnabled          bool
+	RateLimitAuthMaxPerMin    int
+	RateLimitUnauthMaxPerMin  int
+	RateLimitCleanupTick      time.Duration
+
+	// Cookie security. Secure cookies require HTTPS; set false for local HTTP dev.
+	CookieSecure bool
 }
 
 // Default holds the process-wide configuration. Tests may override fields
@@ -156,14 +157,8 @@ var Default = &Config{
 	LLMProcessorEnabled:       false, // gated until smoke-tested
 	LLMProcessorTickInterval:  10 * time.Second,
 	LLMBatchSize:              50,
-	LLMPrimaryProvider:        "opencode",
-	LLMFallbackProvider:       "anthropic",
-	LLMFailoverErrorThreshold: 5,
-	LLMFailoverWindowSeconds:  60,
 	LLMConfidenceThreshold:    0.7,
 	LLMProcessorShutdownGrace: 30 * time.Second,
-	OpenAIModel:               "gpt-4o",
-	AnthropicModel:            "claude-3-5-sonnet-latest",
 	OpenCodeBaseURL:           "https://api.opencode.local/v1",
 	OpenCodeModel:             "opencode/default",
 
@@ -189,7 +184,7 @@ var Default = &Config{
 	AccountLifecycleAPIEnabled: false,
 	ExportStorageDir:           "/var/lib/noumena/data-exports",
 	ExportLinkTTLDays:          7,
-	DeletionReversibleHours:    48,
+	DeletionReversibleHours:    720,
 	DeletionChunkSize:          10000,
 	ExportPreDeleteTimeout:     12 * time.Hour,
 
@@ -198,6 +193,15 @@ var Default = &Config{
 	// `service.name` resource attribute.
 	OTELEnabled:     false,
 	OTELServiceName: "noumena-api",
+
+	// Rate limiting defaults. 100 req/min authenticated, 10 req/min unauthenticated.
+	RateLimitEnabled:         false,
+	RateLimitAuthMaxPerMin:   100,
+	RateLimitUnauthMaxPerMin: 10,
+	RateLimitCleanupTick:     5 * time.Minute,
+
+	// Cookie security. Secure by default (HTTPS only); set COOKIE_SECURE=false for local HTTP dev.
+	CookieSecure: true,
 }
 
 // Load reads configuration from environment variables, applying defaults
@@ -373,26 +377,6 @@ func Load(strict bool) (*Config, error) {
 		}
 		c.LLMBatchSize = n
 	}
-	if v := os.Getenv("LLM_PRIMARY_PROVIDER"); v != "" {
-		c.LLMPrimaryProvider = v
-	}
-	if v := os.Getenv("LLM_FALLBACK_PROVIDER"); v != "" {
-		c.LLMFallbackProvider = v
-	}
-	if v := os.Getenv("LLM_FAILOVER_ERROR_THRESHOLD"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n <= 0 {
-			return nil, fmt.Errorf("LLM_FAILOVER_ERROR_THRESHOLD must be a positive integer")
-		}
-		c.LLMFailoverErrorThreshold = n
-	}
-	if v := os.Getenv("LLM_FAILOVER_WINDOW_SECONDS"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n <= 0 {
-			return nil, fmt.Errorf("LLM_FAILOVER_WINDOW_SECONDS must be a positive integer")
-		}
-		c.LLMFailoverWindowSeconds = n
-	}
 	if v := os.Getenv("LLM_CONFIDENCE_THRESHOLD"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil || f < 0 || f > 1 {
@@ -406,14 +390,6 @@ func Load(strict bool) (*Config, error) {
 			return nil, fmt.Errorf("LLM_PROCESSOR_SHUTDOWN_GRACE: %w", err)
 		}
 		c.LLMProcessorShutdownGrace = d
-	}
-	c.OpenAIAPIKey = os.Getenv("OPENAI_API_KEY")
-	if v := os.Getenv("OPENAI_MODEL"); v != "" {
-		c.OpenAIModel = v
-	}
-	c.AnthropicAPIKey = os.Getenv("ANTHROPIC_API_KEY")
-	if v := os.Getenv("ANTHROPIC_MODEL"); v != "" {
-		c.AnthropicModel = v
 	}
 	c.OpenCodeAPIKey = os.Getenv("OPENCODE_API_KEY")
 	if v := os.Getenv("OPENCODE_BASE_URL"); v != "" {
@@ -645,6 +621,36 @@ func Load(strict bool) (*Config, error) {
 	c.OTELResourceAttributes = os.Getenv("OTEL_RESOURCE_ATTRIBUTES")
 	if c.OTELEnabled && c.OTELExporterOTLPEndpoint == "" {
 		return nil, fmt.Errorf("OTEL_ENABLED=true but OTEL_EXPORTER_OTLP_ENDPOINT is unset")
+	}
+
+	// --- Rate limiting (spec-gap-improvements) ----------------------------
+	if v := os.Getenv("RATE_LIMIT_ENABLED"); v != "" {
+		c.RateLimitEnabled = v == "1" || v == "true" || v == "yes"
+	}
+	if v := os.Getenv("RATE_LIMIT_AUTH_MAX_PER_MIN"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("RATE_LIMIT_AUTH_MAX_PER_MIN must be a positive integer")
+		}
+		c.RateLimitAuthMaxPerMin = n
+	}
+	if v := os.Getenv("RATE_LIMIT_UNAUTH_MAX_PER_MIN"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("RATE_LIMIT_UNAUTH_MAX_PER_MIN must be a positive integer")
+		}
+		c.RateLimitUnauthMaxPerMin = n
+	}
+	if v := os.Getenv("RATE_LIMIT_CLEANUP_TICK"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return nil, fmt.Errorf("RATE_LIMIT_CLEANUP_TICK: %w", err)
+		}
+		c.RateLimitCleanupTick = d
+	}
+
+	if v := os.Getenv("COOKIE_SECURE"); v != "" {
+		c.CookieSecure = v == "1" || v == "true" || v == "yes"
 	}
 
 	Default = &c

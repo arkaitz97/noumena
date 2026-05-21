@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/jackc/pgx/v5"
+	"database/sql"
 
 	"noumena/internal/db"
 )
@@ -50,23 +50,23 @@ func (m *MockQuery) MarkDeletionCompletedJobOnly(context.Context, string) error 
 func (m *MockQuery) GetUserTrackingChannels(context.Context, string) ([]*db.UserChannelTrackingRow, error) {
 	return nil, nil
 }
-func (m *MockQuery) GetActiveTrackerCountForUpdate(context.Context, pgx.Tx, string, string) (int, error) {
+func (m *MockQuery) GetActiveTrackerCountForUpdate(context.Context, *sql.Tx, string, string) (int, error) {
 	return 0, nil
 }
-func (m *MockQuery) DeleteUserChannelTracking(context.Context, pgx.Tx, string, string) error {
+func (m *MockQuery) DeleteUserChannelTracking(context.Context, *sql.Tx, string, string) error {
 	return nil
 }
 func (m *MockQuery) DeleteCommentsByChannelChunked(context.Context, string, int, string) (int, error) {
 	return 0, nil
 }
-func (m *MockQuery) DeletePlatformChannel(context.Context, pgx.Tx, string) error      { return nil }
-func (m *MockQuery) DeleteUserStarsForChannel(context.Context, pgx.Tx, string, string) error {
+func (m *MockQuery) DeletePlatformChannel(context.Context, *sql.Tx, string) error      { return nil }
+func (m *MockQuery) DeleteUserStarsForChannel(context.Context, *sql.Tx, string, string) error {
 	return nil
 }
-func (m *MockQuery) DeleteUserStarsAll(context.Context, pgx.Tx, string) error      { return nil }
-func (m *MockQuery) DeleteUserDigests(context.Context, pgx.Tx, string) error       { return nil }
-func (m *MockQuery) DeleteUserAuthTokens(context.Context, pgx.Tx, string) error    { return nil }
-func (m *MockQuery) HardDeleteUser(context.Context, pgx.Tx, string) error          { return nil }
+func (m *MockQuery) DeleteUserStarsAll(context.Context, *sql.Tx, string) error      { return nil }
+func (m *MockQuery) DeleteUserDigests(context.Context, *sql.Tx, string) error       { return nil }
+func (m *MockQuery) DeleteUserAuthTokens(context.Context, *sql.Tx, string) error    { return nil }
+func (m *MockQuery) HardDeleteUser(context.Context, *sql.Tx, string) error          { return nil }
 func (m *MockQuery) EnqueueDataExport(context.Context, string) (*db.DataExportJob, error) {
 	return nil, nil
 }

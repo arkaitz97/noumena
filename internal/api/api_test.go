@@ -3,6 +3,7 @@ package api_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -10,7 +11,6 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/jackc/pgx/v5"
 
 	"noumena/internal/api"
 	"noumena/internal/auth"
@@ -44,6 +44,14 @@ type MockQuery struct {
 	latestDigests map[string]*db.WeeklyDigest
 	digestsByUser map[string][]*db.WeeklyDigest
 	digestOptIn   map[string]bool
+
+	// audit log tracking
+	auditLogs []struct {
+		UserID    string
+		Action    string
+		Details   string
+		IPAddress string
+	}
 
 	// billing fixtures
 	processedEvents       map[string]string // eventID -> event_type
@@ -167,7 +175,7 @@ func (m *MockQuery) GetUnprocessedCommentsByChannel(ctx context.Context, limit i
 	return nil, nil
 }
 
-func (m *MockQuery) UpdateCommentLLMData(ctx context.Context, id, category, topic, provider, model string, sentiment, confidence float64) error {
+func (m *MockQuery) UpdateCommentLLMData(ctx context.Context, id, category, topic, provider, model string, actionableInsights []byte, confidence float64) error {
 	return nil
 }
 
@@ -578,7 +586,7 @@ func (m *MockQuery) IsStripeEventProcessed(ctx context.Context, eventID string) 
 	return ok, nil
 }
 
-func (m *MockQuery) InsertProcessedStripeEvent(ctx context.Context, tx pgx.Tx, eventID, eventType string) error {
+func (m *MockQuery) InsertProcessedStripeEvent(ctx context.Context, tx *sql.Tx, eventID, eventType string) error {
 	if m.processedEvents == nil {
 		m.processedEvents = map[string]string{}
 	}
@@ -586,7 +594,7 @@ func (m *MockQuery) InsertProcessedStripeEvent(ctx context.Context, tx pgx.Tx, e
 	return nil
 }
 
-func (m *MockQuery) ApplySubscriptionUpdate(ctx context.Context, tx pgx.Tx, u db.SubscriptionUpdate) error {
+func (m *MockQuery) ApplySubscriptionUpdate(ctx context.Context, tx *sql.Tx, u db.SubscriptionUpdate) error {
 	m.subscriptionUpdates = append(m.subscriptionUpdates, u)
 	if u.UserID == "" {
 		return nil
@@ -668,7 +676,7 @@ func (m *MockQuery) GetOverageCostForCurrentPeriod(ctx context.Context, userID s
 	return m.overageCost[userID], nil
 }
 
-func (m *MockQuery) InsertCommentUsageLog(ctx context.Context, tx pgx.Tx, userID string, count int, periodStart, periodEnd time.Time) error {
+func (m *MockQuery) InsertCommentUsageLog(ctx context.Context, tx *sql.Tx, userID string, count int, periodStart, periodEnd time.Time) error {
 	m.usageLogs = append(m.usageLogs, struct {
 		UserID                string
 		Count                 int
@@ -677,7 +685,7 @@ func (m *MockQuery) InsertCommentUsageLog(ctx context.Context, tx pgx.Tx, userID
 	return nil
 }
 
-func (m *MockQuery) PauseChannelsAlphabetically(ctx context.Context, tx pgx.Tx, userID string, keepCount int) error {
+func (m *MockQuery) PauseChannelsAlphabetically(ctx context.Context, tx *sql.Tx, userID string, keepCount int) error {
 	m.pauseAlphaCalls = append(m.pauseAlphaCalls, struct {
 		UserID    string
 		KeepCount int
@@ -688,6 +696,95 @@ func (m *MockQuery) PauseChannelsAlphabetically(ctx context.Context, tx pgx.Tx, 
 func (m *MockQuery) ResetFreeTierQuotas(ctx context.Context) (int64, error) { return 0, nil }
 func (m *MockQuery) ExpirePastDueGrace(ctx context.Context, graceHours int) (int64, error) {
 	return 0, nil
+}
+
+// spec-gap-improvements additions
+func (m *MockQuery) UpdateChannelCustomPrompt(ctx context.Context, userID, platformChannelID string, customPrompt *string) error {
+	return nil
+}
+func (m *MockQuery) CreateWorkspace(ctx context.Context, name, createdBy string) (*db.Workspace, error) {
+	return nil, nil
+}
+func (m *MockQuery) GetWorkspace(ctx context.Context, workspaceID string) (*db.Workspace, error) {
+	return nil, nil
+}
+func (m *MockQuery) UpdateWorkspace(ctx context.Context, workspaceID, name string) error { return nil }
+func (m *MockQuery) DeleteWorkspace(ctx context.Context, workspaceID string) error { return nil }
+func (m *MockQuery) ListWorkspacesForUser(ctx context.Context, userID string) ([]*db.WorkspaceWithMembers, error) {
+	return nil, nil
+}
+func (m *MockQuery) GetWorkspaceMember(ctx context.Context, workspaceID, userID string) (*db.WorkspaceMember, error) {
+	return nil, nil
+}
+func (m *MockQuery) AddWorkspaceMember(ctx context.Context, workspaceID, userID, role string) error {
+	return nil
+}
+func (m *MockQuery) RemoveWorkspaceMember(ctx context.Context, workspaceID, userID string) error {
+	return nil
+}
+func (m *MockQuery) UpdateWorkspaceMemberRole(ctx context.Context, workspaceID, userID, role string) error {
+	return nil
+}
+func (m *MockQuery) CountWorkspaceMembers(ctx context.Context, workspaceID string) (int, error) {
+	return 0, nil
+}
+func (m *MockQuery) CountWorkspaceAdmins(ctx context.Context, workspaceID string) (int, error) {
+	return 0, nil
+}
+func (m *MockQuery) CreateWorkspaceInvite(ctx context.Context, workspaceID, email, role, tokenHash string, expiresAt time.Time) (*db.WorkspaceInvite, error) {
+	return nil, nil
+}
+func (m *MockQuery) GetWorkspaceInviteByToken(ctx context.Context, tokenHash string) (*db.WorkspaceInvite, error) {
+	return nil, nil
+}
+func (m *MockQuery) ConsumeWorkspaceInvite(ctx context.Context, inviteID string) error { return nil }
+func (m *MockQuery) GetWorkspaceInviteByEmail(ctx context.Context, workspaceID, email string) (*db.WorkspaceInvite, error) {
+	return nil, nil
+}
+func (m *MockQuery) SetUserActiveWorkspace(ctx context.Context, userID, workspaceID string) error {
+	return nil
+}
+func (m *MockQuery) GetUserActiveWorkspaceID(ctx context.Context, userID string) (string, error) {
+	return "", nil
+}
+func (m *MockQuery) IsWorkspaceOwner(ctx context.Context, workspaceID, userID string) (bool, error) {
+	return false, nil
+}
+func (m *MockQuery) InsertAuditLog(ctx context.Context, userID, action, details, ipAddress string) error {
+	m.auditLogs = append(m.auditLogs, struct {
+		UserID    string
+		Action    string
+		Details   string
+		IPAddress string
+	}{userID, action, details, ipAddress})
+	return nil
+}
+func (m *MockQuery) IncrementRateLimit(ctx context.Context, userKey string, windowStart time.Time, limit int) (int, error) {
+	return 0, nil
+}
+func (m *MockQuery) GetRateLimitStatus(ctx context.Context, userKey string, windowStart time.Time, limit int) (*db.RateLimitStatus, error) {
+	return nil, nil
+}
+func (m *MockQuery) CleanupExpiredRateLimitBuckets(ctx context.Context, before time.Time) (int64, error) {
+	return 0, nil
+}
+func (m *MockQuery) GetChannelCustomPrompt(ctx context.Context, platformChannelID, userID string) (string, error) {
+	return "", nil
+}
+func (m *MockQuery) GetCommentBodyByID(ctx context.Context, commentID string) (string, error) {
+	return "", nil
+}
+func (m *MockQuery) SearchComments(ctx context.Context, userID, query string) ([]*db.Comment, error) {
+	return nil, nil
+}
+func (m *MockQuery) BulkStarComments(ctx context.Context, userID string, commentIDs []string) (int, error) {
+	return 0, nil
+}
+func (m *MockQuery) BulkUnstarComments(ctx context.Context, userID string, commentIDs []string) (int, error) {
+	return 0, nil
+}
+func (m *MockQuery) GetCommentThread(ctx context.Context, userID, commentID string, maxDepth int) ([]*db.Comment, error) {
+	return nil, nil
 }
 
 func setupRouter(queries db.DBQuery) *chi.Mux {

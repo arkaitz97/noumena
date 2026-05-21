@@ -2,90 +2,86 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"errors"
-
-	"github.com/jackc/pgx/v5"
 )
 
-// GetIngestionToken returns the encrypted access/refresh token of the
-// active tracker with the lowest token_priority for a channel. It is the
-// legacy compatibility shim used by the ingestion worker.
-func (q *PostgresQuery) GetIngestionToken(ctx context.Context, pcID string) (string, string, error) {
+func (q *SQLiteQuery) GetIngestionToken(ctx context.Context, pcID string) (string, string, error) {
 	query := `
 		SELECT access_token_enc, refresh_token_enc
 		FROM user_channel_tracking
-		WHERE platform_channel_id = $1 AND tracking_status = 'active'
+		WHERE platform_channel_id = ? AND tracking_status = 'active'
 		ORDER BY token_priority ASC, created_at ASC
 		LIMIT 1
 	`
 	var access, refresh string
-	err := q.pool.QueryRow(ctx, query, pcID).Scan(&access, &refresh)
-	if errors.Is(err, pgx.ErrNoRows) {
+	err := q.db.QueryRowContext(ctx, query, pcID).Scan(&access, &refresh)
+	if errors.Is(err, sql.ErrNoRows) {
 		return "", "", ErrNotFound
 	}
 	return access, refresh, err
 }
 
-// PromoteNextIngestionToken demotes the current primary (token_priority = 0)
-// to a sentinel high priority and elects the next-lowest-priority active
-// tracker as the new primary. The election runs inside a transaction holding
-// `SELECT ... FOR UPDATE` on the parent platform_channels row to serialize
-// concurrent lifecycle events.
-func (q *PostgresQuery) PromoteNextIngestionToken(ctx context.Context, pcID string) error {
-	tx, err := q.pool.Begin(ctx)
+func (q *SQLiteQuery) PromoteNextIngestionToken(ctx context.Context, pcID string) error {
+	tx, err := q.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback()
 
-	// Serialize concurrent promotions for this channel.
 	var lockedID string
-	if err := tx.QueryRow(ctx,
-		`SELECT id FROM platform_channels WHERE id = $1 FOR UPDATE`, pcID,
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id FROM platform_channels WHERE id = ?`, pcID,
 	).Scan(&lockedID); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
 		return err
 	}
 
-	// Demote the current primary, if any, to a sentinel value. We must
-	// vacate priority 0 first so the partial unique index does not block
-	// the subsequent promote update.
-	if _, err := tx.Exec(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`UPDATE user_channel_tracking
 		 SET token_priority = 9999
-		 WHERE platform_channel_id = $1
+		 WHERE platform_channel_id = ?
 		   AND token_priority = 0
 		   AND tracking_status = 'active'`,
 		pcID); err != nil {
 		return err
 	}
 
-	// Elect the next active tracker (if any). Choose the lowest priority
-	// strictly greater than 0 so we don't re-elect a sentinel'd primary.
 	var nextID string
-	err = tx.QueryRow(ctx,
+	err = tx.QueryRowContext(ctx,
 		`SELECT id FROM user_channel_tracking
-		 WHERE platform_channel_id = $1
+		 WHERE platform_channel_id = ?
 		   AND tracking_status = 'active'
 		   AND token_priority > 0
 		   AND token_priority < 9999
 		 ORDER BY token_priority ASC, created_at ASC
 		 LIMIT 1`,
 		pcID).Scan(&nextID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		// No replacement available; commit the demotion anyway.
-		return tx.Commit(ctx)
+	if errors.Is(err, sql.ErrNoRows) {
+		return tx.Commit()
 	}
 	if err != nil {
 		return err
 	}
 
-	if _, err := tx.Exec(ctx,
-		`UPDATE user_channel_tracking SET token_priority = 0 WHERE id = $1`,
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE user_channel_tracking SET token_priority = 0 WHERE id = ?`,
 		nextID); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	return tx.Commit()
+}
+
+func (q *SQLiteQuery) UpdateChannelCustomPrompt(ctx context.Context, userID, platformChannelID string, customPrompt *string) error {
+	var prompt interface{} = customPrompt
+	if customPrompt != nil {
+		prompt = *customPrompt
+	}
+	_, err := q.db.ExecContext(ctx,
+		`UPDATE user_channel_tracking SET custom_prompt = ?
+		 WHERE platform_channel_id = ? AND user_id = ?`,
+		prompt, platformChannelID, userID)
+	return err
 }

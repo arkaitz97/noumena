@@ -35,6 +35,7 @@ func rebindLifecycleMeters() {
 	deletionChunkRows, _ = lifecycleMeter.Int64Histogram("noumena_deletion_chunk_rows")
 	exportsCompletedTotal, _ = lifecycleMeter.Int64Counter("noumena_exports_completed_total")
 	exportBytesTotal, _ = lifecycleMeter.Int64Counter("noumena_export_bytes_total", metric.WithUnit("By"))
+	deletionStage, _ = lifecycleMeter.Int64UpDownCounter("noumena_deletion_stage")
 }
 
 func histCountWithAttr(rm *metricdata.ResourceMetrics, name, key, val string) (count uint64, sum int64) {

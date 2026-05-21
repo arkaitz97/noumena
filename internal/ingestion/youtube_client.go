@@ -83,22 +83,24 @@ func (c *YouTubeClient) http() *http.Client {
 type CommentThread struct {
 	CommentID       string
 	ParentCommentID *string
+	ReplyDepth      int
 	AuthorHandle    string
 	Body            string
 	PostedAt        time.Time
 }
 
-// ToDBComment converts a CommentThread into a db.Comment ready for upsert.
 func (t *CommentThread) ToDBComment(platformChannelID string) *db.Comment {
 	var author *string
 	if t.AuthorHandle != "" {
 		a := t.AuthorHandle
 		author = &a
 	}
+	rd := t.ReplyDepth
 	return &db.Comment{
 		PlatformChannelID: platformChannelID,
 		PlatformCommentID: t.CommentID,
 		ParentCommentID:   t.ParentCommentID,
+		ReplyDepth:        rd,
 		AuthorHandle:      author,
 		Body:              t.Body,
 		PostedAt:          t.PostedAt,
@@ -231,6 +233,88 @@ type commentThreadsResponse struct {
 	Items         []commentThreadItem `json:"items"`
 }
 
+type commentsListResponse struct {
+	NextPageToken string      `json:"nextPageToken"`
+	Items         []ytComment `json:"items"`
+}
+
+func (c *YouTubeClient) ListReplies(ctx context.Context, accessToken, parentCommentID string) func() (CommentThread, bool, error) {
+	pageToken := ""
+	var buffer []CommentThread
+	idx := 0
+	exhausted := false
+
+	fetchPage := func() error {
+		q := url.Values{}
+		q.Set("part", "snippet")
+		q.Set("parentId", parentCommentID)
+		q.Set("maxResults", "100")
+		q.Set("textFormat", "plainText")
+		if pageToken != "" {
+			q.Set("pageToken", pageToken)
+		}
+		body, err := c.doGET(ctx, accessToken, "/comments?"+q.Encode())
+		if err != nil {
+			return err
+		}
+		var parsed commentsListResponse
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			return fmt.Errorf("decode comments.list (replies): %w", err)
+		}
+		buffer = buffer[:0]
+		for _, c := range parsed.Items {
+			if c.ID == "" {
+				continue
+			}
+			rPosted, _ := time.Parse(time.RFC3339, c.Snippet.PublishedAt)
+			rBody := c.Snippet.TextDisplay
+			if rBody == "" {
+				rBody = c.Snippet.TextOriginal
+			}
+			pID := c.Snippet.ParentID
+			depth := 1
+			if pID != "" && pID != parentCommentID {
+				depth = 2
+			}
+			buffer = append(buffer, CommentThread{
+				CommentID:       c.ID,
+				ParentCommentID: &pID,
+				ReplyDepth:      depth,
+				AuthorHandle:    c.Snippet.AuthorDisplayName,
+				Body:            rBody,
+				PostedAt:        rPosted,
+			})
+		}
+		idx = 0
+		pageToken = parsed.NextPageToken
+		if pageToken == "" && len(buffer) == 0 {
+			exhausted = true
+		}
+		return nil
+	}
+
+	return func() (CommentThread, bool, error) {
+		if exhausted {
+			return CommentThread{}, false, nil
+		}
+		if idx >= len(buffer) {
+			if pageToken == "" && buffer != nil {
+				exhausted = true
+				return CommentThread{}, false, nil
+			}
+			if err := fetchPage(); err != nil {
+				return CommentThread{}, false, err
+			}
+			if exhausted {
+				return CommentThread{}, false, nil
+			}
+		}
+		t := buffer[idx]
+		idx++
+		return t, true, nil
+	}
+}
+
 // ListCommentThreads returns an iterator over CommentThread records for a
 // video. Both top-level comments and their replies are flattened into a
 // single stream; replies carry ParentCommentID = top-level comment id.
@@ -271,6 +355,7 @@ func (c *YouTubeClient) ListCommentThreads(ctx context.Context, accessToken, vid
 			pending = append(pending, CommentThread{
 				CommentID:       tlc.ID,
 				ParentCommentID: nil,
+				ReplyDepth:      0,
 				AuthorHandle:    tlc.Snippet.AuthorDisplayName,
 				Body:            body,
 				PostedAt:        topPosted,
@@ -286,9 +371,14 @@ func (c *YouTubeClient) ListCommentThreads(ctx context.Context, accessToken, vid
 						rBody = reply.Snippet.TextOriginal
 					}
 					parentID := tlc.ID
+					depth := 1
+					if reply.Snippet.ParentID != "" && reply.Snippet.ParentID != tlc.ID {
+						depth = 2
+					}
 					pending = append(pending, CommentThread{
 						CommentID:       reply.ID,
 						ParentCommentID: &parentID,
+						ReplyDepth:      depth,
 						AuthorHandle:    reply.Snippet.AuthorDisplayName,
 						Body:            rBody,
 						PostedAt:        rPosted,

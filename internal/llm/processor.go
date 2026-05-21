@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -162,9 +163,18 @@ func (p *Processor) processChannelBatch(ctx context.Context, channelID string, b
 		channelID, jobID, len(batch), p.Client.ProviderName(), p.Client.ModelName())
 
 	// Build prompt input. The LLM call happens outside any DB transaction.
+	customPrompt := ""
+	if primary != nil {
+		customPrompt, _ = p.Q.GetChannelCustomPrompt(ctx, channelID, primary.ID)
+	}
 	prompts := make([]PromptComment, len(batch))
 	for i, c := range batch {
-		prompts[i] = PromptComment{Body: c.Body}
+		pc := PromptComment{Body: c.Body, CustomPrompt: customPrompt}
+		if c.ParentCommentID != nil && *c.ParentCommentID != "" {
+			parent, _ := p.Q.GetCommentBodyByID(ctx, *c.ParentCommentID)
+			pc.ParentContext = parent
+		}
+		prompts[i] = pc
 	}
 
 	llmCtx, cancel := context.WithTimeout(ctx, p.BatchTimeout)
@@ -225,7 +235,7 @@ func (p *Processor) persistBatch(ctx context.Context, batch []*db.Comment, resul
 		if !ok {
 			return fmt.Errorf("missing result for comment_index=%d id=%s", i, c.ID)
 		}
-		if err := p.Q.UpdateCommentLLMData(ctx, c.ID, r.Category, r.Topic, p.Client.ProviderName(), p.Client.ModelName(), r.Sentiment, r.Confidence); err != nil {
+		if err := p.Q.UpdateCommentLLMData(ctx, c.ID, r.Category, r.Topic, p.Client.ProviderName(), p.Client.ModelName(), mustMarshalInsights(r.ActionableInsights), r.Confidence); err != nil {
 			return fmt.Errorf("update comment %s: %w", c.ID, err)
 		}
 	}
@@ -280,4 +290,12 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+func mustMarshalInsights(insights []Insight) []byte {
+	b, err := json.Marshal(insights)
+	if err != nil {
+		return []byte("[]")
+	}
+	return b
 }

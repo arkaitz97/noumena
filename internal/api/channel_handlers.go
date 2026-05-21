@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 
 	"noumena/internal/auth"
 	"noumena/internal/billing"
@@ -243,8 +242,7 @@ func (h *ChannelHandler) ExchangeYouTubeCode(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		// Race: a concurrent insert may have grabbed token_priority=0
 		// before us. Retry once with the next available priority.
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" && prio == 0 {
+		if isUniqueConstraintViolation(err) && prio == 0 {
 			tracking, err = h.Queries.CreateUserChannelTracking(
 				r.Context(), userID, pcID, accessEnc, refreshEnc, expires,
 				req.BackfillDays, 1,
@@ -549,3 +547,9 @@ func checkChannelLimit(ctx context.Context, q db.DBQuery, userID string) (blocke
 
 // guard against unused import warnings when log is only needed in some builds
 var _ = strings.TrimSpace
+
+// isUniqueConstraintViolation returns true when the error indicates a
+// SQLite UNIQUE constraint failure.
+func isUniqueConstraintViolation(err error) bool {
+	return strings.Contains(err.Error(), "UNIQUE constraint failed")
+}

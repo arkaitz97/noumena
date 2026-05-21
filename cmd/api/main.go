@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"net/http"
 	"os"
@@ -27,34 +28,32 @@ import (
 	"noumena/internal/telemetry"
 )
 
+func writeJSON(w http.ResponseWriter, status int, body interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
+}
+
 func main() {
+	startTime := time.Now()
 	_ = godotenv.Load()
 
-	// Load configuration. We load in non-strict mode so the dev server can
-	// still come up without all secrets present, but production deployments
-	// should set strict=true.
 	strict := os.Getenv("STRICT_CONFIG") == "1"
 	if _, err := config.Load(strict); err != nil {
 		log.Fatalf("config: %v", err)
 	}
 
-	// otel-instrumentation: initialise OpenTelemetry providers before any
-	// worker or HTTP server starts so package-level meter handles
-	// resolved during package init pick up the configured providers.
-	// When OTEL_ENABLED=false (default), Init installs the no-op
-	// providers and `shutdown` is a no-op — zero allocations on every
-	// instrumentation call site.
 	otelShutdown, err := telemetry.Init(context.Background(), config.Default)
 	if err != nil {
 		log.Fatalf("telemetry: %v", err)
 	}
 
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		dbURL = "postgresql://postgres:postgres@localhost:5432/noumena?sslmode=disable"
+	dbPath := os.Getenv("DATABASE_PATH")
+	if dbPath == "" {
+		dbPath = "./noumena.db"
 	}
 
-	if err := db.InitDB(dbURL); err != nil {
+	if err := db.InitDB(dbPath); err != nil {
 		log.Printf("Failed to connect to database: %v. Running in degraded mock mode...", err)
 	} else {
 		defer db.CloseDB()
@@ -64,26 +63,12 @@ func main() {
 	}
 
 	var queries db.DBQuery
-	if db.Pool != nil {
-		queries = db.NewPostgresQuery(db.Pool)
+	if db.DB != nil {
+		queries = db.NewSQLiteQuery(db.DB)
 	} else {
 		log.Println("Using mock database queries.")
 	}
 
-	// Initialize Email Client.
-	//
-	// data-lifecycle change: introduces a second email path — the
-	// pipeline + idempotency log + retry worker. Selection order:
-	//
-	//  1. EMAIL_ENABLED=true → build email.Pipeline (SMTP sender, retry
-	//     worker) and expose it to legacy callers via PipelineAdapter.
-	//     This is the production path post-cutover.
-	//  2. RESEND_API_KEY set → keep the legacy Resend client (transition
-	//     fallback for environments not yet migrated to SMTP).
-	//  3. otherwise → mock client (dev/CI default).
-	//
-	// The two paths are mutually exclusive; if both env knobs are set,
-	// EMAIL_ENABLED wins and we log the override so operators notice.
 	var emailClient email.Client
 	var emailPipeline *email.Pipeline
 	switch {
@@ -94,9 +79,6 @@ func main() {
 		if queries == nil {
 			log.Fatalf("EMAIL_ENABLED=true requires a live database (email_send_log) — refusing to start")
 		}
-		// NetSMTPSender selects TLS mode by port (465=implicit, 587=
-		// STARTTLS); plain SMTP is rejected unless AllowInsecure is set
-		// (we leave it false in production).
 		sender := &email.NetSMTPSender{
 			Host:     config.Default.SMTPHost,
 			Port:     config.Default.SMTPPort,
@@ -111,10 +93,6 @@ func main() {
 		}
 		emailClient = email.NewPipelineAdapter(emailPipeline)
 		log.Printf("Email: pipeline initialized (provider=%s host=%s)", config.Default.EmailProvider, config.Default.SMTPHost)
-		// Retry worker: best-effort drain of pending rows. See
-		// design.md D11; currently degraded (no body persistence) so
-		// it mostly marks orphaned rows failed. Lifecycle owned by the
-		// process context (no explicit Stop).
 		retry := &email.RetryWorker{
 			Pipeline: emailPipeline,
 			Queries:  queries,
@@ -129,9 +107,6 @@ func main() {
 		emailClient = email.NewMockClient()
 	}
 
-	// Initialize Billing Client. When BILLING_ENABLED=true the config layer
-	// has already validated that all required Stripe env vars are present;
-	// otherwise we fall back to a mock client so the API still boots in dev.
 	var billingClient billing.Client
 	if config.Default.BillingEnabled {
 		prices := billing.PriceMap{
@@ -155,26 +130,21 @@ func main() {
 		billingClient = billing.NewMockClient()
 	}
 
-	// Start LLM Workers
-	openAIKey := os.Getenv("OPENAI_API_KEY")
+	opencodeKey := os.Getenv("OPENCODE_API_KEY")
 
-	// Weekly-digest cron worker. Gated by DIGEST_WORKER_ENABLED (default
-	// "false" for safe rollout — see openspec/changes/weekly-digest).
-	// When enabled, OPENAI_API_KEY is required so the worker has an LLM
-	// transport; we treat a missing key as a configuration warning rather
-	// than a fatal error so the rest of the API still boots.
 	var digestWorker *llm.Worker
 	if os.Getenv("DIGEST_WORKER_ENABLED") == "true" || os.Getenv("DIGEST_WORKER_ENABLED") == "1" {
-		if openAIKey == "" {
-			log.Println("WARN: DIGEST_WORKER_ENABLED=true but OPENAI_API_KEY is unset; digest worker will not start")
+		if opencodeKey == "" {
+			log.Println("WARN: DIGEST_WORKER_ENABLED=true but OPENCODE_API_KEY is unset; digest worker will not start")
 		} else if queries == nil {
 			log.Println("WARN: DIGEST_WORKER_ENABLED=true but no live DB; digest worker will not start")
 		} else {
+			opencodeClient := llm.NewOpenCodeClient(opencodeKey, config.Default.OpenCodeBaseURL, config.Default.OpenCodeModel)
 			digestWorker = &llm.Worker{
 				Queries:     queries,
-				LLMClient:   llm.NewClient(openAIKey),
+				LLMClient:   opencodeClient,
 				EmailClient: emailClient,
-				Pipeline:    emailPipeline, // 12.6 weekly_digest send
+				Pipeline:    emailPipeline,
 			}
 			digestWorker.Start(context.Background())
 			log.Println("Weekly-digest worker started")
@@ -184,90 +154,42 @@ func main() {
 		log.Println("Weekly-digest worker: disabled (DIGEST_WORKER_ENABLED!=true)")
 	}
 
-	// Start the new spec-driven LLM batch processor (llm-processing change,
-	// extended by use-opencode-as-ai-provider). The primary and fallback
-	// providers are selected by name from config; the required API key is
-	// determined by the chosen primary.
 	if config.Default.LLMProcessorEnabled {
-		primaryName := config.Default.LLMPrimaryProvider
-		fallbackName := config.Default.LLMFallbackProvider
-
-		provCfg := llm.ProviderConfig{
-			OpenAIAPIKey:    openAIKey,
-			OpenAIModel:     config.Default.OpenAIModel,
-			AnthropicAPIKey: config.Default.AnthropicAPIKey,
-			AnthropicModel:  config.Default.AnthropicModel,
-			OpenCodeAPIKey:  config.Default.OpenCodeAPIKey,
-			OpenCodeBaseURL: config.Default.OpenCodeBaseURL,
-			OpenCodeModel:   config.Default.OpenCodeModel,
+		if opencodeKey == "" {
+			log.Fatalf("LLM_PROCESSOR_ENABLED=true but OPENCODE_API_KEY is unset")
 		}
-
-		primary, err := llm.BuildLLMClientByName(primaryName, provCfg)
-		if err != nil {
-			log.Fatalf("LLM processor: invalid LLM_PRIMARY_PROVIDER=%q: %v", primaryName, err)
-		}
-		if primary == nil {
-			required := llm.RequiredEnvVarForProvider(primaryName)
-			if required == "" {
-				log.Fatalf("LLM_PROCESSOR_ENABLED=true but LLM_PRIMARY_PROVIDER=%q is not recognized", primaryName)
-			}
-			log.Fatalf("LLM_PROCESSOR_ENABLED=true but %s is unset (mandatory for primary=%s)", required, primaryName)
-		}
-
-		fallback, ferr := llm.BuildLLMClientByName(fallbackName, provCfg)
-		if ferr != nil {
-			log.Fatalf("LLM processor: invalid LLM_FALLBACK_PROVIDER=%q: %v", fallbackName, ferr)
-		}
-		if fallback == nil && fallbackName != "" {
-			required := llm.RequiredEnvVarForProvider(fallbackName)
-			log.Printf("WARN: LLM_FALLBACK_PROVIDER=%s but %s is unset — provider failover is disabled for this process",
-				fallbackName, required)
-		}
-
-		failover := llm.NewFailoverClient(llm.FailoverConfig{
-			Primary:        primary,
-			Fallback:       fallback,
-			ErrorThreshold: config.Default.LLMFailoverErrorThreshold,
-			WindowSeconds:  config.Default.LLMFailoverWindowSeconds,
-		})
-		proc := llm.NewProcessor(failover, queries)
+		opencodeClient := llm.NewOpenCodeClient(opencodeKey, config.Default.OpenCodeBaseURL, config.Default.OpenCodeModel)
+		proc := llm.NewProcessor(opencodeClient, queries)
 		proc.TickInterval = config.Default.LLMProcessorTickInterval
 		proc.BatchSize = config.Default.LLMBatchSize
 		proc.ConfidenceThreshold = config.Default.LLMConfidenceThreshold
 		proc.ShutdownGrace = config.Default.LLMProcessorShutdownGrace
-		log.Printf("LLM processor: enabled=true primary=%s fallback=%s fallback_available=%t batch_size=%d threshold=%.2f failover_threshold=%d window_s=%d",
-			primaryName, fallbackName, fallback != nil,
-			config.Default.LLMBatchSize, config.Default.LLMConfidenceThreshold,
-			config.Default.LLMFailoverErrorThreshold, config.Default.LLMFailoverWindowSeconds)
+		log.Printf("LLM processor: enabled=true provider=opencode model=%s batch_size=%d threshold=%.2f",
+			config.Default.OpenCodeModel,
+			config.Default.LLMBatchSize, config.Default.LLMConfidenceThreshold)
 		go proc.Run(context.Background())
 	} else {
 		log.Println("LLM processor: disabled (LLM_PROCESSOR_ENABLED=false)")
 	}
 
-	// Start the unverified-account cleanup job (daily).
 	if queries != nil {
 		auth.StartUnverifiedAccountCleanup(context.Background(), queries, 0, 0)
 		api.StartTokenExpiryNotifier(context.Background(), queries, emailClient, api.TokenExpirySchedule{})
 		api.StartChannelPurgeJob(context.Background(), queries, 0)
 	}
 
-	// Start the daily billing-quota cron (billing change, task 8.3): resets
-	// free-tier quotas and transitions past_due → paused after the grace
-	// window. First run is aligned to 08:00 UTC.
-	if pq, ok := queries.(*db.PostgresQuery); ok {
-		billing.StartQuotaCron(context.Background(), pq, billing.QuotaCronConfig{
+	if sq, ok := queries.(*db.SQLiteQuery); ok {
+		billing.StartQuotaCron(context.Background(), sq, billing.QuotaCronConfig{
 			Interval:          24 * time.Hour,
 			InitialDelay:      billing.NextRunDelayUTC(8, 0),
 			PastDueGraceHours: 72,
-			Pipeline:          emailPipeline, // 12.4 payment_grace_final
+			Pipeline:          emailPipeline,
 		})
 		log.Println("Billing quota cron: started (daily, first run aligned to 08:00 UTC)")
 
-		// data-lifecycle (12.5): trial-expiry reminder cron. Same 08:00 UTC
-		// schedule as the quota cron; gated internally on Pipeline != nil.
-		billing.StartTrialReminder(context.Background(), pq, emailPipeline, billing.TrialReminderConfig{
+		billing.StartTrialReminder(context.Background(), sq, emailPipeline, billing.TrialReminderConfig{
 			Interval:     24 * time.Hour,
-			InitialDelay: billing.NextRunDelayUTC(8, 5), // stagger 5min after quota cron
+			InitialDelay: billing.NextRunDelayUTC(8, 5),
 			LeadTime:     72 * time.Hour,
 		})
 		if emailPipeline != nil {
@@ -279,45 +201,53 @@ func main() {
 
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
-	// otel-instrumentation: HTTP server metrics + (when traces are
-	// enabled) server spans. The two-layer composition is deliberate:
-	// otelhttp.NewMiddleware emits the server span (using the global
-	// TracerProvider — no-op when traces are disabled), and our
-	// OtelMiddleware records the metrics with the chi route pattern
-	// (which otelhttp cannot see because it runs before routing).
 	r.Use(otelhttp.NewMiddleware("noumena-api"))
 	r.Use(api.OtelMiddleware())
 
-	authHandler := &api.AuthHandler{Queries: queries, EmailClient: emailClient}
+	rateLimitCleaner := &api.RateLimitCleaner{
+		Queries: queries,
+		Tick:    config.Default.RateLimitCleanupTick,
+	}
+	if config.Default.RateLimitEnabled && queries != nil {
+		r.Use(api.RateLimitMiddleware(queries, config.Default))
+		rateLimitCleaner.Start(context.Background())
+		defer rateLimitCleaner.Stop()
+		log.Printf("Rate limiting: enabled (auth=%d/min, unauth=%d/min)",
+			config.Default.RateLimitAuthMaxPerMin, config.Default.RateLimitUnauthMaxPerMin)
+	} else {
+		log.Println("Rate limiting: disabled (RATE_LIMIT_ENABLED=false)")
+	}
+
+	workspaceHandler := &api.WorkspaceHandler{Queries: queries, Cfg: config.Default}
+
+	authHandler := &api.AuthHandler{Queries: queries, EmailClient: emailClient, CookieSecure: config.Default.CookieSecure}
+	if queries != nil {
+		authHandler.DefaultWorkspaceCreator = workspaceHandler.CreateDefaultWorkspace
+	}
 	channelHandler := &api.ChannelHandler{Queries: queries}
-	if pq, ok := queries.(*db.PostgresQuery); ok {
-		channelHandler.SyncStatusReader = pq
+	if sq, ok := queries.(*db.SQLiteQuery); ok {
+		channelHandler.SyncStatusReader = sq
 	}
 	commentHandler := &api.CommentHandler{Queries: queries}
 	billingHandler := &api.BillingHandler{Queries: queries, BillingClient: billingClient, Pipeline: emailPipeline}
-	if pq, ok := queries.(*db.PostgresQuery); ok {
-		billingHandler.Pool = pq.Pool()
+	if sq, ok := queries.(*db.SQLiteQuery); ok {
+		billingHandler.Pool = sq.DB()
 	}
 	digestHandler := &api.DigestHandler{Queries: queries}
 
-	// data-lifecycle change: account/GDPR-export handlers + workers.
-	// Handlers are constructed unconditionally (so the type is always
-	// available for the router gate below) but only registered when
-	// ACCOUNT_LIFECYCLE_API_ENABLED=true. Workers are started under a
-	// separate flag (LIFECYCLE_WORKERS_ENABLED) so a deployment can
-	// run the API surface in one replica and the destructive workers
-	// in another.
+	userHandler := &api.UserHandler{Queries: queries, Cfg: config.Default}
+
 	accountHandler := &api.AccountHandler{
 		Queries:  queries,
-		Pipeline: emailPipeline, // nil when EMAIL_ENABLED=false; handlers no-op the email step
+		Pipeline: emailPipeline,
 		Billing:  billingClient,
 		Cfg:      config.Default,
 	}
 	if config.Default.LifecycleWorkersEnabled {
-		if pq, ok := queries.(*db.PostgresQuery); ok && pq.Pool() != nil {
+		if sq, ok := queries.(*db.SQLiteQuery); ok && sq.DB() != nil {
 			delWorker := &lifecycle.DeletionWorker{
 				Queries:  queries,
-				Pool:     pq.Pool(),
+				Pool:     sq.DB(),
 				Pipeline: emailPipeline,
 				Billing:  billingClient,
 				Cfg:      config.Default,
@@ -345,27 +275,18 @@ func main() {
 		log.Println("Lifecycle workers: disabled (LIFECYCLE_WORKERS_ENABLED=false)")
 	}
 
-	// insights-api change: rich feed/saved/star/exports/insights endpoints.
-	// All new routes live behind both the auth+verified-email middleware AND
-	// the insights-api feature flag (returns 503 when off). They require the
-	// concrete *db.PostgresQuery type because the new methods (BuildFeedQuery
-	// driver, exports CRUD, aggregates) are not on the DBQuery interface.
 	var insightsHandler *api.InsightsHandler
-	if pq, ok := queries.(*db.PostgresQuery); ok {
-		insightsHandler = &api.InsightsHandler{Queries: pq, Cfg: config.Default}
+	if sq, ok := queries.(*db.SQLiteQuery); ok {
+		insightsHandler = &api.InsightsHandler{Queries: sq, Cfg: config.Default}
 
-		// Ensure EXPORT_DIR exists at startup; mode 0700.
 		if err := config.EnsureExportDir(config.Default.ExportDir); err != nil {
 			log.Printf("WARN: EnsureExportDir(%q) failed: %v", config.Default.ExportDir, err)
 		}
 
-		// Export worker: drains queued exports + sweeps expired files.
-		// Gated by EXPORT_WORKER_ENABLED so a single replica owns the queue
-		// in production while other API replicas only serve sync exports.
 		if config.Default.ExportWorkerEnabled {
 			w := &export.Worker{
-				Queries:      pq,
-				Pool:         pq.Pool(),
+				Queries:      sq,
+				Pool:         sq.DB(),
 				ExportDir:    config.Default.ExportDir,
 				TTLHours:     config.Default.ExportTTLHours,
 				TickInterval: config.Default.ExportWorkerTickInterval,
@@ -378,11 +299,10 @@ func main() {
 		}
 	}
 
-	// Start the comment-ingestion pipeline (scheduler + worker) if enabled.
 	if config.Default.IngestionWorkerEnabled {
-		if pq, ok := queries.(*db.PostgresQuery); ok && pq.Pool() != nil {
-			scheduler := ingestion.NewScheduler(pq, config.Default.IngestionPollIntervalMinutes)
-			worker := ingestion.NewWorker(pq, pq.Pool())
+		if sq, ok := queries.(*db.SQLiteQuery); ok && sq.DB() != nil {
+			scheduler := ingestion.NewScheduler(sq, config.Default.IngestionPollIntervalMinutes)
+			worker := ingestion.NewWorker(sq, sq.DB())
 			worker.JobDeadline = config.Default.IngestionJobDeadline
 			worker.MaxConcurrency = config.Default.IngestionMaxConcurrency
 			worker.Alerter = ingestion.PickAlerter(config.Default.IngestionDeadLetterAlertTo)
@@ -390,7 +310,7 @@ func main() {
 			go worker.Run(context.Background())
 			log.Println("Comment-ingestion worker started")
 		} else {
-			log.Println("Ingestion worker NOT started: no live Postgres pool")
+			log.Println("Ingestion worker NOT started: no live database")
 		}
 	}
 
@@ -403,23 +323,16 @@ func main() {
 		r.Post("/forgot-password", authHandler.ForgotPassword)
 		r.Post("/reset-password", authHandler.ResetPassword)
 
-		// Google SSO
 		r.Get("/google", authHandler.GoogleStart)
 		r.Get("/google/callback", authHandler.GoogleCallback)
 		r.Post("/google/link", authHandler.LinkGoogleConfirm)
-		// Popup-based JSON twins of the redirect endpoints
-		// (auth-google-popup-endpoints change).
 		r.Get("/google/auth-url", authHandler.GetGoogleAuthURL)
 		r.Post("/google/callback", authHandler.GoogleCallbackJSON)
 
-		// Authenticated /auth routes (no email-verification gate).
 		r.Group(func(r chi.Router) {
 			r.Use(api.AuthMiddlewareWithQueries(queries))
 			r.Post("/logout-all", authHandler.LogoutAll)
 			r.Post("/resend-verification", authHandler.ResendVerification)
-			// Lightweight session-introspection endpoint for SPA auth-store
-			// hydration. Lives under /auth so it is NOT gated by the /api
-			// middleware chain (verified-email + ACCOUNT_LIFECYCLE flag).
 			r.Get("/me", authHandler.Me)
 		})
 	})
@@ -428,11 +341,32 @@ func main() {
 		r.Post("/stripe", billingHandler.WebhookStripe)
 	})
 
-	// data-lifecycle change: signed-URL download endpoint lives OUTSIDE
-	// the /api auth chain — the URL signature IS the credential.
-	// Registered only when the lifecycle API surface is enabled, so
-	// disabled deployments can't accidentally serve files even if the
-	// signing secret leaks.
+	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status":  "ok",
+			"uptime":  time.Since(startTime).String(),
+		})
+	})
+	r.Get("/ready", func(w http.ResponseWriter, r *http.Request) {
+		if db.DB != nil {
+			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+			defer cancel()
+			if err := db.DB.PingContext(ctx); err != nil {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+					"status": "error",
+					"error":  "database unavailable",
+				})
+				return
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status": "ok",
+		})
+	})
+
+	r.Get("/invites/accept", workspaceHandler.AcceptInvite)
+	r.Get("/metrics", api.MetricsHandler)
+
 	if config.Default.AccountLifecycleAPIEnabled {
 		r.Get("/api/exports/{id}/download", accountHandler.DownloadExport)
 	}
@@ -448,24 +382,36 @@ func main() {
 		r.Get("/channels", channelHandler.List)
 		r.Get("/channels/connect/youtube", channelHandler.ConnectYouTube)
 		r.Post("/channels/exchange/youtube", channelHandler.ExchangeYouTubeCode)
+		r.Get("/channels/connect/tiktok", channelHandler.ConnectTikTok)
+		r.Post("/channels/exchange/tiktok", channelHandler.ExchangeTikTok)
+		r.Get("/channels/connect/instagram", channelHandler.ConnectInstagram)
+		r.Post("/channels/exchange/instagram", channelHandler.ExchangeInstagram)
 		r.Patch("/channels/{id}/pause", channelHandler.Pause)
 		r.Post("/channels/{id}/resume", channelHandler.Resume)
 		r.Delete("/channels/{id}", channelHandler.Delete)
 		r.Patch("/channels/{id}/backfill-window", channelHandler.UpdateBackfillWindow)
+		r.Patch("/channels/{id}/custom-prompt", channelHandler.UpdateCustomPrompt)
 		r.Get("/channels/{id}/status", channelHandler.Status)
 		r.Get("/channels/{id}/sync-status", channelHandler.SyncStatus)
+		r.Get("/user/rate-limit-status", userHandler.GetRateLimitStatus)
 		r.Get("/comments", commentHandler.Feed)
 		r.Post("/comments/{id}/star", commentHandler.Star)
 
-		// weekly-digest read API + opt-in toggle. These live on the same
-		// auth+verified-email middleware chain as the rest of /api.
 		r.Get("/digests", digestHandler.List)
 		r.Get("/digests/latest", digestHandler.Latest)
 		r.Patch("/user/preferences", digestHandler.UpdatePreferences)
 
-		// data-lifecycle change: account/GDPR endpoints. Gated by
-		// ACCOUNT_LIFECYCLE_API_ENABLED so the schema + workers can
-		// ship before the user-facing surface is exposed.
+		r.Get("/workspaces/mine", workspaceHandler.GetMyWorkspaces)
+		r.Get("/workspaces", workspaceHandler.ListWorkspaces)
+		r.Post("/workspaces", workspaceHandler.CreateWorkspace)
+		r.Get("/workspaces/{id}", workspaceHandler.ListWorkspaces)
+		r.Patch("/workspaces/{id}", workspaceHandler.UpdateWorkspace)
+		r.Delete("/workspaces/{id}", workspaceHandler.DeleteWorkspace)
+		r.Put("/workspaces/{id}/activate", workspaceHandler.ActivateWorkspace)
+		r.Post("/workspaces/{id}/invites", workspaceHandler.InviteMember)
+		r.Delete("/workspaces/{id}/members/{user_id}", workspaceHandler.RemoveMember)
+		r.Patch("/workspaces/{id}/members/{user_id}", workspaceHandler.ChangeMemberRole)
+
 		if config.Default.AccountLifecycleAPIEnabled {
 			r.Get("/user/me", accountHandler.GetProfile)
 			r.Delete("/user/account", accountHandler.DeleteAccount)
@@ -474,33 +420,32 @@ func main() {
 			r.Get("/user/data-export/{id}/status", accountHandler.GetExportStatus)
 		}
 
-		// insights-api routes. Mounted only when we have a live Postgres
-		// pool (insightsHandler != nil); otherwise the feature is silently
-		// unavailable in mock mode. The InsightsAPIGate middleware further
-		// returns 503 when the INSIGHTS_API_ENABLED flag is off so we can
-		// roll out per-environment without recompiling.
 		if insightsHandler != nil {
 			r.Group(func(r chi.Router) {
 				r.Use(api.InsightsAPIGate(config.Default))
 
-				// Feed + saved (rich response with total/has_more).
 				r.Get("/comments/feed", insightsHandler.Feed)
 				r.Get("/comments/saved", insightsHandler.Saved)
 
-				// Star/unstar (scoped, idempotent).
 				r.Post("/comments/{id}/star", insightsHandler.Star)
 				r.Delete("/comments/{id}/star", insightsHandler.Unstar)
 
-				// Exports.
 				r.Post("/comments/export", insightsHandler.CreateExport)
 				r.Get("/comments/export/{id}/status", insightsHandler.ExportStatus)
 				r.Get("/comments/export/{id}/download", insightsHandler.ExportDownload)
 
-				// Aggregates + trends + digest.
-				r.Get("/insights/sentiment", insightsHandler.Sentiment)
+				r.Get("/insights/actionable-insights", insightsHandler.ActionableInsights)
+				r.Get("/insights/actionable-insights/top", insightsHandler.TopInsights)
+				r.Get("/insights/actionable-insights/distribution", insightsHandler.InsightDistribution)
+				r.Post("/insights/actionable-insights/refresh", insightsHandler.RefreshInsightsView)
 				r.Get("/insights/toxicity-shield", insightsHandler.ToxicityShield)
 				r.Get("/insights/trends", insightsHandler.Trends)
 				r.Get("/insights/digest/latest", insightsHandler.LatestDigest)
+
+				r.Get("/comments/search", insightsHandler.SearchComments)
+				r.Post("/comments/bulk-star", insightsHandler.BulkStarComments)
+				r.Post("/comments/bulk-unstar", insightsHandler.BulkUnstarComments)
+				r.Get("/comments/{id}/thread", insightsHandler.GetCommentThread)
 			})
 		}
 	})
@@ -508,9 +453,6 @@ func main() {
 	log.Println("Server starting on :8080")
 	srv := &http.Server{Addr: ":8080", Handler: r}
 
-	// Run the listener on a goroutine so we can intercept SIGTERM /
-	// SIGINT and run the graceful-shutdown sequence (otel-instrumentation
-	// requires us to flush exporter buffers before exit).
 	listenErr := make(chan error, 1)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -530,10 +472,6 @@ func main() {
 		}
 	}
 
-	// Bounded shutdown: the OTel exporter is async and tolerant of
-	// timeouts, so a 5s deadline is a tradeoff between flushing the
-	// last buffer and not hanging SIGTERM. Errors from the telemetry
-	// shutdown are LOGGED, never fatal, per the spec.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {

@@ -5,7 +5,7 @@
 //
 // Usage:
 //
-//	DATABASE_URL=... go run ./scripts/enqueue_initial_backfills
+//	DATABASE_PATH=./noumena.db go run ./scripts/enqueue_initial_backfills
 package main
 
 import (
@@ -25,13 +25,21 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	if err := db.InitDB(os.Getenv("DATABASE_URL")); err != nil {
+	dbPath := os.Getenv("DATABASE_PATH")
+	if dbPath == "" {
+		dbPath = "./noumena.db"
+	}
+	if err := db.InitDB(dbPath); err != nil {
 		log.Fatalf("connect: %v", err)
 	}
 	defer db.CloseDB()
 
-	q := db.NewPostgresQuery(db.Pool).(*db.PostgresQuery)
-	channels, err := q.GetChannelsNeedingSync(ctx, 30)
+	q := db.NewSQLiteQuery(db.DB)
+	sq, ok := q.(*db.SQLiteQuery)
+	if !ok {
+		log.Fatalf("failed to create SQLiteQuery")
+	}
+	channels, err := sq.GetChannelsNeedingSync(ctx, 30)
 	if err != nil {
 		log.Fatalf("list channels: %v", err)
 	}
@@ -41,7 +49,7 @@ func main() {
 		if ch.LastSyncedAt != nil {
 			continue // only NULL last_synced_at (pre-existing un-backfilled)
 		}
-		jobID, err := q.EnqueueIngestionJob(ctx, ch.ID, "backfill")
+		jobID, err := sq.EnqueueIngestionJob(ctx, ch.ID, "backfill")
 		if err != nil {
 			log.Printf("channel=%s enqueue error: %v", ch.ID, err)
 			continue

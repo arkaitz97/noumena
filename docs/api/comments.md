@@ -53,7 +53,7 @@ The end-user friendly version of this reference lives at
 | 4 | `body` | string | RFC4180-quoted; commas, quotes, and newlines preserved. |
 | 5 | `posted_at` | RFC3339 UTC | Timestamp from the platform. |
 | 6 | `category` | string \| empty | Best-fit category from LLM processing. |
-| 7 | `sentiment_score` | float in `[-1, 1]` \| empty | Empty when LLM processing has not run yet. |
+| 7 | `actionable_insights` | JSON array \| empty | JSON-encoded array of insight objects. Empty when LLM processing has not run yet or no insights extracted. |
 | 8 | `topic` | string \| empty | Best-fit topic. |
 | 9 | `confidence` | float in `[0, 1]` \| empty | LLM confidence for `category`/`topic`. |
 | 10 | `processed_at` | RFC3339 UTC \| empty | When LLM processing completed. |
@@ -73,8 +73,7 @@ JSON exports use the same field names with native JSON types
     "format": "csv",
     "channels":     ["<uuid>", "..."],
     "categories":   ["..."],
-    "sentiment_min": -1,
-    "sentiment_max":  1,
+    "insight_type": "video_idea",
     "date_from":    "2026-01-01",
     "date_to":      "2026-05-05",
     "search":       "shipping",

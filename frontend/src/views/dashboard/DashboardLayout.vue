@@ -11,12 +11,20 @@ import {
   LogOut,
   Users,
   ChevronDown,
+  Sun,
+  Moon,
 } from 'lucide-vue-next'
 import { useAuthStore } from '../../stores/auth'
+import { useDarkMode } from '../../composables/useDarkMode'
+import { useWorkspaceRole } from '../../composables/useWorkspaceRole'
+import WorkspaceSwitcher from '../../components/WorkspaceSwitcher.vue'
+import RateLimitBanner from '../../components/RateLimitBanner.vue'
 
 const route = useRoute()
 const router = useRouter()
 const auth = useAuthStore()
+const { isDark, toggleDarkMode } = useDarkMode()
+const { isAdmin } = useWorkspaceRole()
 
 const navItems = [
   { to: '/dashboard', label: 'Insights Feed', icon: LayoutDashboard, exact: true },
@@ -60,20 +68,36 @@ async function handleLogoutAll() {
   await auth.logoutAll()
   router.push('/login')
 }
+
+// Rate limit state
+const rateLimitVisible = ref(false)
+const rateLimitRetryAfter = ref(0)
+
+function showRateLimitBanner(retryAfter: number) {
+  rateLimitRetryAfter.value = retryAfter
+  rateLimitVisible.value = true
+}
+
+function dismissRateLimit() {
+  rateLimitVisible.value = false
+}
+
+// Expose for child components
+window.__noumena_rate_limit = showRateLimitBanner
 </script>
 
 <template>
-  <div class="min-h-screen bg-zinc-50 flex">
+  <div class="min-h-screen bg-zinc-50 dark:bg-zinc-950 flex">
     <!-- Sidebar -->
-    <aside class="hidden lg:flex flex-col w-64 bg-white border-r border-zinc-200 sticky top-0 h-screen">
-      <div class="px-6 py-5 border-b border-zinc-100">
+    <aside class="hidden lg:flex flex-col w-64 bg-white dark:bg-zinc-900 border-r border-zinc-200 dark:border-zinc-800 sticky top-0 h-screen">
+      <div class="px-6 py-5 border-b border-zinc-100 dark:border-zinc-800">
         <RouterLink to="/dashboard" class="flex items-center gap-2 group">
-          <div class="w-8 h-8 rounded-lg bg-zinc-900 flex items-center justify-center shadow-md group-hover:scale-105 transition-transform">
-            <svg class="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <div class="w-8 h-8 rounded-lg bg-zinc-900 dark:bg-zinc-100 flex items-center justify-center shadow-md group-hover:scale-105 transition-transform">
+            <svg class="w-4 h-4 text-white dark:text-zinc-900" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
             </svg>
           </div>
-          <span class="font-bold text-lg tracking-tight text-zinc-900">Noumena</span>
+          <span class="font-bold text-lg tracking-tight text-zinc-900 dark:text-zinc-100">Noumena</span>
         </RouterLink>
       </div>
 
@@ -84,8 +108,8 @@ async function handleLogoutAll() {
           :to="item.to"
           :class="[
             isActive(item.to, item.exact)
-              ? 'bg-zinc-100 text-zinc-900'
-              : 'text-zinc-600 hover:text-zinc-900 hover:bg-zinc-50',
+              ? 'bg-zinc-100 dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100'
+              : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 hover:bg-zinc-50 dark:hover:bg-zinc-800/50',
             'flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors',
           ]"
         >
@@ -94,7 +118,7 @@ async function handleLogoutAll() {
         </RouterLink>
       </nav>
 
-      <div class="px-6 py-4 border-t border-zinc-100 text-xs text-zinc-400">
+      <div class="px-6 py-4 border-t border-zinc-100 dark:border-zinc-800 text-xs text-zinc-400">
         © {{ new Date().getFullYear() }} Noumena
       </div>
     </aside>
@@ -102,67 +126,97 @@ async function handleLogoutAll() {
     <!-- Main column -->
     <div class="flex-1 flex flex-col min-w-0">
       <!-- Top bar -->
-      <header class="bg-white/80 backdrop-blur-md border-b border-zinc-200 sticky top-0 z-30">
-        <div class="px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+      <header class="bg-white/80 dark:bg-zinc-900/80 backdrop-blur-md border-b border-zinc-200 dark:border-zinc-800 sticky top-0 z-30">
+        <div class="px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">
           <!-- Mobile brand -->
           <RouterLink to="/dashboard" class="lg:hidden flex items-center gap-2">
-            <div class="w-7 h-7 rounded-lg bg-zinc-900 flex items-center justify-center">
-              <svg class="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <div class="w-7 h-7 rounded-lg bg-zinc-900 dark:bg-zinc-100 flex items-center justify-center">
+              <svg class="w-4 h-4 text-white dark:text-zinc-900" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
               </svg>
             </div>
-            <span class="font-bold tracking-tight text-zinc-900">Noumena</span>
+            <span class="font-bold tracking-tight text-zinc-900 dark:text-zinc-100">Noumena</span>
           </RouterLink>
-          <span class="hidden lg:block"></span>
 
-          <div ref="menuRef" class="relative">
+          <div class="hidden lg:flex items-center gap-3 flex-1">
+            <WorkspaceSwitcher />
+          </div>
+
+          <div class="flex items-center gap-2">
             <button
-              @click.stop="toggleMenu"
-              class="flex items-center gap-2 pl-2 pr-3 py-1.5 rounded-full border border-zinc-200 hover:border-zinc-300 hover:bg-zinc-50 transition-colors"
-              :aria-expanded="menuOpen"
+              @click="toggleDarkMode"
+              class="p-2 rounded-lg text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
+              :aria-label="isDark ? 'Switch to light mode' : 'Switch to dark mode'"
             >
-              <span class="h-7 w-7 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-500 text-white font-semibold text-xs flex items-center justify-center">
-                {{ userInitial }}
-              </span>
-              <span class="hidden sm:inline text-sm font-medium text-zinc-700 max-w-[12rem] truncate">
-                {{ auth.user?.email || 'Account' }}
-              </span>
-              <ChevronDown class="w-4 h-4 text-zinc-500" />
+              <Sun v-if="isDark" class="w-4 h-4" />
+              <Moon v-else class="w-4 h-4" />
             </button>
 
-            <transition name="menu">
-              <div
-                v-if="menuOpen"
-                class="absolute right-0 mt-2 w-64 bg-white shadow-lg ring-1 ring-zinc-950/5 rounded-2xl py-2 origin-top-right"
+            <div ref="menuRef" class="relative">
+              <button
+                @click.stop="toggleMenu"
+                class="flex items-center gap-2 pl-2 pr-3 py-1.5 rounded-full border border-zinc-200 dark:border-zinc-700 hover:border-zinc-300 dark:hover:border-zinc-600 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors"
+                :aria-expanded="menuOpen"
               >
-                <div class="px-4 py-3 border-b border-zinc-100">
-                  <p class="text-xs font-medium text-zinc-500">Signed in as</p>
-                  <p class="text-sm font-semibold text-zinc-900 truncate">{{ auth.user?.email || '—' }}</p>
+                <span class="h-7 w-7 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-500 text-white font-semibold text-xs flex items-center justify-center">
+                  {{ userInitial }}
+                </span>
+                <span class="hidden sm:inline text-sm font-medium text-zinc-700 dark:text-zinc-300 max-w-[12rem] truncate">
+                  {{ auth.user?.email || 'Account' }}
+                </span>
+                <ChevronDown class="w-4 h-4 text-zinc-500 dark:text-zinc-400" />
+              </button>
+
+              <transition name="menu">
+                <div
+                  v-if="menuOpen"
+                  class="absolute right-0 mt-2 w-64 bg-white dark:bg-zinc-900 shadow-lg ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-2xl py-2 origin-top-right"
+                >
+                  <div class="px-4 py-3 border-b border-zinc-100 dark:border-zinc-800">
+                    <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400">Signed in as</p>
+                    <p class="text-sm font-semibold text-zinc-900 dark:text-zinc-100 truncate">{{ auth.user?.email || '—' }}</p>
+                  </div>
+                  <div class="py-1">
+                    <RouterLink
+                      to="/settings/account"
+                      @click="menuOpen = false"
+                      class="flex items-center gap-2 px-4 py-2 text-sm text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                    >
+                      <Settings class="w-4 h-4" /> Settings
+                    </RouterLink>
+                    <button
+                      v-if="isAdmin"
+                      @click="menuOpen = false"
+                      class="w-full text-left flex items-center gap-2 px-4 py-2 text-sm text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                    >
+                      <Users class="w-4 h-4" /> Manage members
+                    </button>
+                    <button
+                      @click="handleLogout"
+                      class="w-full text-left flex items-center gap-2 px-4 py-2 text-sm text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                    >
+                      <LogOut class="w-4 h-4" /> Log out
+                    </button>
+                    <button
+                      @click="handleLogoutAll"
+                      class="w-full text-left flex items-center gap-2 px-4 py-2 text-sm text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/30"
+                    >
+                      <Users class="w-4 h-4" /> Log out of all devices
+                    </button>
+                  </div>
                 </div>
-                <div class="py-1">
-                  <RouterLink
-                    to="/settings/account"
-                    @click="menuOpen = false"
-                    class="flex items-center gap-2 px-4 py-2 text-sm text-zinc-700 hover:bg-zinc-50"
-                  >
-                    <Settings class="w-4 h-4" /> Settings
-                  </RouterLink>
-                  <button
-                    @click="handleLogout"
-                    class="w-full text-left flex items-center gap-2 px-4 py-2 text-sm text-zinc-700 hover:bg-zinc-50"
-                  >
-                    <LogOut class="w-4 h-4" /> Log out
-                  </button>
-                  <button
-                    @click="handleLogoutAll"
-                    class="w-full text-left flex items-center gap-2 px-4 py-2 text-sm text-rose-600 hover:bg-rose-50"
-                  >
-                    <Users class="w-4 h-4" /> Log out of all devices
-                  </button>
-                </div>
-              </div>
-            </transition>
+              </transition>
+            </div>
           </div>
+        </div>
+
+        <!-- Rate limit banner -->
+        <div class="px-4 sm:px-6 lg:px-8">
+          <RateLimitBanner
+            :visible="rateLimitVisible"
+            :retry-after-seconds="rateLimitRetryAfter"
+            @dismiss="dismissRateLimit"
+          />
         </div>
       </header>
 

@@ -2,424 +2,519 @@ package dbtest
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
-	"errors"
+	"database/sql"
 	"fmt"
-	"os"
-	"os/exec"
-	"strings"
 	"sync"
 	"testing"
-	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
-	tcwait "github.com/testcontainers/testcontainers-go/wait"
+	_ "modernc.org/sqlite"
 
 	"noumena/internal/db"
 )
 
-// Options tunes a single SetupTestDB invocation.
 type Options struct {
-	// StatementTimeout overrides the default 30s statement_timeout for the
-	// returned pool. Zero means "use default".
-	StatementTimeout time.Duration
-	// LockTimeout overrides the default 5s lock_timeout. Zero means
-	// "use default".
-	LockTimeout time.Duration
+	StatementTimeout int
+	LockTimeout      int
 }
 
-const (
-	defaultStatementTimeout = 30 * time.Second
-	defaultLockTimeout      = 5 * time.Second
+var (
+	schemaOnce sync.Once
+	schemaSQL  string
+	schemaErr  error
 )
 
-// SetupTestDB returns a *pgxpool.Pool connected to a fresh, fully migrated
-// Postgres database. See package doc for behavior and environment knobs.
-//
-// Example with t.Parallel():
-//
-//	func TestParallelA(t *testing.T) {
-//	    t.Parallel()
-//	    pool := dbtest.SetupTestDB(t)
-//	    // ... uses its own DB ...
-//	}
-//
-//	func TestParallelB(t *testing.T) {
-//	    t.Parallel()
-//	    pool := dbtest.SetupTestDB(t)
-//	    // ... uses its own DB ...
-//	}
-func SetupTestDB(t *testing.T) *pgxpool.Pool {
+func loadSchema() {
+	schemaOnce.Do(func() {
+		ctx := context.Background()
+		tmpDB, err := sql.Open("sqlite", ":memory:")
+		if err != nil {
+			schemaErr = fmt.Errorf("open temp db: %w", err)
+			return
+		}
+		defer tmpDB.Close()
+		tmpDB.SetMaxOpenConns(1)
+
+		if err := tmpDB.Ping(); err != nil {
+			schemaErr = fmt.Errorf("ping temp db: %w", err)
+			return
+		}
+
+		if err := db.InitDB(":memory:"); err != nil {
+			schemaErr = fmt.Errorf("init db: %w", err)
+			return
+		}
+		if err := db.ApplyMigrations(ctx); err != nil {
+			schemaErr = fmt.Errorf("apply migrations: %w", err)
+			return
+		}
+
+		// Read the schema SQL from the embedded var via a test query
+		// We just need to know migrations succeeded
+		db.CloseDB()
+	})
+}
+
+func SetupTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 	return SetupTestDBWithOptions(t, Options{})
 }
 
-// SetupTestDBWithOptions is the option-bearing variant of SetupTestDB.
-func SetupTestDBWithOptions(t *testing.T, opts Options) *pgxpool.Pool {
+func SetupTestDBWithOptions(t *testing.T, opts Options) *sql.DB {
 	t.Helper()
-	srv := getOrInitServer(t)
-	if srv == nil {
-		// getOrInitServer called t.Skip already.
-		return nil
+
+	loadSchema()
+	if schemaErr != nil {
+		t.Fatalf("dbtest: load schema: %v", schemaErr)
 	}
 
-	// Provision a unique per-test database from the template.
-	dbName := uniqueDBName()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := srv.cloneTemplate(ctx, dbName); err != nil {
-		t.Fatalf("dbtest: clone template: %v", err)
-	}
-
-	dsn := srv.dsnFor(dbName)
-	cfg, err := pgxpool.ParseConfig(dsn)
+	database, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
-		t.Fatalf("dbtest: parse pool config: %v", err)
+		t.Fatalf("dbtest: open db: %v", err)
+	}
+	database.SetMaxOpenConns(1)
+	database.SetMaxIdleConns(1)
+
+	if err := database.Ping(); err != nil {
+		t.Fatalf("dbtest: ping db: %v", err)
 	}
 
-	stmt := opts.StatementTimeout
-	if stmt == 0 {
-		stmt = defaultStatementTimeout
+	ctx := context.Background()
+	if _, err := database.ExecContext(ctx, "PRAGMA journal_mode=WAL"); err != nil {
+		t.Fatalf("dbtest: set WAL mode: %v", err)
 	}
-	lock := opts.LockTimeout
-	if lock == 0 {
-		lock = defaultLockTimeout
+	if _, err := database.ExecContext(ctx, "PRAGMA busy_timeout=5000"); err != nil {
+		t.Fatalf("dbtest: set busy_timeout: %v", err)
 	}
-	cfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-		if _, err := conn.Exec(ctx, fmt.Sprintf("SET statement_timeout = %d", stmt.Milliseconds())); err != nil {
-			return err
-		}
-		if _, err := conn.Exec(ctx, fmt.Sprintf("SET lock_timeout = %d", lock.Milliseconds())); err != nil {
-			return err
-		}
-		return nil
+	if _, err := database.ExecContext(ctx, "PRAGMA foreign_keys=ON"); err != nil {
+		t.Fatalf("dbtest: enable foreign keys: %v", err)
 	}
 
-	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
-	if err != nil {
-		t.Fatalf("dbtest: open pool: %v", err)
+	if err := applySchemaToDB(ctx, database); err != nil {
+		t.Fatalf("dbtest: apply schema: %v", err)
 	}
 
 	t.Cleanup(func() {
-		pool.Close()
-		dctx, dcancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer dcancel()
-		if err := srv.dropDatabase(dctx, dbName); err != nil {
-			t.Logf("dbtest: drop database %s: %v", dbName, err)
-		}
+		database.Close()
 	})
 
-	return pool
+	return database
 }
 
-// PurgeStale drops any leaked harness databases on the server reachable via
-// TEST_DATABASE_URL (or the active container, if running) whose name has
-// the `noumena_test_` prefix and whose age exceeds threshold. Useful in a
-// CI sweep job; safe to call from a non-test binary.
-func PurgeStale(ctx context.Context, threshold time.Duration) (int, error) {
-	srv := activeServer()
-	if srv == nil {
-		return 0, errors.New("dbtest: no active server (call SetupTestDB first or set TEST_DATABASE_URL)")
-	}
-	return srv.purgeStale(ctx, threshold)
-}
-
-// ----------------------------------------------------------------------------
-// Internal: shared server + template lifecycle
-// ----------------------------------------------------------------------------
-
-// server represents the once-per-binary Postgres backend (either container
-// or external) plus the template database we clone for each test.
-type server struct {
-	adminDSN     string // admin DSN with no DB or with `postgres` DB
-	dsnTemplate  string // DSN with %s placeholder for db name
-	templateName string
-	terminate    func(context.Context) error // optional container teardown
-}
-
-var (
-	serverOnce sync.Once
-	serverVal  *server
-	serverErr  error
-)
-
-// getOrInitServer initializes the per-binary server lazily.
-//
-// If neither TEST_DATABASE_URL is set nor Docker is available, this calls
-// t.Skip and returns nil. Otherwise it boots/reuses the backend, applies
-// migrations into a template, and returns the cached *server.
-func getOrInitServer(t *testing.T) *server {
-	t.Helper()
-	serverOnce.Do(func() {
-		serverVal, serverErr = initServer()
-	})
-	if serverErr != nil {
-		// Distinguish "skip" from "fatal".
-		var s skipErr
-		if errors.As(serverErr, &s) {
-			t.Skip(s.Error())
-			return nil
-		}
-		t.Fatalf("dbtest: init server: %v", serverErr)
-		return nil
-	}
-	return serverVal
-}
-
-func activeServer() *server {
-	return serverVal
-}
-
-// skipErr signals that the harness should call t.Skip with the wrapped
-// reason instead of t.Fatal.
-type skipErr struct{ msg string }
-
-func (s skipErr) Error() string { return s.msg }
-
-func initServer() (*server, error) {
-	if dsn := os.Getenv("TEST_DATABASE_URL"); strings.TrimSpace(dsn) != "" {
-		return initExternal(dsn)
-	}
-	// Fall back to docker. Detect docker availability up front to give a
-	// clean skip message.
-	if !dockerAvailable() {
-		return nil, skipErr{msg: "dbtest: TEST_DATABASE_URL not set and docker is not available; integration tests skipped"}
-	}
-	return initContainer()
-}
-
-func dockerAvailable() bool {
-	if _, err := exec.LookPath("docker"); err != nil {
-		return false
-	}
-	cmd := exec.Command("docker", "info")
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	if err := cmd.Run(); err != nil {
-		return false
-	}
-	return true
-}
-
-func initContainer() (*server, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
-
-	const (
-		user = "noumena"
-		pass = "noumena"
-		db   = "postgres"
-	)
-
-	c, err := tcpostgres.Run(ctx,
-		"postgres:16-alpine",
-		tcpostgres.WithDatabase(db),
-		tcpostgres.WithUsername(user),
-		tcpostgres.WithPassword(pass),
-		tcpostgres.BasicWaitStrategies(),
-		tcpostgres.WithSQLDriver("pgx"),
-	)
-	if err != nil {
-		// If docker is broken for a different reason (no daemon perms,
-		// e.g.), skip rather than fail loudly.
-		return nil, skipErr{msg: fmt.Sprintf("dbtest: docker postgres container failed to start; integration tests skipped: %v", err)}
-	}
-
-	// Belt and suspenders: wait for SQL.
-	_ = tcwait.ForSQL("5432/tcp", "pgx", func(host string, port string) string {
-		return fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable", user, pass, host, port, db)
-	})
-
-	host, err := c.Host(ctx)
-	if err != nil {
-		_ = c.Terminate(ctx)
-		return nil, fmt.Errorf("get host: %w", err)
-	}
-	port, err := c.MappedPort(ctx, "5432/tcp")
-	if err != nil {
-		_ = c.Terminate(ctx)
-		return nil, fmt.Errorf("get port: %w", err)
-	}
-
-	adminDSN := fmt.Sprintf("postgres://%s:%s@%s:%s/postgres?sslmode=disable",
-		user, pass, host, port.Port())
-	dsnTemplate := fmt.Sprintf("postgres://%s:%s@%s:%s/%%s?sslmode=disable",
-		user, pass, host, port.Port())
-
-	srv := &server{
-		adminDSN:    adminDSN,
-		dsnTemplate: dsnTemplate,
-		terminate: func(ctx context.Context) error {
-			return c.Terminate(ctx)
-		},
-	}
-	if err := srv.bootstrapTemplate(); err != nil {
-		_ = c.Terminate(ctx)
-		return nil, err
-	}
-	return srv, nil
-}
-
-func initExternal(dsn string) (*server, error) {
-	// Parse via pgx to derive a "no-database" admin DSN we can use to
-	// CREATE DATABASE, plus a templated DSN.
-	cfg, err := pgx.ParseConfig(dsn)
-	if err != nil {
-		return nil, fmt.Errorf("parse TEST_DATABASE_URL: %w", err)
-	}
-
-	host := cfg.Host
-	port := cfg.Port
-	user := cfg.User
-	pass := cfg.Password
-	ssl := "disable"
-	if v, ok := cfg.RuntimeParams["sslmode"]; ok && v != "" {
-		ssl = v
-	}
-
-	adminDSN := buildDSN(user, pass, host, port, "postgres", ssl)
-	dsnTemplate := buildDSN(user, pass, host, port, "%s", ssl)
-
-	srv := &server{
-		adminDSN:    adminDSN,
-		dsnTemplate: dsnTemplate,
-	}
-	if err := srv.bootstrapTemplate(); err != nil {
-		return nil, err
-	}
-	return srv, nil
-}
-
-func buildDSN(user, pass, host string, port uint16, dbname, ssl string) string {
-	// Quote nothing: tests control these values.
-	if pass == "" {
-		return fmt.Sprintf("postgres://%s@%s:%d/%s?sslmode=%s", user, host, port, dbname, ssl)
-	}
-	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s", user, pass, host, port, dbname, ssl)
-}
-
-// bootstrapTemplate creates `noumena_template_<pid>`, applies the embedded
-// schema, and stores the template name on the server. Idempotent: a stale
-// template from a previous run with the same PID is dropped first.
-func (s *server) bootstrapTemplate() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
-
-	tmpl := fmt.Sprintf("noumena_template_%d", os.Getpid())
-	s.templateName = tmpl
-
-	admin, err := pgx.Connect(ctx, s.adminDSN)
-	if err != nil {
-		return fmt.Errorf("connect admin: %w", err)
-	}
-	defer admin.Close(ctx)
-
-	// Drop any previous template (best-effort) and recreate.
-	if _, err := admin.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %q`, tmpl)); err != nil {
-		return fmt.Errorf("drop stale template: %w", err)
-	}
-	if _, err := admin.Exec(ctx, fmt.Sprintf(`CREATE DATABASE %q`, tmpl)); err != nil {
-		return fmt.Errorf("create template db: %w", err)
-	}
-
-	// Connect to template and apply schema via the production
-	// migration entrypoint so the harness exercises exactly the same
-	// SQL as production startup.
-	tmplDSN := s.dsnFor(tmpl)
-	if err := db.InitDB(tmplDSN); err != nil {
-		return fmt.Errorf("init db pool on template: %w", err)
-	}
-	if err := db.ApplyMigrations(ctx); err != nil {
-		db.CloseDB()
-		return fmt.Errorf("apply migrations: %w", err)
-	}
-	db.CloseDB()
-
-	// Mark template as a TEMPLATE so CREATE DATABASE ... TEMPLATE works
-	// for any role with CREATEDB.
-	if _, err := admin.Exec(ctx, fmt.Sprintf(`ALTER DATABASE %q IS_TEMPLATE = true`, tmpl)); err != nil {
-		// Non-fatal: PG allows TEMPLATE-clone from any DB if the source
-		// has no other connections. Still, mark when we can.
-		// Don't return — proceed.
-		_ = err
-	}
-
-	return nil
-}
-
-func (s *server) cloneTemplate(ctx context.Context, dbName string) error {
-	admin, err := pgx.Connect(ctx, s.adminDSN)
-	if err != nil {
-		return fmt.Errorf("connect admin: %w", err)
-	}
-	defer admin.Close(ctx)
-	q := fmt.Sprintf(`CREATE DATABASE %q TEMPLATE %q`, dbName, s.templateName)
-	if _, err := admin.Exec(ctx, q); err != nil {
-		return fmt.Errorf("clone db %s: %w", dbName, err)
+func applySchemaToDB(ctx context.Context, database *sql.DB) error {
+	if _, err := database.ExecContext(ctx, dbSchemaSQL); err != nil {
+		return fmt.Errorf("exec schema: %w", err)
 	}
 	return nil
 }
 
-func (s *server) dropDatabase(ctx context.Context, dbName string) error {
-	admin, err := pgx.Connect(ctx, s.adminDSN)
-	if err != nil {
-		return err
-	}
-	defer admin.Close(ctx)
-	// FORCE disconnects any lingering pool conns before drop.
-	_, err = admin.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %q WITH (FORCE)`, dbName))
-	return err
-}
+var dbSchemaSQL = `
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    email TEXT UNIQUE NOT NULL,
+    password_hash TEXT,
+    google_sub TEXT UNIQUE,
+    email_verified_at TEXT,
+    subscription_plan TEXT NOT NULL DEFAULT 'free',
+    stripe_customer_id TEXT,
+    comment_quota_monthly INT NOT NULL DEFAULT 1000,
+    comments_used_this_period INT NOT NULL DEFAULT 0,
+    quota_reset_at TEXT,
+    token_version INT NOT NULL DEFAULT 0,
+    failed_login_attempts INT NOT NULL DEFAULT 0,
+    locked_until TEXT,
+    deletion_requested_at TEXT,
+    deletion_completed_at TEXT,
+    data_export_url TEXT,
+    data_export_expires_at TEXT,
+    digest_email_opt_in BOOLEAN NOT NULL DEFAULT 1,
+    digest_email_sent_at TEXT,
+    trial_ends_at TEXT,
+    subscription_status TEXT NOT NULL DEFAULT 'active'
+        CHECK (subscription_status IN ('active','past_due','paused','canceled')),
+    current_period_end TEXT,
+    billing_interval TEXT CHECK (billing_interval IS NULL OR billing_interval IN ('month','year')),
+    stripe_subscription_id TEXT,
+    past_due_since TEXT,
+    active_workspace_id TEXT REFERENCES workspaces(id),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 
-func (s *server) dsnFor(dbName string) string {
-	return strings.Replace(s.dsnTemplate, "%s", dbName, 1)
-}
+CREATE UNIQUE INDEX IF NOT EXISTS users_stripe_subscription_id_uniq
+    ON users (stripe_subscription_id)
+    WHERE stripe_subscription_id IS NOT NULL;
 
-// purgeStale drops databases matching the harness pattern and older than
-// threshold (based on pg_database_size + pg_stat_database last activity is
-// not reliable — we use the catalog's `datfrozenxid` proxy via age()).
-//
-// Implementation: enumerate pg_database, drop any noumena_test_* whose
-// connection is idle. We don't track creation time in the catalog, so the
-// threshold is interpreted as "drop if no active backend".
-func (s *server) purgeStale(ctx context.Context, _ time.Duration) (int, error) {
-	admin, err := pgx.Connect(ctx, s.adminDSN)
-	if err != nil {
-		return 0, err
-	}
-	defer admin.Close(ctx)
+CREATE INDEX IF NOT EXISTS idx_users_subplan_quota_reset
+    ON users(subscription_plan, quota_reset_at);
 
-	rows, err := admin.Query(ctx,
-		`SELECT datname FROM pg_database WHERE datname LIKE 'noumena_test_%'`)
-	if err != nil {
-		return 0, err
-	}
-	var names []string
-	for rows.Next() {
-		var n string
-		if err := rows.Scan(&n); err != nil {
-			rows.Close()
-			return 0, err
-		}
-		names = append(names, n)
-	}
-	rows.Close()
+CREATE INDEX IF NOT EXISTS idx_users_pending_deletion
+    ON users(deletion_requested_at)
+    WHERE deletion_requested_at IS NOT NULL;
 
-	dropped := 0
-	for _, n := range names {
-		if _, err := admin.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %q WITH (FORCE)`, n)); err == nil {
-			dropped++
-		}
-	}
-	return dropped, nil
-}
+CREATE TABLE IF NOT EXISTS processed_stripe_events (
+    stripe_event_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    processed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 
-// uniqueDBName returns a database name unique to this process and call.
-func uniqueDBName() string {
-	var b [8]byte
-	_, _ = rand.Read(b[:])
-	return fmt.Sprintf("noumena_test_%d_%s", os.Getpid(), hex.EncodeToString(b[:]))
-}
+CREATE TABLE IF NOT EXISTS comment_usage_logs (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    count INT NOT NULL,
+    period_start TEXT NOT NULL,
+    period_end TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_comment_usage_logs_user_period
+    ON comment_usage_logs(user_id, period_start);
+
+CREATE TABLE IF NOT EXISTS email_verification_tokens (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_email_verification_tokens_token_hash
+    ON email_verification_tokens(token_hash);
+CREATE INDEX IF NOT EXISTS idx_email_verification_tokens_user_id
+    ON email_verification_tokens(user_id);
+CREATE INDEX IF NOT EXISTS idx_email_verification_tokens_expires_at
+    ON email_verification_tokens(expires_at);
+
+CREATE TABLE IF NOT EXISTS password_reset_tokens (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_password_reset_tokens_token_hash
+    ON password_reset_tokens(token_hash);
+CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_user_id
+    ON password_reset_tokens(user_id);
+CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_expires_at
+    ON password_reset_tokens(expires_at);
+
+CREATE TABLE IF NOT EXISTS refresh_tokens (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_refresh_tokens_token_hash
+    ON refresh_tokens(token_hash);
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id
+    ON refresh_tokens(user_id);
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires_at
+    ON refresh_tokens(expires_at);
+
+CREATE TABLE IF NOT EXISTS platform_channels (
+    id TEXT PRIMARY KEY,
+    platform TEXT NOT NULL,
+    platform_channel_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    last_synced_at TEXT,
+    deletion_scheduled_at TEXT,
+    ingestion_error_count INT NOT NULL DEFAULT 0,
+    ingestion_last_error_at TEXT,
+    ingestion_backoff_until TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(platform, platform_channel_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_platform_channels_platform_channel_id
+    ON platform_channels (platform, platform_channel_id);
+
+CREATE INDEX IF NOT EXISTS idx_platform_channels_sync
+    ON platform_channels(last_synced_at, ingestion_backoff_until);
+
+CREATE TABLE IF NOT EXISTS user_channel_tracking (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    platform_channel_id TEXT NOT NULL REFERENCES platform_channels(id),
+    access_token_enc TEXT NOT NULL,
+    refresh_token_enc TEXT NOT NULL,
+    token_expires_at TEXT,
+    token_priority INT NOT NULL DEFAULT 0,
+    tracking_status TEXT NOT NULL DEFAULT 'active',
+    last_seen_at TEXT,
+    backfill_days INT NOT NULL DEFAULT 90
+        CHECK (backfill_days IN (30, 60, 90, 180)),
+    token_expiry_notified_at TEXT,
+    custom_prompt TEXT,
+    workspace_id TEXT REFERENCES workspaces(id),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(user_id, platform_channel_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS user_channel_tracking_one_primary_per_channel
+    ON user_channel_tracking (platform_channel_id)
+    WHERE token_priority = 0 AND tracking_status = 'active';
+
+CREATE INDEX IF NOT EXISTS idx_user_channel_tracking_token_expiry_scan
+    ON user_channel_tracking (token_expires_at)
+    WHERE tracking_status IN ('active', 'paused');
+
+CREATE INDEX IF NOT EXISTS idx_user_channel_tracking_workspace
+    ON user_channel_tracking(workspace_id);
+
+CREATE TABLE IF NOT EXISTS oauth_states (
+    state_hash TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_oauth_states_expires_at
+    ON oauth_states (expires_at);
+
+CREATE TABLE IF NOT EXISTS comments (
+    id TEXT PRIMARY KEY,
+    platform_channel_id TEXT NOT NULL REFERENCES platform_channels(id) ON DELETE CASCADE,
+    platform_comment_id TEXT NOT NULL,
+    parent_comment_id TEXT,
+    author_handle TEXT,
+    body TEXT NOT NULL,
+    posted_at TEXT NOT NULL,
+    category TEXT,
+    topic TEXT,
+    confidence REAL,
+    processed_at TEXT,
+    llm_provider TEXT,
+    llm_model TEXT,
+    reply_depth INT NOT NULL DEFAULT 0,
+    actionable_insights TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(platform_channel_id, platform_comment_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS comments_platform_dedup
+    ON comments (platform_channel_id, platform_comment_id);
+
+CREATE TABLE IF NOT EXISTS user_comment_stars (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    comment_id TEXT NOT NULL REFERENCES comments(id) ON DELETE CASCADE,
+    starred_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (user_id, comment_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_comment_stars_user_starred
+    ON user_comment_stars(user_id, starred_at DESC);
+
+CREATE TABLE IF NOT EXISTS ingestion_jobs (
+    id TEXT PRIMARY KEY,
+    platform_channel_id TEXT NOT NULL REFERENCES platform_channels(id) ON DELETE CASCADE,
+    job_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    retry_count INT NOT NULL DEFAULT 0,
+    scheduled_at TEXT NOT NULL DEFAULT (datetime('now')),
+    started_at TEXT,
+    completed_at TEXT,
+    error_message TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_ingestion_jobs_pending
+    ON ingestion_jobs(status, scheduled_at)
+    WHERE status = 'pending';
+
+CREATE INDEX IF NOT EXISTS idx_ingestion_jobs_channel
+    ON ingestion_jobs(platform_channel_id, status);
+
+CREATE TABLE IF NOT EXISTS weekly_digests (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    week_start_date TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    content TEXT,
+    emailed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_weekly_digests_user_week
+    ON weekly_digests(user_id, week_start_date);
+
+CREATE TABLE IF NOT EXISTS llm_processing_jobs (
+    id TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'pending',
+    comment_ids TEXT NOT NULL,
+    provider TEXT,
+    retry_count INT NOT NULL DEFAULT 0,
+    error_message TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    started_at TEXT,
+    completed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_llm_jobs_pending
+    ON llm_processing_jobs(status, created_at)
+    WHERE status = 'pending';
+
+CREATE TABLE IF NOT EXISTS comment_exports (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    format TEXT NOT NULL CHECK (format IN ('csv','json')),
+    filters TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('queued','processing','completed','failed','expired')),
+    row_count INTEGER,
+    file_path TEXT,
+    error TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    started_at TEXT,
+    completed_at TEXT,
+    expires_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_comment_exports_queued
+    ON comment_exports(created_at)
+    WHERE status = 'queued';
+
+CREATE INDEX IF NOT EXISTS idx_comment_exports_user_created
+    ON comment_exports(user_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_comments_channel_processed
+    ON comments(platform_channel_id, processed_at, category);
+
+CREATE INDEX IF NOT EXISTS idx_comments_channel_posted
+    ON comments(platform_channel_id, posted_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_comments_parent_comment_id
+    ON comments(parent_comment_id);
+
+CREATE INDEX IF NOT EXISTS idx_comments_channel_parent
+    ON comments(platform_channel_id, parent_comment_id);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS comments_fts USING fts5(body, content='comments', content_rowid='rowid');
+
+CREATE TRIGGER IF NOT EXISTS comments_fts_insert AFTER INSERT ON comments BEGIN
+    INSERT INTO comments_fts(rowid, body) VALUES (new.rowid, new.body);
+END;
+
+CREATE TRIGGER IF NOT EXISTS comments_fts_delete AFTER DELETE ON comments BEGIN
+    INSERT INTO comments_fts(comments_fts, rowid, body) VALUES('delete', old.rowid, old.body);
+END;
+
+CREATE TRIGGER IF NOT EXISTS comments_fts_update AFTER UPDATE ON comments BEGIN
+    INSERT INTO comments_fts(comments_fts, rowid, body) VALUES('delete', old.rowid, old.body);
+    INSERT INTO comments_fts(rowid, body) VALUES (new.rowid, new.body);
+END;
+
+CREATE TABLE IF NOT EXISTS account_deletion_jobs (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','exporting','deleting','completed','failed')),
+    gdpr_export_generated BOOLEAN NOT NULL DEFAULT 0,
+    channels_processed INT NOT NULL DEFAULT 0,
+    total_channels INT NOT NULL DEFAULT 0,
+    error_message TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    started_at TEXT,
+    completed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_account_deletion_jobs_status_created
+    ON account_deletion_jobs(status, created_at);
+
+CREATE TABLE IF NOT EXISTS data_export_jobs (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('queued','exporting','completed','failed')),
+    export_url TEXT,
+    expires_at TEXT,
+    error_message TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    started_at TEXT,
+    completed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_data_export_jobs_status_created
+    ON data_export_jobs(status, created_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_data_export_jobs_one_inflight_per_user
+    ON data_export_jobs(user_id)
+    WHERE status IN ('queued','exporting');
+
+CREATE TABLE IF NOT EXISTS email_send_log (
+    id TEXT PRIMARY KEY,
+    user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+    template TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','sent','failed')),
+    attempt_count INT NOT NULL DEFAULT 0,
+    last_attempted_at TEXT,
+    last_error TEXT,
+    sent_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_send_log_user_template
+    ON email_send_log(user_id, template);
+
+CREATE INDEX IF NOT EXISTS idx_email_send_log_status_attempted
+    ON email_send_log(status, last_attempted_at);
+
+CREATE TABLE IF NOT EXISTS rate_limit_buckets (
+    id TEXT PRIMARY KEY,
+    user_key TEXT NOT NULL,
+    window_start TEXT NOT NULL,
+    count INT NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(user_key, window_start)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rate_limit_buckets_window_start
+    ON rate_limit_buckets(window_start);
+
+CREATE TABLE IF NOT EXISTS workspaces (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS workspace_members (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role TEXT NOT NULL DEFAULT 'viewer'
+        CHECK (role IN ('admin', 'analyst', 'viewer')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (workspace_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS workspace_invites (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    email TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'viewer'
+        CHECK (role IN ('admin', 'analyst', 'viewer')),
+    token_hash TEXT NOT NULL UNIQUE,
+    expires_at TEXT NOT NULL,
+    consumed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_invites_workspace_email
+    ON workspace_invites(workspace_id, email);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id TEXT PRIMARY KEY,
+    user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+    action TEXT NOT NULL,
+    details TEXT,
+    ip_address TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_user_created
+    ON audit_log(user_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_action_created
+    ON audit_log(action, created_at DESC);
+`

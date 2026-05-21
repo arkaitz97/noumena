@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/jackc/pgx/v5"
+	"database/sql"
 
 	"noumena/internal/db"
 )
@@ -48,23 +48,23 @@ func (g *guardMockQuery) MarkDeletionCompletedJobOnly(context.Context, string) e
 func (g *guardMockQuery) GetUserTrackingChannels(context.Context, string) ([]*db.UserChannelTrackingRow, error) {
 	return nil, nil
 }
-func (g *guardMockQuery) GetActiveTrackerCountForUpdate(context.Context, pgx.Tx, string, string) (int, error) {
+func (g *guardMockQuery) GetActiveTrackerCountForUpdate(context.Context, *sql.Tx, string, string) (int, error) {
 	return 0, nil
 }
-func (g *guardMockQuery) DeleteUserChannelTracking(context.Context, pgx.Tx, string, string) error {
+func (g *guardMockQuery) DeleteUserChannelTracking(context.Context, *sql.Tx, string, string) error {
 	return nil
 }
 func (g *guardMockQuery) DeleteCommentsByChannelChunked(context.Context, string, int, string) (int, error) {
 	return 0, nil
 }
-func (g *guardMockQuery) DeletePlatformChannel(context.Context, pgx.Tx, string) error      { return nil }
-func (g *guardMockQuery) DeleteUserStarsForChannel(context.Context, pgx.Tx, string, string) error {
+func (g *guardMockQuery) DeletePlatformChannel(context.Context, *sql.Tx, string) error      { return nil }
+func (g *guardMockQuery) DeleteUserStarsForChannel(context.Context, *sql.Tx, string, string) error {
 	return nil
 }
-func (g *guardMockQuery) DeleteUserStarsAll(context.Context, pgx.Tx, string) error      { return nil }
-func (g *guardMockQuery) DeleteUserDigests(context.Context, pgx.Tx, string) error       { return nil }
-func (g *guardMockQuery) DeleteUserAuthTokens(context.Context, pgx.Tx, string) error    { return nil }
-func (g *guardMockQuery) HardDeleteUser(context.Context, pgx.Tx, string) error          { return nil }
+func (g *guardMockQuery) DeleteUserStarsAll(context.Context, *sql.Tx, string) error      { return nil }
+func (g *guardMockQuery) DeleteUserDigests(context.Context, *sql.Tx, string) error       { return nil }
+func (g *guardMockQuery) DeleteUserAuthTokens(context.Context, *sql.Tx, string) error    { return nil }
+func (g *guardMockQuery) HardDeleteUser(context.Context, *sql.Tx, string) error          { return nil }
 func (g *guardMockQuery) EnqueueDataExport(context.Context, string) (*db.DataExportJob, error) {
 	return nil, nil
 }

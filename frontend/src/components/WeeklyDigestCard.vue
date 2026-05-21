@@ -8,8 +8,18 @@ defineProps<{ digest: WeeklyDigest | null; loading?: boolean }>()
 
 const openIdeas = ref(true)
 const openQuestions = ref(true)
-const openTrend = ref(false)
+const openInsights = ref(false)
 const openHealth = ref(false)
+
+const INSIGHT_TYPE_LABELS: Record<string, string> = {
+  video_idea: 'Video Ideas',
+  editing_tip: 'Editing Tips',
+  feature_request: 'Feature Requests',
+  collaboration_ask: 'Collaboration Asks',
+  improvement_suggestion: 'Improvements',
+  content_format_request: 'Format Requests',
+  other: 'Other',
+}
 </script>
 
 <template>
@@ -36,11 +46,10 @@ const openHealth = ref(false)
 
     <div v-else-if="!digest" class="text-xs text-zinc-500 leading-relaxed">
       Once you've collected a few days of comments, Noumena will summarise the
-      week's top ideas, questions, and sentiment trend here every Monday.
+      week's top ideas, questions, and actionable insights here every Monday.
     </div>
 
     <div v-else class="space-y-3 text-sm">
-      <!-- Top ideas -->
       <div class="rounded-xl border border-zinc-100">
         <button
           type="button"
@@ -60,7 +69,6 @@ const openHealth = ref(false)
         </ul>
       </div>
 
-      <!-- Top questions -->
       <div class="rounded-xl border border-zinc-100">
         <button
           type="button"
@@ -80,24 +88,34 @@ const openHealth = ref(false)
         </ul>
       </div>
 
-      <!-- Sentiment trend -->
       <div class="rounded-xl border border-zinc-100">
         <button
           type="button"
-          @click="openTrend = !openTrend"
-          :aria-expanded="openTrend"
+          @click="openInsights = !openInsights"
+          :aria-expanded="openInsights"
           class="w-full flex items-center justify-between px-3 py-2 text-left text-xs font-semibold text-zinc-700 hover:bg-zinc-50 rounded-xl"
         >
-          Sentiment trend
-          <ChevronDown class="w-4 h-4 transition-transform" :class="openTrend ? 'rotate-180' : ''" />
+          Top actionable insights ({{ digest.top_actionable_insights?.length ?? 0 }})
+          <ChevronDown class="w-4 h-4 transition-transform" :class="openInsights ? 'rotate-180' : ''" />
         </button>
-        <div v-if="openTrend" class="px-3 pb-3 text-xs text-zinc-700">
-          <p>7d avg: <span class="font-medium">{{ (digest.sentiment_trend?.avg_7d ?? 0).toFixed(2) }}</span></p>
-          <p>30d avg: <span class="font-medium">{{ (digest.sentiment_trend?.avg_30d ?? 0).toFixed(2) }}</span></p>
+        <div v-if="openInsights" class="px-3 pb-3 space-y-1.5">
+          <div
+            v-for="(insight, i) in (digest.top_actionable_insights || [])"
+            :key="i"
+            class="text-xs text-zinc-700"
+          >
+            <span
+              class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-indigo-50 text-indigo-700 ring-1 ring-inset ring-indigo-600/20 mr-1"
+            >
+              {{ INSIGHT_TYPE_LABELS[insight.type] ?? insight.type }}
+            </span>
+            <span class="font-medium text-zinc-900">{{ insight.description }}</span>
+            <span v-if="insight.count" class="text-zinc-400"> · {{ insight.count }}</span>
+          </div>
+          <p v-if="(digest.top_actionable_insights || []).length === 0" class="text-xs text-zinc-400">No insights this week.</p>
         </div>
       </div>
 
-      <!-- Health -->
       <div class="rounded-xl border border-zinc-100">
         <button
           type="button"

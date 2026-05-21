@@ -22,10 +22,7 @@ function filtersToParams(filters: Partial<FeedFilters>): Record<string, string> 
   const out: Record<string, string> = {}
   if (filters.channels && filters.channels.length > 0) out.channels = filters.channels.join(',')
   if (filters.categories && filters.categories.length > 0) out.categories = filters.categories.join(',')
-  if (typeof filters.sentiment_min === 'number' && filters.sentiment_min > -1)
-    out.sentiment_min = String(filters.sentiment_min)
-  if (typeof filters.sentiment_max === 'number' && filters.sentiment_max < 1)
-    out.sentiment_max = String(filters.sentiment_max)
+  if (filters.insight_type) out.insight_type = filters.insight_type
   if (filters.date_from) out.date_from = filters.date_from
   if (filters.date_to) out.date_to = filters.date_to
   if (filters.search && filters.search.trim().length > 0) out.search = filters.search.trim()

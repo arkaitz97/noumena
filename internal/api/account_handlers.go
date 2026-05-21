@@ -97,6 +97,7 @@ func (h *AccountHandler) DeleteAccount(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "failed to mark deletion", http.StatusInternalServerError)
 			return
 		}
+		_ = h.Queries.InsertAuditLog(r.Context(), userID, "deletion_requested", `{"user_id":"`+userID+`"}`, r.RemoteAddr)
 	}
 
 	// Cancel the live Stripe subscription, if any. Errors are logged
@@ -144,7 +145,8 @@ func (h *AccountHandler) DeleteAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 // CancelAccountDeletion reverses a pending deletion (only valid while
-// the worker has not yet claimed the job, i.e. status='pending').
+// the worker has not yet claimed the job AND within the 30-day reversible
+// window).
 //
 // POST /api/user/account/cancel-deletion
 func (h *AccountHandler) CancelAccountDeletion(w http.ResponseWriter, r *http.Request) {
@@ -153,6 +155,24 @@ func (h *AccountHandler) CancelAccountDeletion(w http.ResponseWriter, r *http.Re
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+
+	user, err := h.Queries.GetUserByID(r.Context(), userID)
+	if err != nil || user == nil {
+		http.Error(w, "user not found", http.StatusNotFound)
+		return
+	}
+
+	if user.DeletionRequestedAt == nil {
+		http.Error(w, "no pending deletion", http.StatusConflict)
+		return
+	}
+
+	reversibleUntil := user.DeletionRequestedAt.Add(time.Duration(h.Cfg.DeletionReversibleHours) * time.Hour)
+	if time.Now().UTC().After(reversibleUntil) {
+		http.Error(w, "deletion is no longer reversible (30-day window has passed)", http.StatusConflict)
+		return
+	}
+
 	if err := h.Queries.CancelAccountDeletion(r.Context(), userID); err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			http.Error(w, "no cancellable deletion found", http.StatusConflict)
@@ -161,6 +181,7 @@ func (h *AccountHandler) CancelAccountDeletion(w http.ResponseWriter, r *http.Re
 		http.Error(w, "failed to cancel deletion", http.StatusInternalServerError)
 		return
 	}
+	_ = h.Queries.InsertAuditLog(r.Context(), userID, "deletion_cancelled", `{"user_id":"`+userID+`"}`, r.RemoteAddr)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -290,20 +311,20 @@ func (h *AccountHandler) GetProfile(w http.ResponseWriter, r *http.Request) {
 // ----------------------------------------------------------------------------
 
 // exec runs an UPDATE/DELETE without expecting a row back. We type-
-// assert to *db.PostgresQuery to reach the underlying pool — same
+// assert to *db.SQLiteQuery to reach the underlying pool — same
 // pattern InsightsHandler uses. Returns ErrNotFound when running in
 // mock mode (tests should override the handler if they need to assert
 // the SQL fired).
 func (h *AccountHandler) exec(r *http.Request, sql string, args ...any) (int64, error) {
-	pq, ok := h.Queries.(*db.PostgresQuery)
+	sq, ok := h.Queries.(*db.SQLiteQuery)
 	if !ok {
 		return 0, nil // mock-mode no-op
 	}
-	tag, err := pq.Pool().Exec(r.Context(), sql, args...)
+	result, err := sq.DB().ExecContext(r.Context(), sql, args...)
 	if err != nil {
 		return 0, err
 	}
-	return tag.RowsAffected(), nil
+	return result.RowsAffected()
 }
 
 // pathTail used to be a manual URL-segment extractor; replaced by

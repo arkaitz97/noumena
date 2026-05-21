@@ -1,4 +1,4 @@
-// /api/insights/* surface — sentiment, toxicity-shield, trends, latest
+// /api/insights/* surface — toxicity-shield, trends, actionable-insights, latest
 // digest. The digest endpoint returns 404 with code `no_digest_yet` for
 // users whose first weekly digest has not been generated yet — we
 // translate that into `null` so the caller can render an inline empty
@@ -8,7 +8,7 @@ import { AxiosError } from 'axios'
 import apiClient from './api'
 import type {
   ApiErrorBody,
-  SentimentResponse,
+  InsightAggregatesResponse,
   ToxicityResponse,
   TrendsResponse,
   WeeklyDigest,
@@ -29,11 +29,11 @@ function buildParams(channelId?: string, opts: { window?: WindowKey; days?: numb
   return out
 }
 
-export async function sentiment(
+export async function actionableInsights(
   channelId?: string,
   windowKey: WindowKey = '7d',
-): Promise<SentimentResponse> {
-  const { data } = await apiClient.get<SentimentResponse>('/insights/sentiment', {
+): Promise<InsightAggregatesResponse> {
+  const { data } = await apiClient.get<InsightAggregatesResponse>('/insights/actionable-insights', {
     params: buildParams(channelId, { window: windowKey }),
   })
   return data

@@ -68,7 +68,7 @@ const digestStaleAge = 2 * time.Hour
 // wasteful.
 type Worker struct {
 	Queries     db.DBQuery
-	LLMClient   DigestLLMClient
+	LLMClient   *opencodeClient
 	EmailClient email.Client // optional; reserved for Spec 08
 	// Pipeline is the data-lifecycle (12.6) email path. When set AND the
 	// user has digest_email_opt_in=true, the worker emits
@@ -306,6 +306,20 @@ func (w *Worker) runUserDigest(ctx context.Context, user *db.User, weekStart, we
 		if err := w.Queries.UpdateDigestStatus(ctx, digestID, "deferred"); err != nil {
 			w.Logger.Printf("digest worker: defer-status update failed user=%s: %v", user.ID, err)
 		}
+		if w.Pipeline != nil && user.DigestEmailOptIn {
+			msg := email.Message{
+				ToUserID:       user.ID,
+				ToAddress:      user.Email,
+				Template:       "digest_delayed",
+				IdempotencyKey: "digest_delayed:" + digestID,
+				Variables: map[string]any{
+					"WeekRange": weekStart.Format("Jan 2") + " – " + weekStart.AddDate(0, 0, 6).Format("Jan 2, 2006"),
+				},
+			}
+			if err := w.Pipeline.Send(ctx, msg); err != nil {
+				w.Logger.Printf("digest worker: digest_delayed email failed user=%s: %v", user.ID, err)
+			}
+		}
 		return
 	}
 
@@ -356,26 +370,13 @@ func (w *Worker) runUserDigest(ctx context.Context, user *db.User, weekStart, we
 // is the value handed to CallDigestLLM as the truth payload that overwrites
 // the LLM's echoed numbers.
 func (w *Worker) computeTruth(ctx context.Context, user *db.User, weekStart time.Time, comments []*db.Comment) DigestContent {
-	currentAvg := computeSentimentAverage(comments)
-	prevAvg := 0.0
-	if prev, err := w.Queries.GetPreviousWeekDigest(ctx, user.ID, weekStart); err == nil && prev != nil && prev.Status == "completed" && prev.Content != "" {
-		var prevContent DigestContent
-		if err := json.Unmarshal([]byte(prev.Content), &prevContent); err == nil {
-			prevAvg = prevContent.SentimentTrend.CurrentAvg
-		}
-	}
-	dir, changePct := computeSentimentTrend(currentAvg, prevAvg)
 	breakdown := HealthScoreBreakdown{
-		ResponseRate:     computeResponseRate(comments),
-		SentimentQuality: computeSentimentQuality(currentAvg),
-		EngagementDepth:  computeEngagementDepth(comments),
+		ResponseRate:    computeResponseRate(comments),
+		EngagementDepth: computeEngagementDepth(comments),
 	}
+	topInsights := computeTopActionableInsights(comments, 5)
 	return DigestContent{
-		SentimentTrend: SentimentTrend{
-			CurrentAvg: currentAvg,
-			ChangePct:  changePct,
-			Direction:  dir,
-		},
+		TopActionableInsights: topInsights,
 		EngagementHealthScore: computeHealthScore(breakdown),
 		HealthScoreBreakdown:  breakdown,
 		TotalCommentsAnalyzed: len(comments),

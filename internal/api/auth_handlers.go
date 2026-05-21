@@ -20,11 +20,16 @@ import (
 type AuthHandler struct {
 	Queries     db.DBQuery
 	EmailClient email.Client
+	CookieSecure bool
 
 	// OAuthExchanger lets tests inject a fake Google token-exchange + ID-token
 	// verifier in place of the real Google calls. Production code leaves this
 	// nil; auth_handlers.go falls back to oauth.ExchangeAndVerifyWithRedirect.
 	OAuthExchanger func(ctx context.Context, code, codeVerifier, redirectURI string) (*oauth.IDClaims, error)
+
+	// DefaultWorkspaceCreator is called after a new user registers to create
+	// their default workspace (multi-seat workspaces change). Nil skips.
+	DefaultWorkspaceCreator func(userID string) error
 }
 
 // AuthRequest is the JSON body shape for /auth/register and /auth/login.
@@ -50,7 +55,7 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
 
-func setRefreshTokenCookie(w http.ResponseWriter, raw string, expiresAt time.Time) {
+func setRefreshTokenCookie(w http.ResponseWriter, raw string, expiresAt time.Time, secure bool) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     refreshCookieName,
 		Value:    raw,
@@ -58,19 +63,19 @@ func setRefreshTokenCookie(w http.ResponseWriter, raw string, expiresAt time.Tim
 		Expires:  expiresAt,
 		MaxAge:   int(time.Until(expiresAt).Seconds()),
 		HttpOnly: true,
-		Secure:   true,
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 	})
 }
 
-func clearRefreshTokenCookie(w http.ResponseWriter) {
+func clearRefreshTokenCookie(w http.ResponseWriter, secure bool) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     refreshCookieName,
 		Value:    "",
 		Path:     "/auth",
 		MaxAge:   -1,
 		HttpOnly: true,
-		Secure:   true,
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 	})
 }
@@ -126,6 +131,11 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Create default workspace for new user (multi-seat workspaces change).
+	if h.DefaultWorkspaceCreator != nil {
+		_ = h.DefaultWorkspaceCreator(user.ID)
+	}
+
 	// Issue tokens.
 	accessTok, _, err := auth.IssueAccessToken(user.ID, user.TokenVersion)
 	if err != nil {
@@ -137,7 +147,7 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to issue refresh token")
 		return
 	}
-	setRefreshTokenCookie(w, refreshRaw, refreshExp)
+	setRefreshTokenCookie(w, refreshRaw, refreshExp, h.CookieSecure)
 
 	// Issue verification token + email.
 	if h.EmailClient != nil {
@@ -211,7 +221,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to issue refresh token")
 		return
 	}
-	setRefreshTokenCookie(w, refreshRaw, refreshExp)
+	setRefreshTokenCookie(w, refreshRaw, refreshExp, h.CookieSecure)
 
 	writeJSON(w, http.StatusOK, map[string]string{"access_token": accessTok})
 }
@@ -221,19 +231,19 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 	c, err := r.Cookie(refreshCookieName)
 	if err != nil || c.Value == "" {
-		clearRefreshTokenCookie(w)
+		clearRefreshTokenCookie(w, h.CookieSecure)
 		writeError(w, http.StatusUnauthorized, "missing refresh token")
 		return
 	}
 	newRaw, newExp, userID, err := auth.RotateRefreshToken(r.Context(), refreshStore{h.Queries}, c.Value)
 	if err != nil {
-		clearRefreshTokenCookie(w)
+		clearRefreshTokenCookie(w, h.CookieSecure)
 		writeError(w, http.StatusUnauthorized, "invalid or expired refresh token")
 		return
 	}
 	user, err := h.Queries.GetUserByID(r.Context(), userID)
 	if err != nil || user == nil {
-		clearRefreshTokenCookie(w)
+		clearRefreshTokenCookie(w, h.CookieSecure)
 		writeError(w, http.StatusUnauthorized, "invalid session")
 		return
 	}
@@ -242,7 +252,7 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to issue access token")
 		return
 	}
-	setRefreshTokenCookie(w, newRaw, newExp)
+	setRefreshTokenCookie(w, newRaw, newExp, h.CookieSecure)
 	writeJSON(w, http.StatusOK, map[string]string{"access_token": accessTok})
 }
 
@@ -252,7 +262,7 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(refreshCookieName); err == nil && c.Value != "" {
 		_ = auth.RevokeRefreshToken(r.Context(), refreshStore{h.Queries}, c.Value)
 	}
-	clearRefreshTokenCookie(w)
+	clearRefreshTokenCookie(w, h.CookieSecure)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -267,7 +277,7 @@ func (h *AuthHandler) LogoutAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = h.Queries.DeleteAllRefreshTokensForUser(r.Context(), userID)
-	clearRefreshTokenCookie(w)
+	clearRefreshTokenCookie(w, h.CookieSecure)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -599,6 +609,9 @@ func (h *AuthHandler) processGoogleCallback(ctx context.Context, code, state str
 	if err != nil {
 		return nil, fmt.Errorf("failed to create user: %w", err)
 	}
+	if h.DefaultWorkspaceCreator != nil {
+		_ = h.DefaultWorkspaceCreator(user.ID)
+	}
 	return &googleCallbackResult{
 		Outcome: googleOutcomeNewUser,
 		User:    user,
@@ -761,7 +774,7 @@ func (h *AuthHandler) GoogleCallbackJSON(w http.ResponseWriter, r *http.Request)
 			writeError(w, http.StatusInternalServerError, "failed to issue refresh token")
 			return
 		}
-		setRefreshTokenCookie(w, refreshRaw, refreshExp)
+		setRefreshTokenCookie(w, refreshRaw, refreshExp, h.CookieSecure)
 		writeJSON(w, http.StatusOK, map[string]string{"access_token": access})
 		return
 	}
@@ -832,7 +845,7 @@ func (h *AuthHandler) signInAndIssue(w http.ResponseWriter, r *http.Request, use
 	if err != nil {
 		return err
 	}
-	setRefreshTokenCookie(w, refreshRaw, refreshExp)
+	setRefreshTokenCookie(w, refreshRaw, refreshExp, h.CookieSecure)
 	w.Header().Set("X-Access-Token", access) // for SPAs that want to read it from a redirect target
 	return nil
 }

@@ -21,6 +21,7 @@ var (
 	deletionChunkRows       metric.Int64Histogram
 	exportsCompletedTotal   metric.Int64Counter
 	exportBytesTotal        metric.Int64Counter
+	deletionStage           metric.Int64UpDownCounter
 )
 
 func init() {
@@ -50,6 +51,12 @@ func init() {
 	); err != nil {
 		panic("noumena_export_bytes_total: " + err.Error())
 	}
+	if deletionStage, err = lifecycleMeter.Int64UpDownCounter(
+		"noumena_deletion_stage",
+		metric.WithDescription("Current deletion job stage (0=pending, 1=exporting, 2=detaching, 3=finalizing)"),
+	); err != nil {
+		panic("noumena_deletion_stage: " + err.Error())
+	}
 }
 
 func recordDeletionCompleted(ctx context.Context, outcome string) {
@@ -74,4 +81,12 @@ func recordExportBytes(ctx context.Context, n int64) {
 		return
 	}
 	exportBytesTotal.Add(ctx, n)
+}
+
+// recordDeletionStage sets the deletion stage gauge for a job.
+// stage: 0=pending, 1=exporting, 2=detaching, 3=finalizing, 4=completed, 5=failed.
+func recordDeletionStage(ctx context.Context, jobID string, stage int64) {
+	deletionStage.Add(ctx, stage, metric.WithAttributes(
+		attribute.String("job_id", jobID),
+	))
 }

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
+	"database/sql"
 
 	"noumena/internal/db"
 )
@@ -45,11 +45,11 @@ func (f *fakeClient) ClassifyBatch(ctx context.Context, comments []PromptComment
 	out := make([]LLMResult, len(comments))
 	for i := range comments {
 		out[i] = LLMResult{
-			CommentIndex: i,
-			Category:     "praise",
-			Confidence:   0.9,
-			Topic:        "topic",
-			Sentiment:    0.5,
+			CommentIndex:     i,
+			Category:         "praise",
+			Confidence:       0.9,
+			Topic:            "topic",
+			ActionableInsights: []Insight{},
 		}
 	}
 	return out, nil
@@ -76,7 +76,8 @@ type fakeQuery struct {
 
 type updateCall struct {
 	id, category, topic, provider, model string
-	sentiment, confidence                float64
+	actionableInsights                   []byte
+	confidence                           float64
 }
 
 func newFakeQuery() *fakeQuery {
@@ -113,10 +114,10 @@ func (q *fakeQuery) GetPrimaryTracker(ctx context.Context, platformChannelID str
 	return nil, db.ErrNoPrimaryTracker
 }
 
-func (q *fakeQuery) UpdateCommentLLMData(ctx context.Context, id, category, topic, provider, model string, sentiment, confidence float64) error {
+func (q *fakeQuery) UpdateCommentLLMData(ctx context.Context, id, category, topic, provider, model string, actionableInsights []byte, confidence float64) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.updates = append(q.updates, updateCall{id, category, topic, provider, model, sentiment, confidence})
+	q.updates = append(q.updates, updateCall{id, category, topic, provider, model, actionableInsights, confidence})
 	return nil
 }
 
@@ -158,6 +159,14 @@ func (q *fakeQuery) MarkLLMJobFailed(ctx context.Context, jobID string, msg stri
 	q.jobs[jobID] = "failed"
 	q.jobErrMsgs[jobID] = msg
 	return nil
+}
+
+func (q *fakeQuery) GetChannelCustomPrompt(ctx context.Context, platformChannelID, userID string) (string, error) {
+	return "", nil
+}
+
+func (q *fakeQuery) GetCommentBodyByID(ctx context.Context, commentID string) (string, error) {
+	return "", nil
 }
 
 // makeBatch fabricates n comments for a channel.
@@ -232,8 +241,8 @@ func TestProcessor_ConfidenceThresholdDowngrade(t *testing.T) {
 		provider: "openai", model: "gpt-4o",
 		resultsFn: func(comments []PromptComment) ([]LLMResult, error) {
 			return []LLMResult{
-				{CommentIndex: 0, Category: "praise", Confidence: 0.55, Topic: "x", Sentiment: 0.5},
-				{CommentIndex: 1, Category: "question", Confidence: 0.95, Topic: "y", Sentiment: -0.1},
+				{CommentIndex: 0, Category: "praise", Confidence: 0.55, Topic: "x", ActionableInsights: []Insight{}},
+				{CommentIndex: 1, Category: "question", Confidence: 0.95, Topic: "y", ActionableInsights: []Insight{}},
 			}, nil
 		},
 	}
@@ -335,8 +344,8 @@ func TestProcessor_NoPrimaryTrackerSkipped(t *testing.T) {
 	}
 }
 
-// 8.9 — out-of-range sentiment => parse failure, comments remain unprocessed.
-func TestProcessor_LLMReturnsInvalidSentiment(t *testing.T) {
+// 8.9 — parse failure => comments remain unprocessed.
+func TestProcessor_LLMReturnsInvalidResponse(t *testing.T) {
 	// We test by injecting via resultsFn that returns an error mimicking what
 	// the parser would surface. The processor must mark job failed, no
 	// updates, no quota increment.
@@ -347,7 +356,7 @@ func TestProcessor_LLMReturnsInvalidSentiment(t *testing.T) {
 	cli := &fakeClient{
 		provider: "openai", model: "gpt-4o",
 		resultsFn: func(comments []PromptComment) ([]LLMResult, error) {
-			return nil, errors.New("parse: sentiment 1.7 out of range at index 0")
+			return nil, errors.New("parse: invalid category at index 0")
 		},
 	}
 	p := NewProcessor(cli, q)
@@ -409,7 +418,7 @@ type fakeQueryBilling struct {
 	usageLogs []usageLogCall
 }
 
-func (q *fakeQueryBilling) InsertCommentUsageLog(ctx context.Context, tx pgx.Tx, userID string, count int, periodStart, periodEnd time.Time) error {
+func (q *fakeQueryBilling) InsertCommentUsageLog(ctx context.Context, tx *sql.Tx, userID string, count int, periodStart, periodEnd time.Time) error {
 	q.fakeQuery.mu.Lock()
 	defer q.fakeQuery.mu.Unlock()
 	q.usageLogs = append(q.usageLogs, usageLogCall{UserID: userID, Count: count})

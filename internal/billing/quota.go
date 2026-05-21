@@ -145,5 +145,5 @@ func NextRunDelayUTC(hour, minute int) time.Duration {
 	return untilNextDailyUTC(time.Now(), hour, minute)
 }
 
-// Compile-time assertion that *db.PostgresQuery satisfies QuotaCronStore.
-var _ QuotaCronStore = (*db.PostgresQuery)(nil)
+// Compile-time assertion that *db.SQLiteQuery satisfies QuotaCronStore.
+var _ QuotaCronStore = (*db.SQLiteQuery)(nil)

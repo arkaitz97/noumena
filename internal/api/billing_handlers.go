@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/stripe/stripe-go/v76"
 
 	"noumena/internal/billing"
@@ -26,8 +26,8 @@ import (
 //   POST /webhooks/stripe (public, signature-verified)
 //
 // All persistence is delegated to the billing-specific helpers on
-// *db.PostgresQuery (see internal/db/billing.go). Webhook handling
-// type-asserts to *db.PostgresQuery so it can begin a real pgx transaction
+// *db.SQLiteQuery (see internal/db/billing.go). Webhook handling
+// type-asserts to *db.SQLiteQuery so it can begin a real sql transaction
 // — the same pattern used by InsightsHandler. In mock-mode (tests) we fall
 // back to the DBQuery interface and pass nil for the tx.
 type BillingHandler struct {
@@ -54,10 +54,10 @@ type BillingHandler struct {
 	Pipeline *email.Pipeline
 }
 
-// TxBeginner is the minimal pool surface BillingHandler needs. *pgxpool.Pool
+// TxBeginner is the minimal DB surface BillingHandler needs. *sql.DB
 // satisfies it. Tests can leave it nil.
 type TxBeginner interface {
-	BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error)
+	BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
 }
 
 // ----------------------------------------------------------------------------
@@ -305,21 +305,21 @@ func (h *BillingHandler) dispatchEvent(ctx context.Context, event stripe.Event) 
 	if h.Pool == nil {
 		return h.applyEvent(ctx, nil, event)
 	}
-	tx, err := h.Pool.BeginTx(ctx, pgx.TxOptions{})
+	tx, err := h.Pool.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer func() { _ = tx.Rollback() }()
 
 	if err := h.applyEvent(ctx, tx, event); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	return tx.Commit()
 }
 
 // applyEvent writes the side effects for a single event and the matching
 // processed_stripe_events row. tx may be nil in mock mode.
-func (h *BillingHandler) applyEvent(ctx context.Context, tx pgx.Tx, event stripe.Event) error {
+func (h *BillingHandler) applyEvent(ctx context.Context, tx *sql.Tx, event stripe.Event) error {
 	switch event.Type {
 	case "checkout.session.completed":
 		if err := h.handleCheckoutCompleted(ctx, tx, event); err != nil {
@@ -376,7 +376,7 @@ type stripeCheckoutSession struct {
 	Metadata          map[string]string `json:"metadata"`
 }
 
-func (h *BillingHandler) handleCheckoutCompleted(ctx context.Context, tx pgx.Tx, event stripe.Event) error {
+func (h *BillingHandler) handleCheckoutCompleted(ctx context.Context, tx *sql.Tx, event stripe.Event) error {
 	var sess stripeCheckoutSession
 	if err := json.Unmarshal(event.Data.Raw, &sess); err != nil {
 		return err
@@ -464,7 +464,7 @@ type stripeInvoice struct {
 	} `json:"lines"`
 }
 
-func (h *BillingHandler) handleInvoicePaymentSucceeded(ctx context.Context, tx pgx.Tx, event stripe.Event) error {
+func (h *BillingHandler) handleInvoicePaymentSucceeded(ctx context.Context, tx *sql.Tx, event stripe.Event) error {
 	var inv stripeInvoice
 	if err := json.Unmarshal(event.Data.Raw, &inv); err != nil {
 		return err
@@ -508,7 +508,7 @@ func (h *BillingHandler) handleInvoicePaymentSucceeded(ctx context.Context, tx p
 	return h.Queries.ApplySubscriptionUpdate(ctx, tx, upd)
 }
 
-func (h *BillingHandler) handleInvoicePaymentFailed(ctx context.Context, tx pgx.Tx, event stripe.Event) error {
+func (h *BillingHandler) handleInvoicePaymentFailed(ctx context.Context, tx *sql.Tx, event stripe.Event) error {
 	var inv stripeInvoice
 	if err := json.Unmarshal(event.Data.Raw, &inv); err != nil {
 		return err
@@ -573,7 +573,7 @@ type stripeSubscriptionEvent struct {
 	Metadata   map[string]string `json:"metadata"`
 }
 
-func (h *BillingHandler) handleSubscriptionUpdated(ctx context.Context, tx pgx.Tx, event stripe.Event) error {
+func (h *BillingHandler) handleSubscriptionUpdated(ctx context.Context, tx *sql.Tx, event stripe.Event) error {
 	var s stripeSubscriptionEvent
 	if err := json.Unmarshal(event.Data.Raw, &s); err != nil {
 		return err
@@ -638,13 +638,49 @@ func (h *BillingHandler) handleSubscriptionUpdated(ctx context.Context, tx pgx.T
 		upd.CurrentPeriodEnd = &t
 	}
 	if status == "active" {
-		// recovering from past_due clears the grace anchor.
 		upd.PastDueSinceClear = true
 	}
-	return h.Queries.ApplySubscriptionUpdate(ctx, tx, upd)
+	if err := h.Queries.ApplySubscriptionUpdate(ctx, tx, upd); err != nil {
+		return err
+	}
+
+	if plan != "" && status == "active" {
+		limit := billing.LimitsFor(plan)
+		if !limit.ChannelsUnlimited {
+			if err := h.Queries.PauseChannelsAlphabetically(ctx, tx, user.ID, limit.ChannelLimit); err != nil {
+				log.Printf("billing webhook: pause excess channels user=%s plan=%s: %v", user.ID, plan, err)
+			}
+		}
+
+		// 7.4: Send downgrade notification email when plan changes to a lower tier.
+		oldPlan := user.SubscriptionPlan
+		if oldPlan == "" {
+			oldPlan = billing.PlanFree
+		}
+		if plan != oldPlan && h.Pipeline != nil {
+			pausedChannels := false
+			if !limit.ChannelsUnlimited {
+				pausedChannels = true
+			}
+			_ = h.Pipeline.Send(ctx, email.Message{
+				Template:       email.TemplatePlanDowngrade,
+				ToUserID:       user.ID,
+				ToAddress:      user.Email,
+				IdempotencyKey: "plan_downgrade:" + user.ID + ":" + plan,
+				Variables: map[string]any{
+					"OldPlan":        oldPlan,
+					"NewPlan":        plan,
+					"ChannelLimit":   limit.ChannelLimit,
+					"PausedChannels": pausedChannels,
+				},
+			})
+		}
+	}
+
+	return nil
 }
 
-func (h *BillingHandler) handleSubscriptionDeleted(ctx context.Context, tx pgx.Tx, event stripe.Event) error {
+func (h *BillingHandler) handleSubscriptionDeleted(ctx context.Context, tx *sql.Tx, event stripe.Event) error {
 	var s stripeSubscriptionEvent
 	if err := json.Unmarshal(event.Data.Raw, &s); err != nil {
 		return err

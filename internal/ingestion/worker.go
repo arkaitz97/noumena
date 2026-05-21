@@ -2,6 +2,7 @@ package ingestion
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log"
@@ -10,8 +11,6 @@ import (
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"noumena/internal/auth"
 	"noumena/internal/config"
@@ -76,7 +75,7 @@ const (
 // per-channel mutual exclusion across the cluster.
 type Worker struct {
 	DB             WorkerDB
-	Pool           *pgxpool.Pool // for advisory lock
+	Pool           *sql.DB // kept for compatibility; not used for SQLite
 	Client         *YouTubeClient
 	Alerter        DeadLetterAlerter
 	JobDeadline    time.Duration
@@ -85,7 +84,7 @@ type Worker struct {
 }
 
 // NewWorker returns a Worker with sensible defaults.
-func NewWorker(db WorkerDB, pool *pgxpool.Pool) *Worker {
+func NewWorker(db WorkerDB, pool *sql.DB) *Worker {
 	return &Worker{
 		DB:             db,
 		Pool:           pool,
@@ -120,8 +119,13 @@ func (w *Worker) Run(ctx context.Context) {
 				wg.Wait()
 				return
 			}
-			log.Printf("worker: claim error: %v", err)
-			sleepCtx(ctx, 5*time.Second)
+			if err != db.ErrNotFound {
+				log.Printf("worker: claim error: %v", err)
+				sleepCtx(ctx, 5*time.Second)
+				continue
+			}
+			// No pending jobs — poll normally.
+			sleepCtx(ctx, w.PollEmptyDelay)
 			continue
 		}
 		if job == nil {
@@ -351,6 +355,33 @@ func (w *Worker) runIngestion(jobCtx, persistCtx context.Context, pc *db.Platfor
 					return err
 				}
 			}
+
+			// Paginate through deep replies for this thread.
+			if t.ParentCommentID == nil && t.ReplyDepth == 0 {
+				nextReply := w.Client.ListReplies(jobCtx, accessTok, t.CommentID)
+				for {
+					if jobCtx.Err() != nil {
+						break
+					}
+					r, rok, rerr := nextReply()
+					if rerr != nil {
+						break
+					}
+					if !rok {
+						break
+					}
+					rc := r.ToDBComment(pc.ID)
+					batch = append(batch, rc)
+					if r.PostedAt.After(maxPostedAt) {
+						maxPostedAt = r.PostedAt
+					}
+					if len(batch) >= commentBatchSize {
+						if err := flush(); err != nil {
+							return err
+						}
+					}
+				}
+			}
 		}
 	}
 	return flush()
@@ -444,26 +475,25 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 // ============================================================================
 
 // StartWorker is the legacy entrypoint. It now constructs and runs both the
-// scheduler and the job-queue worker against the provided pool. The
-// `q db.DBQuery` parameter is preserved for source compatibility but is not
-// used for job-queue operations (which require *PostgresQuery methods).
+// scheduler and the job-queue worker against the provided DB. The
+// `q db.DBQuery` parameter is preserved for source compatibility.
 //
 // Callers that want fine-grained control should use NewWorker / NewScheduler
 // directly from cmd/api/main.go.
 func StartWorker(ctx context.Context, q db.DBQuery) {
-	pq, ok := q.(*db.PostgresQuery)
+	sq, ok := q.(*db.SQLiteQuery)
 	if !ok {
-		log.Println("ingestion: StartWorker requires *db.PostgresQuery; legacy path disabled")
+		log.Println("ingestion: StartWorker requires *db.SQLiteQuery; legacy path disabled")
 		return
 	}
-	pool := pq.Pool()
+	pool := sq.DB()
 	if pool == nil {
-		log.Println("ingestion: StartWorker requires a pgx pool; legacy path disabled")
+		log.Println("ingestion: StartWorker requires a database connection; legacy path disabled")
 		return
 	}
 
-	scheduler := NewScheduler(pq, 30)
-	worker := NewWorker(pq, pool)
+	scheduler := NewScheduler(sq, 30)
+	worker := NewWorker(sq, pool)
 
 	go scheduler.Run(ctx, 30*time.Second)
 	worker.Run(ctx)

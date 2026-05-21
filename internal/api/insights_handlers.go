@@ -32,11 +32,11 @@ import (
 )
 
 // InsightsHandler bundles dependencies for the insights-api endpoints. It
-// requires a *db.PostgresQuery (not the DBQuery interface) because several
+// requires a *db.SQLiteQuery (not the DBQuery interface) because several
 // new methods (BuildFeedQuery-driven ones, exports CRUD, aggregates) live
 // only on the concrete type.
 type InsightsHandler struct {
-	Queries *db.PostgresQuery
+	Queries *db.SQLiteQuery
 	Cfg     *config.Config
 }
 
@@ -76,19 +76,8 @@ func parseFeedFilters(r *http.Request, cfg *config.Config) (db.FeedFilters, erro
 	if v := q.Get("categories"); v != "" {
 		f.Categories = splitCSV(v)
 	}
-	if v := q.Get("sentiment_min"); v != "" {
-		x, err := strconv.ParseFloat(v, 64)
-		if err != nil || x < -1 || x > 1 {
-			return f, errors.New("invalid sentiment_min")
-		}
-		f.SentimentMin = &x
-	}
-	if v := q.Get("sentiment_max"); v != "" {
-		x, err := strconv.ParseFloat(v, 64)
-		if err != nil || x < -1 || x > 1 {
-			return f, errors.New("invalid sentiment_max")
-		}
-		f.SentimentMax = &x
+	if v := q.Get("insight_type"); v != "" {
+		f.InsightType = v
 	}
 	if v := q.Get("date_from"); v != "" {
 		t, err := parseDateOrTime(v)
@@ -325,13 +314,8 @@ func isUUID(s string) bool {
 
 // --- Insights aggregates ----------------------------------------------------
 
-type sentimentResponse struct {
-	ChannelID string                            `json:"channel_id"`
-	Windows   map[string]db.SentimentBucket     `json:"windows"`
-}
-
-// Sentiment handles GET /api/insights/sentiment. Tasks 7.1–7.3.
-func (h *InsightsHandler) Sentiment(w http.ResponseWriter, r *http.Request) {
+// ActionableInsights handles GET /api/insights/actionable-insights.
+func (h *InsightsHandler) ActionableInsights(w http.ResponseWriter, r *http.Request) {
 	userID, ok := r.Context().Value(UserIDKey).(string)
 	if !ok || userID == "" {
 		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
@@ -342,35 +326,95 @@ func (h *InsightsHandler) Sentiment(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, code, "not_tracked")
 		return
 	}
-	now := time.Now()
-	resp := sentimentResponse{
-		ChannelID: "all",
-		Windows:   map[string]db.SentimentBucket{},
-	}
-	if channelID != nil {
-		resp.ChannelID = *channelID
-	}
-	for label, dur := range map[string]time.Duration{
-		"7d":  7 * 24 * time.Hour,
-		"30d": 30 * 24 * time.Hour,
-		"90d": 90 * 24 * time.Hour,
-	} {
-		b, err := h.Queries.GetSentimentAggregates(r.Context(), userID, channelID, now.Add(-dur))
-		if err != nil {
-			writeJSONError(w, http.StatusInternalServerError, "aggregate_failed")
-			return
+	q := r.URL.Query()
+	days := 30
+	if v := q.Get("days"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			days = n
 		}
-		// 7.3: log a warning if bucket percentages are way off 100.
-		if b.Count > 0 {
-			sum := b.PositivePct + b.NegativePct + b.NeutralPct
-			if sum < 99.7 || sum > 100.3 {
-				// Non-fatal; rounding artifact at very small N.
-				_ = sum
-			}
+	}
+	insights, err := h.Queries.GetTopInsights(r.Context(), userID, channelID, time.Now().Add(-time.Duration(days)*24*time.Hour), 50)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "aggregate_failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, insights)
+}
+
+// TopInsights handles GET /api/insights/actionable-insights/top.
+func (h *InsightsHandler) TopInsights(w http.ResponseWriter, r *http.Request) {
+	userID, ok := r.Context().Value(UserIDKey).(string)
+	if !ok || userID == "" {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	channelID, code := h.validateChannelID(r)
+	if code != 0 {
+		writeJSONError(w, code, "not_tracked")
+		return
+	}
+	q := r.URL.Query()
+	days := 30
+	if v := q.Get("days"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			days = n
 		}
-		resp.Windows[label] = b
+	}
+	insights, err := h.Queries.GetTopInsights(r.Context(), userID, channelID, time.Now().Add(-time.Duration(days)*24*time.Hour), 10)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "aggregate_failed")
+		return
+	}
+	// Group by type and take top 3 per type.
+	typeGrouped := make(map[string][]db.TopInsight)
+	for _, ins := range insights {
+		typeGrouped[ins.Type] = append(typeGrouped[ins.Type], ins)
+	}
+	resp := make(map[string][]db.TopInsight)
+	for typ, list := range typeGrouped {
+		if len(list) > 3 {
+			list = list[:3]
+		}
+		resp[typ] = list
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// InsightDistribution handles GET /api/insights/actionable-insights/distribution.
+func (h *InsightsHandler) InsightDistribution(w http.ResponseWriter, r *http.Request) {
+	userID, ok := r.Context().Value(UserIDKey).(string)
+	if !ok || userID == "" {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	channelID, code := h.validateChannelID(r)
+	if code != 0 {
+		writeJSONError(w, code, "not_tracked")
+		return
+	}
+	q := r.URL.Query()
+	days := 30
+	if v := q.Get("days"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			days = n
+		}
+	}
+	dist, err := h.Queries.GetInsightDistribution(r.Context(), userID, channelID, time.Now().Add(-time.Duration(days)*24*time.Hour))
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "aggregate_failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, dist)
+}
+
+// RefreshInsightsView handles POST /api/insights/actionable-insights/refresh.
+func (h *InsightsHandler) RefreshInsightsView(w http.ResponseWriter, r *http.Request) {
+	_, err := h.Queries.DB().ExecContext(r.Context(), "SELECT refresh_actionable_insights_view()")
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "refresh_failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "refreshed"})
 }
 
 type toxicityResponse struct {
@@ -497,8 +541,7 @@ type exportRequest struct {
 	// Filter shape mirrors GET /feed query params.
 	Channels     []string `json:"channels"`
 	Categories   []string `json:"categories"`
-	SentimentMin *float64 `json:"sentiment_min"`
-	SentimentMax *float64 `json:"sentiment_max"`
+	InsightType  string   `json:"insight_type"`
 	DateFrom     *string  `json:"date_from"`
 	DateTo       *string  `json:"date_to"`
 	Search       *string  `json:"search"`
@@ -510,8 +553,7 @@ func (er exportRequest) toFilters() (db.FeedFilters, error) {
 	f := db.FeedFilters{
 		Channels:     er.Channels,
 		Categories:   er.Categories,
-		SentimentMin: er.SentimentMin,
-		SentimentMax: er.SentimentMax,
+		InsightType:  er.InsightType,
 		Search:       er.Search,
 		IncludeToxic: er.IncludeToxic,
 		Sort:         er.Sort,
@@ -595,7 +637,7 @@ func (h *InsightsHandler) CreateExport(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "open_failed")
 		return
 	}
-	rowCount, eerr := export.StreamExport(r.Context(), h.Queries.Pool(), userID, filters, req.Format, f)
+	rowCount, eerr := export.StreamExport(r.Context(), h.Queries.DB(), userID, filters, req.Format, f)
 	if eerr != nil {
 		_ = f.Close()
 		_ = h.Queries.MarkExportFailed(context.Background(), exp.ID, eerr.Error(), false)

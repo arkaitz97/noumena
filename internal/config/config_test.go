@@ -79,12 +79,11 @@ func TestEnsureExportDirCreatesMissing(t *testing.T) {
 	}
 }
 
-// TestLoadOpenCodeDefaultsAndOverrides asserts the use-opencode-as-ai-provider
-// change: OpenCode is the default primary, OPENCODE_BASE_URL/OPENCODE_MODEL
+// TestLoadOpenCodeDefaultsAndOverrides asserts the migrate-llm-to-opencode
+// change: OpenCode is the sole provider, OPENCODE_BASE_URL/OPENCODE_MODEL
 // have sensible defaults, and the env-var loaders override them.
 func TestLoadOpenCodeDefaultsAndOverrides(t *testing.T) {
 	for _, k := range []string{
-		"LLM_PRIMARY_PROVIDER", "LLM_FALLBACK_PROVIDER",
 		"OPENCODE_API_KEY", "OPENCODE_BASE_URL", "OPENCODE_MODEL",
 	} {
 		_ = os.Unsetenv(k)
@@ -93,12 +92,6 @@ func TestLoadOpenCodeDefaultsAndOverrides(t *testing.T) {
 	c, err := Load(false)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
-	}
-	if c.LLMPrimaryProvider != "opencode" {
-		t.Errorf("LLMPrimaryProvider default: want opencode, got %q", c.LLMPrimaryProvider)
-	}
-	if c.LLMFallbackProvider != "anthropic" {
-		t.Errorf("LLMFallbackProvider default: want anthropic, got %q", c.LLMFallbackProvider)
 	}
 	if c.OpenCodeBaseURL != "https://api.opencode.local/v1" {
 		t.Errorf("OpenCodeBaseURL default: got %q", c.OpenCodeBaseURL)
@@ -111,7 +104,6 @@ func TestLoadOpenCodeDefaultsAndOverrides(t *testing.T) {
 	}
 
 	// Now override via env.
-	t.Setenv("LLM_PRIMARY_PROVIDER", "openai")
 	t.Setenv("OPENCODE_API_KEY", "sk-opencode-xyz")
 	t.Setenv("OPENCODE_BASE_URL", "https://opencode.example.test/v1")
 	t.Setenv("OPENCODE_MODEL", "opencode/large")
@@ -119,9 +111,6 @@ func TestLoadOpenCodeDefaultsAndOverrides(t *testing.T) {
 	c2, err := Load(false)
 	if err != nil {
 		t.Fatalf("Load (with env): %v", err)
-	}
-	if c2.LLMPrimaryProvider != "openai" {
-		t.Errorf("LLMPrimaryProvider override: got %q", c2.LLMPrimaryProvider)
 	}
 	if c2.OpenCodeAPIKey != "sk-opencode-xyz" {
 		t.Errorf("OpenCodeAPIKey override: got %q", c2.OpenCodeAPIKey)

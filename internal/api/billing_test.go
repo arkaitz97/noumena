@@ -18,6 +18,7 @@ import (
 	"noumena/internal/auth"
 	"noumena/internal/billing"
 	"noumena/internal/db"
+	"noumena/internal/email"
 )
 
 // ============================================================================
@@ -714,3 +715,174 @@ func itoa(n int64) string { return strconv.FormatInt(n, 10) }
 
 // guard unused imports
 var _ = context.Background
+
+// ============================================================================
+// Task 7.6: Annual pricing, downgrade behavior, webhook handling
+// ============================================================================
+
+func TestBillingCheckoutAnnualIntervalAccepted(t *testing.T) {
+	queries := &MockQuery{}
+	seedTestUser(queries, "test-user-id", billing.PlanFree)
+	r := setupBillingRouter(queries, billing.NewMockClient())
+
+	access, _, _ := auth.GenerateTokens("test-user-id")
+	req, _ := http.NewRequest("POST", "/api/billing/checkout",
+		bytes.NewBufferString(`{"plan":"studio","interval":"year"}`))
+	req.Header.Set("Authorization", bearer(access))
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("annual checkout: want 200 got %d body=%s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		CheckoutURL string `json:"checkout_url"`
+	}
+	_ = json.NewDecoder(rr.Body).Decode(&body)
+	if body.CheckoutURL == "" {
+		t.Fatal("annual checkout: expected checkout_url in response")
+	}
+}
+
+func TestBillingCheckoutAllAnnualPlansAccepted(t *testing.T) {
+	queries := &MockQuery{}
+	seedTestUser(queries, "u", billing.PlanFree)
+	r := setupBillingRouter(queries, billing.NewMockClient())
+	access, _, _ := auth.GenerateTokens("u")
+
+	plans := []string{billing.PlanCreator, billing.PlanStudio, billing.PlanAgency}
+	for _, plan := range plans {
+		body := []byte(`{"plan":"` + plan + `","interval":"year"}`)
+		req, _ := http.NewRequest("POST", "/api/billing/checkout", bytes.NewBuffer(body))
+		req.Header.Set("Authorization", bearer(access))
+		rr := httptest.NewRecorder()
+		r.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Errorf("checkout %s/year: want 200 got %d", plan, rr.Code)
+		}
+	}
+}
+
+func TestStripeWebhookSubscriptionUpdatedDowngrade(t *testing.T) {
+	queries := &MockQuery{}
+	cust := "cus_downgrade"
+	u := seedTestUser(queries, "user-1", billing.PlanStudio)
+	u.StripeCustomerID = &cust
+	queries.usersByStripeCustomer = map[string]*db.User{cust: u}
+
+	mc := billing.NewMockClient()
+	mc.Prices = billing.PriceMap{CreatorMonthly: "price_cm"}
+	periodEnd := time.Now().Add(30 * 24 * time.Hour).Unix()
+	mc.Subscriptions = map[string]*stripe.Subscription{
+		"sub_down": {
+			ID:               "sub_down",
+			Status:           stripe.SubscriptionStatusActive,
+			CurrentPeriodEnd: periodEnd,
+			Items: &stripe.SubscriptionItemList{
+				Data: []*stripe.SubscriptionItem{
+					{Price: &stripe.Price{ID: "price_cm"}},
+				},
+			},
+		},
+	}
+	mc.NextEvent = &stripe.Event{
+		ID:   "evt_downgrade",
+		Type: "customer.subscription.updated",
+		Data: &stripe.EventData{Raw: []byte(`{"id":"sub_down","customer":"cus_downgrade","status":"active"}`)},
+	}
+
+	r := setupBillingRouter(queries, mc)
+	req, _ := http.NewRequest("POST", "/webhooks/stripe", bytes.NewBufferString(`{}`))
+	req.Header.Set("Stripe-Signature", "ok")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200 got %d body=%s", rr.Code, rr.Body.String())
+	}
+	// Downgrade from studio → creator must apply new plan + quota.
+	if u.SubscriptionPlan != billing.PlanCreator {
+		t.Errorf("plan: want creator got %s", u.SubscriptionPlan)
+	}
+	if u.CommentQuotaMonthly != 50000 {
+		t.Errorf("quota: want 50000 got %d", u.CommentQuotaMonthly)
+	}
+	// PauseChannelsAlphabetically must have been called with creator limit (3).
+	if len(queries.pauseAlphaCalls) != 1 {
+		t.Fatalf("expected 1 pause-alpha call, got %d", len(queries.pauseAlphaCalls))
+	}
+	if queries.pauseAlphaCalls[0].KeepCount != 3 {
+		t.Errorf("pause-alpha keepCount: want 3 (creator), got %d", queries.pauseAlphaCalls[0].KeepCount)
+	}
+}
+
+func TestStripeWebhookSubscriptionUpdatedUpgradeAppliesStudioLimits(t *testing.T) {
+	queries := &MockQuery{}
+	cust := "cus_upgrade"
+	u := seedTestUser(queries, "user-2", billing.PlanCreator)
+	u.StripeCustomerID = &cust
+	queries.usersByStripeCustomer = map[string]*db.User{cust: u}
+
+	mc := billing.NewMockClient()
+	mc.Prices = billing.PriceMap{StudioMonthly: "price_sm"}
+	periodEnd := time.Now().Add(30 * 24 * time.Hour).Unix()
+	mc.Subscriptions = map[string]*stripe.Subscription{
+		"sub_up": {
+			ID:               "sub_up",
+			Status:           stripe.SubscriptionStatusActive,
+			CurrentPeriodEnd: periodEnd,
+			Items: &stripe.SubscriptionItemList{
+				Data: []*stripe.SubscriptionItem{
+					{Price: &stripe.Price{ID: "price_sm"}},
+				},
+			},
+		},
+	}
+	mc.NextEvent = &stripe.Event{
+		ID:   "evt_upgrade",
+		Type: "customer.subscription.updated",
+		Data: &stripe.EventData{Raw: []byte(`{"id":"sub_up","customer":"cus_upgrade","status":"active"}`)},
+	}
+
+	r := setupBillingRouter(queries, mc)
+	req, _ := http.NewRequest("POST", "/webhooks/stripe", bytes.NewBufferString(`{}`))
+	req.Header.Set("Stripe-Signature", "ok")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200 got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if u.SubscriptionPlan != billing.PlanStudio {
+		t.Errorf("plan: want studio got %s", u.SubscriptionPlan)
+	}
+	if u.CommentQuotaMonthly != 250000 {
+		t.Errorf("quota: want 250000 got %d", u.CommentQuotaMonthly)
+	}
+	// PauseChannelsAlphabetically is called for every update to enforce plan limits.
+	if len(queries.pauseAlphaCalls) != 1 {
+		t.Fatalf("expected 1 pause-alpha call, got %d", len(queries.pauseAlphaCalls))
+	}
+	if queries.pauseAlphaCalls[0].KeepCount != 15 {
+		t.Errorf("pause-alpha keepCount: want 15 (studio), got %d", queries.pauseAlphaCalls[0].KeepCount)
+	}
+}
+
+// TestPlanDowngradeTemplateExists verifies the plan_downgrade template is
+// registered and renders with the expected variables.
+func TestPlanDowngradeTemplateExists(t *testing.T) {
+	if email.TemplatePlanDowngrade != "plan_downgrade" {
+		t.Errorf("TemplatePlanDowngrade: want plan_downgrade, got %s", email.TemplatePlanDowngrade)
+	}
+	// Verify it's in the registry.
+	found := false
+	for _, id := range email.TemplateIDs {
+		if id == email.TemplatePlanDowngrade {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("TemplatePlanDowngrade not in TemplateIDs registry")
+	}
+}

@@ -30,14 +30,13 @@ const (
 	TemplatePaymentGraceFinal  = "payment_grace_final"
 	TemplateTrialExpiry        = "trial_expiry"
 	TemplateWeeklyDigest       = "weekly_digest"
+	TemplateDigestDelayed      = "digest_delayed"
 	TemplateExportReady        = "export_ready"
 	TemplateDeletionScheduled  = "deletion_scheduled"
 	TemplateDeletionCompleted  = "deletion_completed"
+	TemplatePlanDowngrade      = "plan_downgrade"
 )
 
-// TemplateIDs is the canonical iteration order — used by the snapshot
-// test to ensure every registered template renders cleanly with a
-// reasonable input set.
 var TemplateIDs = []string{
 	TemplateEmailVerification,
 	TemplatePasswordReset,
@@ -47,9 +46,11 @@ var TemplateIDs = []string{
 	TemplatePaymentGraceFinal,
 	TemplateTrialExpiry,
 	TemplateWeeklyDigest,
+	TemplateDigestDelayed,
 	TemplateExportReady,
 	TemplateDeletionScheduled,
 	TemplateDeletionCompleted,
+	TemplatePlanDowngrade,
 }
 
 // templateDef is one row in the registry. Subject is also a Go template
@@ -301,6 +302,18 @@ Sentiment trend: {{.SentimentDirection}} ({{.SentimentChangePct}}% week-over-wee
 View full digest: {{.AppBaseURL}}/dashboard`,
 		},
 
+		TemplateDigestDelayed: {
+			subject: "Your weekly digest is delayed",
+			html: `<p>We're still preparing your weekly digest for <strong>{{.WeekRange}}</strong>.</p>
+<p>Due to high processing volume, your digest will be available shortly. You'll receive another email when it's ready.</p>
+<p><a href="{{.AppBaseURL}}/dashboard">View dashboard →</a></p>`,
+			textRaw: `We're still preparing your weekly digest for {{.WeekRange}}.
+
+Due to high processing volume, your digest will be available shortly. You'll receive another email when it's ready.
+
+View dashboard: {{.AppBaseURL}}/dashboard`,
+		},
+
 		TemplateExportReady: {
 			subject: "Your data export is ready",
 			html: `<p>Your data export is ready to download.</p>
@@ -317,13 +330,13 @@ The link is valid until {{.ExpiresAt}}:
 		TemplateDeletionScheduled: {
 			subject: "Your account is scheduled for deletion",
 			html: `<p>We received a request to delete your account.</p>
-<p>Your account is reversible until <strong>{{.ReversibleUntil}}</strong>. After that time we will begin permanently deleting your data.</p>
-<p>If this was a mistake, contact <a href="mailto:{{.AppSupportEmail}}">{{.AppSupportEmail}}</a> immediately and reference your account email.</p>`,
+<p>Your account deletion is reversible for <strong>30 days</strong> until <strong>{{.ReversibleUntil}}</strong>. After that time we will begin permanently deleting your data.</p>
+<p>If this was a mistake, you can cancel the deletion from your account settings or contact <a href="mailto:{{.AppSupportEmail}}">{{.AppSupportEmail}}</a> immediately and reference your account email.</p>`,
 			textRaw: `We received a request to delete your account.
 
-Your account is reversible until {{.ReversibleUntil}}. After that time we will begin permanently deleting your data.
+Your account deletion is reversible for 30 days until {{.ReversibleUntil}}. After that time we will begin permanently deleting your data.
 
-If this was a mistake, contact {{.AppSupportEmail}} immediately and reference your account email.`,
+If this was a mistake, you can cancel the deletion from your account settings or contact {{.AppSupportEmail}} immediately and reference your account email.`,
 		},
 
 		TemplateDeletionCompleted: {
@@ -336,6 +349,17 @@ If this was a mistake, contact {{.AppSupportEmail}} immediately and reference yo
 If you previously requested a GDPR data export, that download link remains valid until its original expiry; no further action is required.
 
 We're sorry to see you go.`,
+		},
+
+		TemplatePlanDowngrade: {
+			subject: "Your plan has been downgraded to {{.NewPlan}}",
+			html: `<p>Your subscription has been downgraded from <strong>{{.OldPlan}}</strong> to <strong>{{.NewPlan}}</strong>.</p>
+{{if .PausedChannels}}<p>Some of your channels have been paused to comply with the {{.NewPlan}} plan limit of <strong>{{.ChannelLimit}}</strong> channels. You can reconnect them at any time by upgrading your plan.</p>{{end}}
+<p><a href="{{.AppBaseURL}}/settings/billing">Manage your subscription</a></p>`,
+			textRaw: `Your subscription has been downgraded from {{.OldPlan}} to {{.NewPlan}}.
+{{if .PausedChannels}}Some of your channels have been paused to comply with the {{.NewPlan}} plan limit of {{.ChannelLimit}} channels. You can reconnect them at any time by upgrading your plan.{{end}}
+
+Manage your subscription: {{.AppBaseURL}}/settings/billing`,
 		},
 	}
 }

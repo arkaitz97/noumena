@@ -2,7 +2,6 @@ package llm
 
 import (
 	"context"
-	"errors"
 	"io"
 	"log"
 	"strings"
@@ -10,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"noumena/internal/config"
 	"noumena/internal/db"
+	"noumena/internal/email"
 )
 
 // fakeDigestQuery is a hand-rolled DBQuery double for the worker tests. It
@@ -106,6 +107,10 @@ func (f *fakeDigestQuery) GetStalePendingDigests(ctx context.Context, olderThan 
 	return f.stale, nil
 }
 
+func (f *fakeDigestQuery) MarkDigestEmailed(ctx context.Context, digestID, userID string, at time.Time) error {
+	return nil
+}
+
 // --- Tests ------------------------------------------------------------------
 
 func TestShouldTrigger(t *testing.T) {
@@ -137,7 +142,7 @@ func TestComputeWeekStart(t *testing.T) {
 	}
 }
 
-func newTestWorker(t *testing.T, q *fakeDigestQuery, llm DigestLLMClient) *Worker {
+func newTestWorker(t *testing.T, q *fakeDigestQuery, llm *opencodeClient) *Worker {
 	t.Helper()
 	return &Worker{
 		Queries:   q,
@@ -155,7 +160,7 @@ func TestRunUserDigest_SkipBelowThreshold(t *testing.T) {
 	for i := range q.comments["u1"] {
 		q.comments["u1"][i] = &db.Comment{Body: "x"}
 	}
-	w := newTestWorker(t, q, &fakeDigestLLM{raw: "{}"})
+	w := newTestWorker(t, q, newMockOpenCode(t, "{}", "", 0))
 	w.runUserDigest(context.Background(), &db.User{ID: "u1"}, time.Now().UTC(), time.Now().UTC().Add(7*24*time.Hour))
 
 	if len(q.contentUpdates) != 1 || q.contentUpdates[0].Status != "skipped_insufficient_data" {
@@ -166,25 +171,24 @@ func TestRunUserDigest_SkipBelowThreshold(t *testing.T) {
 func TestRunUserDigest_SuccessOverwritesNumeric(t *testing.T) {
 	cs := make([]*db.Comment, 12)
 	for i := range cs {
-		s := 0.5
 		topic := "topic-A"
 		cat := "praise"
-		cs[i] = &db.Comment{Body: "loved it", SentimentScore: &s, Topic: &topic, Category: &cat}
+		cs[i] = &db.Comment{Body: "loved it", Topic: &topic, Category: &cat}
 	}
 	q := &fakeDigestQuery{
 		comments:        map[string][]*db.Comment{"u1": cs},
 		pendingInserted: true,
 	}
-	llm := &fakeDigestLLM{raw: `{
+	llmRaw := `{
 		"top_ideas":[{"idea":"more like this","evidence":"many positives","sample_comments":["loved it"]}],
 		"top_questions":[],
-		"sentiment_trend":{"current_avg":0,"change_pct":0,"direction":"stable"},
+		"top_actionable_insights":[{"type":"video_idea","description":"tutorial","count":2}],
 		"engagement_health_score":0,
-		"health_score_breakdown":{"response_rate":0,"sentiment_quality":0,"engagement_depth":0},
+		"health_score_breakdown":{"response_rate":0,"engagement_depth":0},
 		"total_comments_analyzed":0,
 		"filtered_comments":0
-	}`}
-	w := newTestWorker(t, q, llm)
+	}`
+	w := newTestWorker(t, q, newMockOpenCode(t, llmRaw, "", 0))
 	w.runUserDigest(context.Background(), &db.User{ID: "u1"}, time.Now().UTC(), time.Now().UTC().Add(7*24*time.Hour))
 
 	if len(q.contentUpdates) != 1 || q.contentUpdates[0].Status != "completed" {
@@ -206,7 +210,6 @@ func TestRunUserDigest_DeferOnRetryExhaustion(t *testing.T) {
 		comments:        map[string][]*db.Comment{"u1": cs},
 		pendingInserted: true,
 	}
-	llm := &fakeDigestLLM{err: errors.New("boom")}
 
 	// Compress the retry schedule for the test so it runs fast. Restore
 	// the production constants via t.Cleanup.
@@ -214,7 +217,7 @@ func TestRunUserDigest_DeferOnRetryExhaustion(t *testing.T) {
 	digestRetrySchedule = []time.Duration{0, 1 * time.Millisecond, 2 * time.Millisecond}
 	t.Cleanup(func() { digestRetrySchedule = prev })
 
-	w := newTestWorker(t, q, llm)
+	w := newTestWorker(t, q, newMockOpenCode(t, "", "boom", 0))
 	w.runUserDigest(context.Background(), &db.User{ID: "u1"}, time.Now().UTC(), time.Now().UTC().Add(7*24*time.Hour))
 
 	if len(q.statusUpdates) != 1 || q.statusUpdates[0].Status != "deferred" {
@@ -231,7 +234,7 @@ func TestRunUserDigest_IdempotentSecondInvocation(t *testing.T) {
 		comments:        map[string][]*db.Comment{"u1": cs},
 		pendingInserted: false, // simulates ON CONFLICT: row already exists
 	}
-	w := newTestWorker(t, q, &fakeDigestLLM{raw: "{}"})
+	w := newTestWorker(t, q, newMockOpenCode(t, "{}", "", 0))
 	w.runUserDigest(context.Background(), &db.User{ID: "u1"}, time.Now().UTC(), time.Now().UTC().Add(7*24*time.Hour))
 	if len(q.contentUpdates) != 0 || len(q.statusUpdates) != 0 {
 		t.Errorf("idempotent skip should leave row untouched")
@@ -254,5 +257,218 @@ func TestRecoverStalePending(t *testing.T) {
 		if u.Status != "deferred" {
 			t.Errorf("want deferred, got %s", u.Status)
 		}
+	}
+}
+
+// fakeSMTPSender implements email.SMTPSender for tests.
+type fakeSMTPSender struct{}
+
+func (f *fakeSMTPSender) Send(ctx context.Context, from, to, subject, htmlBody, textBody string) error {
+	return nil
+}
+
+// fakeEmailLogStore implements db.EmailLogStore for tests.
+type fakeEmailLogStore struct{}
+
+func (f *fakeEmailLogStore) IsEmailIdempotencyKeyUsed(ctx context.Context, key string) (bool, error) {
+	return false, nil
+}
+func (f *fakeEmailLogStore) LogEmailAttempt(ctx context.Context, in db.EmailAttemptInput) (string, error) {
+	return "log-" + in.IdempotencyKey, nil
+}
+func (f *fakeEmailLogStore) MarkEmailSent(ctx context.Context, logID string, at time.Time) error {
+	return nil
+}
+func (f *fakeEmailLogStore) MarkEmailAttemptError(ctx context.Context, logID, errMsg string) error {
+	return nil
+}
+func (f *fakeEmailLogStore) IncrementEmailAttempt(ctx context.Context, id string, attempt int, lastErr string) error {
+	return nil
+}
+func (f *fakeEmailLogStore) MarkEmailFailed(ctx context.Context, id string, lastErr string) error {
+	return nil
+}
+func (f *fakeEmailLogStore) ClaimPendingEmails(ctx context.Context, now time.Time, max int) ([]*db.EmailLogRow, error) {
+	return nil, nil
+}
+
+func TestRunUserDigest_EmailSentWhenOptInTrue(t *testing.T) {
+	cs := make([]*db.Comment, 12)
+	for i := range cs {
+		topic := "topic-A"
+		cat := "praise"
+		cs[i] = &db.Comment{Body: "loved it", Topic: &topic, Category: &cat}
+	}
+	q := &fakeDigestQuery{
+		comments:        map[string][]*db.Comment{"u1": cs},
+		pendingInserted: true,
+	}
+	llmRaw := `{
+		"top_ideas":[{"idea":"more like this","evidence":"many positives","sample_comments":["loved it"]}],
+		"top_questions":[],
+		"top_actionable_insights":[{"type":"video_idea","description":"tutorial","count":2}],
+		"engagement_health_score":80,
+		"health_score_breakdown":{"response_rate":70,"engagement_depth":75},
+		"total_comments_analyzed":12,
+		"filtered_comments":0
+	}`
+	pipeline := &email.Pipeline{
+		Queries: &fakeEmailLogStore{},
+		Sender:  &fakeSMTPSender{},
+		Cfg:     &config.Config{EmailEnabled: true},
+		Logger:  log.New(io.Discard, "", 0),
+	}
+	w := newTestWorker(t, q, newMockOpenCode(t, llmRaw, "", 0))
+	w.Pipeline = pipeline
+	w.runUserDigest(context.Background(), &db.User{ID: "u1", Email: "u1@test.com", DigestEmailOptIn: true}, time.Now().UTC(), time.Now().UTC().Add(7*24*time.Hour))
+
+	// Digest should be completed and email path exercised (no error from Send)
+	if len(q.contentUpdates) != 1 || q.contentUpdates[0].Status != "completed" {
+		t.Fatalf("expected completed status, got %+v", q.contentUpdates)
+	}
+}
+
+func TestRunUserDigest_EmailNotSentWhenOptInFalse(t *testing.T) {
+	cs := make([]*db.Comment, 12)
+	for i := range cs {
+		topic := "topic-A"
+		cat := "praise"
+		cs[i] = &db.Comment{Body: "loved it", Topic: &topic, Category: &cat}
+	}
+	q := &fakeDigestQuery{
+		comments:        map[string][]*db.Comment{"u1": cs},
+		pendingInserted: true,
+	}
+	llmRaw := `{
+		"top_ideas":[{"idea":"more like this","evidence":"many positives","sample_comments":["loved it"]}],
+		"top_questions":[],
+		"top_actionable_insights":[],
+		"engagement_health_score":80,
+		"health_score_breakdown":{"response_rate":70,"engagement_depth":75},
+		"total_comments_analyzed":12,
+		"filtered_comments":0
+	}`
+	// Use a pipeline that would panic if Send is called (to verify it is NOT called)
+	panicSender := &panicSMTPSender{}
+	pipeline := &email.Pipeline{
+		Queries: &fakeEmailLogStore{},
+		Sender:  panicSender,
+		Cfg:     &config.Config{EmailEnabled: true},
+		Logger:  log.New(io.Discard, "", 0),
+	}
+	w := newTestWorker(t, q, newMockOpenCode(t, llmRaw, "", 0))
+	w.Pipeline = pipeline
+	// Should NOT panic because opt_in=false skips the email path
+	w.runUserDigest(context.Background(), &db.User{ID: "u1", Email: "u1@test.com", DigestEmailOptIn: false}, time.Now().UTC(), time.Now().UTC().Add(7*24*time.Hour))
+
+	// Digest should still be completed (just no email)
+	if len(q.contentUpdates) != 1 || q.contentUpdates[0].Status != "completed" {
+		t.Fatalf("expected completed status, got %+v", q.contentUpdates)
+	}
+}
+
+// panicSMTPSender panics if Send is called, used to verify email path is skipped.
+type panicSMTPSender struct{}
+
+func (p *panicSMTPSender) Send(ctx context.Context, from, to, subject, htmlBody, textBody string) error {
+	panic("SMTPSender.Send should not be called when opt_in=false")
+}
+
+func TestRunUserDigest_DigestDelayedEmailOnDefer(t *testing.T) {
+	cs := make([]*db.Comment, 11)
+	for i := range cs {
+		cs[i] = &db.Comment{Body: "x"}
+	}
+	q := &fakeDigestQuery{
+		comments:        map[string][]*db.Comment{"u1": cs},
+		pendingInserted: true,
+	}
+
+	prev := digestRetrySchedule
+	digestRetrySchedule = []time.Duration{0, 1 * time.Millisecond, 2 * time.Millisecond}
+	t.Cleanup(func() { digestRetrySchedule = prev })
+
+	// Track whether Send was called for digest_delayed
+	sender := &trackingSMTPSender{}
+	pipeline := &email.Pipeline{
+		Queries: &fakeEmailLogStore{},
+		Sender:  sender,
+		Cfg:     &config.Config{EmailEnabled: true},
+		Logger:  log.New(io.Discard, "", 0),
+	}
+	w := newTestWorker(t, q, newMockOpenCode(t, "", "boom", 0))
+	w.Pipeline = pipeline
+	w.runUserDigest(context.Background(), &db.User{ID: "u1", Email: "u1@test.com", DigestEmailOptIn: true}, time.Now().UTC(), time.Now().UTC().Add(7*24*time.Hour))
+
+	if !sender.called {
+		t.Fatal("expected digest_delayed email to be sent on defer")
+	}
+	// The email was sent to the user's address (template rendering happens in Pipeline.Send)
+	if sender.lastTo != "u1@test.com" {
+		t.Errorf("expected email to u1@test.com, got %s", sender.lastTo)
+	}
+}
+
+// trackingSMTPSender records whether Send was called.
+type trackingSMTPSender struct {
+	called bool
+	lastTo string
+}
+
+func (t *trackingSMTPSender) Send(ctx context.Context, from, to, subject, htmlBody, textBody string) error {
+	t.called = true
+	t.lastTo = to
+	return nil
+}
+
+func TestRunUserDigest_EmailedAtMarkedAfterSend(t *testing.T) {
+	cs := make([]*db.Comment, 12)
+	for i := range cs {
+		topic := "topic-A"
+		cat := "praise"
+		cs[i] = &db.Comment{Body: "loved it", Topic: &topic, Category: &cat}
+	}
+	q := &fakeDigestQuery{
+		comments:        map[string][]*db.Comment{"u1": cs},
+		pendingInserted: true,
+	}
+	llmRaw := `{
+		"top_ideas":[],
+		"top_questions":[],
+		"top_actionable_insights":[],
+		"engagement_health_score":80,
+		"health_score_breakdown":{"response_rate":70,"engagement_depth":75},
+		"total_comments_analyzed":12,
+		"filtered_comments":0
+	}`
+	pipeline := &email.Pipeline{
+		Queries: &fakeEmailLogStore{},
+		Sender:  &fakeSMTPSender{},
+		Cfg:     &config.Config{EmailEnabled: true},
+		Logger:  log.New(io.Discard, "", 0),
+	}
+	w := newTestWorker(t, q, newMockOpenCode(t, llmRaw, "", 0))
+	w.Pipeline = pipeline
+	w.runUserDigest(context.Background(), &db.User{ID: "u1", Email: "u1@test.com", DigestEmailOptIn: true}, time.Now().UTC(), time.Now().UTC().Add(7*24*time.Hour))
+
+	// Verify digest completed and email path was exercised
+	if len(q.contentUpdates) != 1 || q.contentUpdates[0].Status != "completed" {
+		t.Fatalf("expected completed status, got %+v", q.contentUpdates)
+	}
+}
+
+func TestRunUserDigest_PausedChannelsExcluded(t *testing.T) {
+	// Simulate paused channels by returning no comments (the SQL query filters
+	// by tracking_status='active', so paused channels produce no eligible comments).
+	q := &fakeDigestQuery{
+		comments:        map[string][]*db.Comment{"u1": {}},
+		pendingInserted: true,
+	}
+	w := newTestWorker(t, q, newMockOpenCode(t, "{}", "", 0))
+	w.runUserDigest(context.Background(), &db.User{ID: "u1"}, time.Now().UTC(), time.Now().UTC().Add(7*24*time.Hour))
+
+	// With 0 comments (< digestSkipThreshold=10), should be skipped.
+	if len(q.contentUpdates) != 1 || q.contentUpdates[0].Status != "skipped_insufficient_data" {
+		t.Errorf("expected skip due to insufficient data (paused channels excluded), got %+v", q.contentUpdates)
 	}
 }

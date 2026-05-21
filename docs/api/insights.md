@@ -38,7 +38,7 @@ Filtered feed used by the dashboard.
   |---|---|---|
   | `channels` | CSV of channel UUIDs | Restricts to those channels (still subject to access control). |
   | `categories` | CSV of category labels | High-signal default categories — see the spec. |
-  | `sentiment_min` / `sentiment_max` | float in `[-1, 1]` | |
+  | `insight_type` | insight type label | Filters to comments containing at least one insight of the specified type. |
   | `date_from` / `date_to` | `YYYY-MM-DD` or RFC3339 | |
   | `search` | free text | Full-text search on the comment body. |
   | `include_toxic` | `true` / `1` | Two-layer toxic comment opt-in. |
@@ -58,7 +58,7 @@ Filtered feed used by the dashboard.
   (`COUNT_QUERY_TIMEOUT`); in that case `has_more` is derived from
   whether the page returned exactly `limit` rows.
 - **Errors:** `400` for any invalid query param (`invalid sort`,
-  `invalid sentiment_min`, etc.), `408 feed_query_timeout` when the
+  `invalid insight_type`, etc.), `408 feed_query_timeout` when the
   feed query exceeds `FEED_QUERY_TIMEOUT`, `500 feed_query_failed`.
 
 ### GET /api/comments/saved
@@ -91,17 +91,24 @@ All `/insights/*` endpoints accept an optional `channel_id` query
 parameter. Omit it (or pass `all`) to aggregate across every channel
 the caller tracks. A foreign UUID returns `403 not_tracked`.
 
-### GET /api/insights/sentiment
+### GET /api/insights/actionable-insights
 
+- **Query:** `window` ∈ `{7d, 30d, 90d}` (default `7d`), optional
+  `channel_id`.
 - **Response:** `200 OK`,
   ```json
   {
     "channel_id": "all",
-    "windows": {
-      "7d":  { "count": 1234, "positive_pct": 41.2, "negative_pct": 18.7, "neutral_pct": 40.1 },
-      "30d": { ... },
-      "90d": { ... }
-    }
+    "window": "7d",
+    "total_insights": 456,
+    "distribution": [
+      { "type": "video_idea", "count": 120 },
+      { "type": "editing_tip", "count": 85 }
+    ],
+    "top_insights": [
+      { "type": "video_idea", "description": "Make a color grading tutorial", "count": 12 },
+      { "type": "editing_tip", "description": "Use smoother transitions", "count": 8 }
+    ]
   }
   ```
 - **Errors:** `400 not_tracked` (malformed UUID), `403 not_tracked`,
@@ -143,7 +150,9 @@ production is owned by the weekly-digest worker).
     "week_end":   "2026-05-03",
     "top_ideas":      [ ... ],
     "top_questions":  [ ... ],
-    "sentiment_trend": { ... },
+    "top_actionable_insights": [
+      { "type": "video_idea", "description": "Make a tutorial", "count": 5 }
+    ],
     "health_score":   87
   }
   ```

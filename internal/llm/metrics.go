@@ -24,7 +24,7 @@ var (
 	llmRequestsTotal       metric.Int64Counter
 	llmTokensTotal         metric.Int64Counter
 	llmRequestDurationSecs metric.Float64Histogram
-	llmFailoverSwitchTotal metric.Int64Counter
+	llmFailoverTotal       metric.Int64Counter
 )
 
 func init() {
@@ -48,11 +48,11 @@ func init() {
 	); err != nil {
 		panic("noumena_llm_request_duration_seconds: " + err.Error())
 	}
-	if llmFailoverSwitchTotal, err = llmMeter.Int64Counter(
-		"noumena_llm_failover_switch_total",
-		metric.WithDescription("Failover-wrapper provider switches"),
+	if llmFailoverTotal, err = llmMeter.Int64Counter(
+		"noumena_llm_failover_total",
+		metric.WithDescription("Provider failover events, by from/to provider pair"),
 	); err != nil {
-		panic("noumena_llm_failover_switch_total: " + err.Error())
+		panic("noumena_llm_failover_total: " + err.Error())
 	}
 }
 
@@ -98,15 +98,6 @@ func recordLLMTokens(ctx context.Context, provider, model string, tokens int64) 
 	))
 }
 
-// recordLLMFailoverSwitch is invoked by failover.go when the wrapper
-// transitions between primary and fallback providers.
-func recordLLMFailoverSwitch(ctx context.Context, fromProvider, toProvider string) {
-	llmFailoverSwitchTotal.Add(ctx, 1, metric.WithAttributes(
-		attribute.String(telemetry.AttrFromProvider, fromProvider),
-		attribute.String(telemetry.AttrToProvider, toProvider),
-	))
-}
-
 // traceWithAttrs builds the StartOption set for the LLM span. Centralised
 // so the attribute keys stay consistent with the metric labels.
 func traceWithAttrs(provider, model string, batchSize int) trace.SpanStartOption {
@@ -115,4 +106,14 @@ func traceWithAttrs(provider, model string, batchSize int) trace.SpanStartOption
 		attribute.String("llm.model", model),
 		attribute.Int("llm.batch_size", batchSize),
 	)
+}
+
+// recordLLMFailover increments noumena_llm_failover_total with the
+// (from_provider, to_provider) attributes. Called when the failover
+// wrapper switches from a failing primary to the fallback provider.
+func recordLLMFailover(ctx context.Context, fromProvider, toProvider string) {
+	llmFailoverTotal.Add(ctx, 1, metric.WithAttributes(
+		attribute.String(telemetry.AttrFromProvider, fromProvider),
+		attribute.String(telemetry.AttrToProvider, toProvider),
+	))
 }

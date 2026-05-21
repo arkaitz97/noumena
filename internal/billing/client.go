@@ -108,6 +108,11 @@ type Client interface {
 	// for rationale on the immediate-cancel choice.
 	CancelSubscription(ctx context.Context, subID string) error
 
+	// CancelSubscriptionAtPeriodEnd cancels a subscription at the end of
+	// the current billing period. Used for annual plan cancellations where
+	// the user retains access until the period ends.
+	CancelSubscriptionAtPeriodEnd(ctx context.Context, subID string) error
+
 	// PriceMap exposes the configured (plan, interval) → price-id mapping
 	// so callers (including handlers and tests) can resolve plan from a
 	// Stripe price-id.
@@ -238,6 +243,23 @@ func (c *StripeClient) CancelSubscription(ctx context.Context, subID string) err
 	return nil
 }
 
+func (c *StripeClient) CancelSubscriptionAtPeriodEnd(ctx context.Context, subID string) error {
+	params := &stripe.SubscriptionParams{
+		CancelAtPeriodEnd: stripe.Bool(true),
+	}
+	params.Context = ctx
+	_, err := stripesub.Update(subID, params)
+	if err != nil {
+		var serr *stripe.Error
+		if errors.As(err, &serr) && serr.Code == stripe.ErrorCodeResourceMissing {
+			log.Printf("billing: CancelSubscriptionAtPeriodEnd sub=%s already missing (treating as success)", subID)
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
 // MockClient is a no-op Client used by tests. It returns deterministic
 // values so tests can assert on them without hitting the Stripe API. The
 // NextEvent / NextEventErr / Subscriptions fields let webhook tests prime
@@ -301,5 +323,10 @@ func (m *MockClient) GetSubscription(_ context.Context, subID string) (*stripe.S
 // want to simulate a failure should swap in a custom Client.
 func (m *MockClient) CancelSubscription(_ context.Context, subID string) error {
 	m.Cancellations = append(m.Cancellations, subID)
+	return nil
+}
+
+func (m *MockClient) CancelSubscriptionAtPeriodEnd(_ context.Context, subID string) error {
+	m.Cancellations = append(m.Cancellations, subID+":at_period_end")
 	return nil
 }

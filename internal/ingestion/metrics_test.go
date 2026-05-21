@@ -3,6 +3,7 @@ package ingestion
 import (
 	"context"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
@@ -79,3 +80,17 @@ func TestRecordIngestionErrorRateLimited(t *testing.T) {
 type dummyErr struct{}
 
 func (dummyErr) Error() string { return "dummy" }
+
+// TestNoOpMetricsDoNotPanic verifies that with the default no-op
+// MeterProvider (no SDK initialized), calling every record function is
+// safe and does not panic. This is the zero-cost guarantee from the
+// spec: when OTEL_ENABLED=false, instrumentation calls short-circuit
+// inside the OTel SDK without any measurable overhead.
+func TestNoOpMetricsDoNotPanic(t *testing.T) {
+	ctx := context.Background()
+	// Default global MeterProvider is no-op; these calls must not panic.
+	recordCommentsIngested(ctx, 5)
+	recordIngestionError(ctx, telemetry.ReasonRateLimited)
+	recordFetchDuration(ctx, time.Now().Add(-50*time.Millisecond), telemetry.OutcomeSuccess)
+	recordLockContention(ctx)
+}

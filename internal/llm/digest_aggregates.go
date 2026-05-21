@@ -1,25 +1,31 @@
 package llm
 
 import (
-	"math"
+	"encoding/json"
 	"sort"
-	"time"
 
 	"noumena/internal/db"
 )
 
 // DigestContent is the canonical JSON shape persisted in
 // weekly_digests.content. The LLM is asked to produce the qualitative fields
-// (top_ideas, top_questions); the numeric fields are computed in Go and
+// (top_ideas, top_questions, top_actionable_insights); the numeric fields are computed in Go and
 // authoritatively overwritten before persistence.
 type DigestContent struct {
 	TopIdeas              []DigestIdea           `json:"top_ideas"`
 	TopQuestions          []DigestQuestion       `json:"top_questions"`
-	SentimentTrend        SentimentTrend         `json:"sentiment_trend"`
+	TopActionableInsights []ActionableInsightAgg `json:"top_actionable_insights"`
 	EngagementHealthScore int                    `json:"engagement_health_score"`
 	HealthScoreBreakdown  HealthScoreBreakdown   `json:"health_score_breakdown"`
 	TotalCommentsAnalyzed int                    `json:"total_comments_analyzed"`
 	FilteredComments      int                    `json:"filtered_comments"`
+}
+
+// ActionableInsightAgg is an aggregated actionable insight for the digest.
+type ActionableInsightAgg struct {
+	Type        string `json:"type"`
+	Description string `json:"description"`
+	Count       int    `json:"count"`
 }
 
 // DigestIdea is one entry in the LLM-synthesised top_ideas list.
@@ -36,20 +42,11 @@ type DigestQuestion struct {
 	Unanswered bool   `json:"unanswered"`
 }
 
-// SentimentTrend captures the current-week sentiment baseline plus the
-// week-over-week delta. Direction values: improving | stable | declining.
-type SentimentTrend struct {
-	CurrentAvg float64 `json:"current_avg"`
-	ChangePct  float64 `json:"change_pct"`
-	Direction  string  `json:"direction"`
-}
-
-// HealthScoreBreakdown decomposes engagement_health_score into its 3 equal-
+// HealthScoreBreakdown decomposes engagement_health_score into its 2 equal-
 // weight components, each in [0, 100].
 type HealthScoreBreakdown struct {
-	ResponseRate     int `json:"response_rate"`
-	SentimentQuality int `json:"sentiment_quality"`
-	EngagementDepth  int `json:"engagement_depth"`
+	ResponseRate    int `json:"response_rate"`
+	EngagementDepth int `json:"engagement_depth"`
 }
 
 // TopicAgg is a (topic, count) tuple emitted by computeTopTopics.
@@ -58,45 +55,43 @@ type TopicAgg struct {
 	Count int    `json:"count"`
 }
 
-// computeSentimentAverage returns the arithmetic mean of all non-NULL
-// sentiment_score values across the comments. Returns 0 for an empty input
-// (matches Spec 06 baseline-zero scenario).
-func computeSentimentAverage(comments []*db.Comment) float64 {
+// computeTopActionableInsights extracts and aggregates actionable insights from comments.
+func computeTopActionableInsights(comments []*db.Comment, n int) []ActionableInsightAgg {
 	if len(comments) == 0 {
-		return 0
+		return nil
 	}
-	var sum float64
-	var n int
+	type insightKey struct {
+		Type        string
+		Description string
+	}
+	counts := map[insightKey]int{}
 	for _, c := range comments {
-		if c.SentimentScore == nil {
+		if len(c.ActionableInsights) == 0 {
 			continue
 		}
-		sum += *c.SentimentScore
-		n++
+		var insights []Insight
+		if err := json.Unmarshal(c.ActionableInsights, &insights); err != nil {
+			continue
+		}
+		for _, ins := range insights {
+			key := insightKey{Type: ins.Type, Description: ins.Description}
+			counts[key]++
+		}
 	}
-	if n == 0 {
-		return 0
+	out := make([]ActionableInsightAgg, 0, len(counts))
+	for k, count := range counts {
+		out = append(out, ActionableInsightAgg{Type: k.Type, Description: k.Description, Count: count})
 	}
-	return sum / float64(n)
-}
-
-// computeSentimentTrend implements the ±1.0 percentage-point thresholds
-// from Spec 06: improving when change_pct > 1.0, declining when < -1.0,
-// otherwise stable. When prevAvg == 0 we return ("stable", 0) because the
-// baseline is missing or genuinely neutral.
-func computeSentimentTrend(currentAvg, prevAvg float64) (direction string, changePct float64) {
-	if prevAvg == 0 {
-		return "stable", 0
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		return out[i].Description < out[j].Description
+	})
+	if len(out) > n {
+		out = out[:n]
 	}
-	changePct = ((currentAvg - prevAvg) / math.Abs(prevAvg)) * 100
-	switch {
-	case changePct > 1.0:
-		return "improving", changePct
-	case changePct < -1.0:
-		return "declining", changePct
-	default:
-		return "stable", changePct
-	}
+	return out
 }
 
 // computeResponseRate is the v1 placeholder for response_rate. The
@@ -113,18 +108,6 @@ func computeResponseRate(comments []*db.Comment) int {
 		pct = 100
 	}
 	return int(pct)
-}
-
-// computeSentimentQuality maps the [-1, 1] sentiment average onto the
-// [0, 100] integer range: ((avg+1)/2)*100. Spec 06 D4 formula.
-func computeSentimentQuality(avg float64) int {
-	v := ((avg + 1) / 2) * 100
-	if v < 0 {
-		v = 0
-	} else if v > 100 {
-		v = 100
-	}
-	return int(v)
 }
 
 // computeEngagementDepth combines mean comment length (length component,
@@ -160,7 +143,7 @@ func computeEngagementDepth(comments []*db.Comment) int {
 // computeHealthScore collapses the breakdown to a single 0–100 integer via
 // the equal-weight mean. Spec 06: engagement_health_score range.
 func computeHealthScore(b HealthScoreBreakdown) int {
-	v := (b.ResponseRate + b.SentimentQuality + b.EngagementDepth) / 3
+	v := (b.ResponseRate + b.EngagementDepth) / 2
 	if v < 0 {
 		v = 0
 	} else if v > 100 {
@@ -212,35 +195,33 @@ func computeCategoryDistribution(comments []*db.Comment) map[string]int {
 }
 
 // selectSampleComments returns up to n high-signal comment bodies, ranked
-// by |sentiment| (so strong opinions win) with recency as the tiebreaker.
-// Comments without a sentiment score sort last.
+// by confidence (so high-confidence classifications win) with recency as the tiebreaker.
 func selectSampleComments(comments []*db.Comment, n int) []string {
 	if n <= 0 || len(comments) == 0 {
 		return nil
 	}
 	type ranked struct {
-		body      string
-		absSent   float64
-		hasSent   bool
-		postedAt  time.Time
+		body       string
+		confidence float64
+		hasConf    bool
 	}
 	scored := make([]ranked, 0, len(comments))
 	for _, c := range comments {
-		r := ranked{body: c.Body, postedAt: c.PostedAt}
-		if c.SentimentScore != nil {
-			r.absSent = math.Abs(*c.SentimentScore)
-			r.hasSent = true
+		r := ranked{body: c.Body}
+		if c.Confidence != nil {
+			r.confidence = *c.Confidence
+			r.hasConf = true
 		}
 		scored = append(scored, r)
 	}
 	sort.SliceStable(scored, func(i, j int) bool {
-		if scored[i].hasSent != scored[j].hasSent {
-			return scored[i].hasSent
+		if scored[i].hasConf != scored[j].hasConf {
+			return scored[i].hasConf
 		}
-		if scored[i].absSent != scored[j].absSent {
-			return scored[i].absSent > scored[j].absSent
+		if scored[i].confidence != scored[j].confidence {
+			return scored[i].confidence > scored[j].confidence
 		}
-		return scored[i].postedAt.After(scored[j].postedAt)
+		return true
 	})
 	if len(scored) > n {
 		scored = scored[:n]

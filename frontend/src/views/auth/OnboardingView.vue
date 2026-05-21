@@ -24,7 +24,7 @@ const connectedChannel = ref<{ id: string; display_name: string } | null>(null)
 // Step 3 state — polling
 const syncStatus = ref<SyncStatus | null>(null)
 const progressPct = computed<number>(() => syncStatus.value?.backfill_progress_percent ?? 0)
-const pollIntervalMs = ref(5000)
+const pollIntervalMs = ref(10000)
 let pollTimer: number | null = null
 let pollStartedAt = 0
 const stableCount = ref(0)
@@ -55,6 +55,11 @@ async function pollOnce(): Promise<void> {
     if (stableCount.value >= 4 && pollIntervalMs.value < 60000) {
       pollIntervalMs.value = Math.min(60000, pollIntervalMs.value * 2)
     }
+    if (pct >= 100) {
+      toast.success('Sync complete! Your insights are ready.')
+      stopPolling()
+      setTimeout(() => router.push('/dashboard'), 1200)
+    }
   } catch (err) {
     // Transient failure — continue polling.
   }
@@ -76,7 +81,7 @@ function schedulePoll() {
 
 async function startBackfillPolling() {
   pollStartedAt = Date.now()
-  pollIntervalMs.value = 5000
+  pollIntervalMs.value = 10000
   stableCount.value = 0
   lastProgress.value = null
   escapeHatchVisible.value = false
@@ -146,22 +151,22 @@ function finishOnboarding() {
 </script>
 
 <template>
-  <div class="min-h-screen bg-zinc-50 flex flex-col">
+  <div class="min-h-screen bg-zinc-50 dark:bg-zinc-950 flex flex-col">
     <header class="px-6 sm:px-12 py-6 flex items-center justify-between">
       <div class="flex items-center gap-2">
-        <div class="w-8 h-8 rounded-lg bg-zinc-900 flex items-center justify-center shadow-md">
-          <svg class="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <div class="w-8 h-8 rounded-lg bg-zinc-900 dark:bg-zinc-100 flex items-center justify-center shadow-md">
+          <svg class="w-5 h-5 text-white dark:text-zinc-900" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
           </svg>
         </div>
-        <span class="text-xl font-bold tracking-tight text-zinc-900">Noumena</span>
+        <span class="text-xl font-bold tracking-tight text-zinc-900 dark:text-zinc-100">Noumena</span>
       </div>
-      <span class="text-xs font-medium text-zinc-500">Step {{ step }} of 4 · {{ stepLabels[step - 1] }}</span>
+      <span class="text-xs font-medium text-zinc-500 dark:text-zinc-400">Step {{ step }} of 4 · {{ stepLabels[step - 1] }}</span>
     </header>
 
     <!-- Progress bar -->
     <div class="px-6 sm:px-12">
-      <div class="h-1.5 bg-zinc-200 rounded-full overflow-hidden">
+      <div class="h-1.5 bg-zinc-200 dark:bg-zinc-800 rounded-full overflow-hidden">
         <div
           class="h-full bg-gradient-to-r from-indigo-500 to-purple-500 transition-all duration-500"
           :style="{ width: ((step / 4) * 100) + '%' }"
@@ -170,17 +175,17 @@ function finishOnboarding() {
     </div>
 
     <main class="flex-1 flex items-center justify-center px-6 sm:px-12 py-12">
-      <div class="bg-white shadow-sm ring-1 ring-zinc-950/5 rounded-2xl max-w-xl w-full p-8 sm:p-12 relative overflow-hidden">
+      <div class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-2xl max-w-xl w-full p-8 sm:p-12 relative overflow-hidden">
         <div class="absolute top-0 right-0 -mt-16 -mr-16 w-48 h-48 bg-gradient-to-br from-indigo-500 to-purple-400 rounded-full blur-[80px] opacity-20 pointer-events-none"></div>
 
         <!-- STEP 1: Welcome -->
         <template v-if="step === 1">
-          <h1 class="text-3xl font-semibold tracking-tight text-zinc-900 mb-3">Welcome to Noumena</h1>
-          <p class="text-zinc-500 leading-relaxed mb-8">
+          <h1 class="text-3xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-100 mb-3">Welcome to Noumena</h1>
+          <p class="text-zinc-500 dark:text-zinc-400 leading-relaxed mb-8">
             Let's connect your first channel. We'll automatically pull in your latest comments and
             start surfacing the insights hidden in them.
           </p>
-          <ul class="space-y-3 text-sm text-zinc-700 mb-10">
+          <ul class="space-y-3 text-sm text-zinc-700 dark:text-zinc-300 mb-10">
             <li class="flex items-start gap-3">
               <span class="mt-1 w-5 h-5 rounded-full bg-emerald-50 text-emerald-600 flex items-center justify-center ring-1 ring-emerald-600/20">
                 <svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7" /></svg>
@@ -205,8 +210,8 @@ function finishOnboarding() {
 
         <!-- STEP 2: Connect -->
         <template v-else-if="step === 2">
-          <h1 class="text-3xl font-semibold tracking-tight text-zinc-900 mb-3">Connect your YouTube channel</h1>
-          <p class="text-zinc-500 leading-relaxed mb-8">
+          <h1 class="text-3xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-100 mb-3">Connect your YouTube channel</h1>
+          <p class="text-zinc-500 dark:text-zinc-400 leading-relaxed mb-8">
             We'll open a Google sign-in window and ask for read-only access to your channel's
             comments.
           </p>
@@ -229,21 +234,21 @@ function finishOnboarding() {
 
         <!-- STEP 3: Backfill -->
         <template v-else-if="step === 3">
-          <h1 class="text-3xl font-semibold tracking-tight text-zinc-900 mb-3">Syncing your channel</h1>
-          <p v-if="connectedChannel" class="text-zinc-500 mb-2">
-            Connected: <span class="font-medium text-zinc-900">{{ connectedChannel.display_name }}</span>
+          <h1 class="text-3xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-100 mb-3">Syncing your channel</h1>
+          <p v-if="connectedChannel" class="text-zinc-500 dark:text-zinc-400 mb-2">
+            Connected: <span class="font-medium text-zinc-900 dark:text-zinc-100">{{ connectedChannel.display_name }}</span>
           </p>
-          <p class="text-zinc-500 leading-relaxed mb-8">
+          <p class="text-zinc-500 dark:text-zinc-400 leading-relaxed mb-8">
             We're pulling in your recent comments. You can continue once we have enough data to show
             useful insights.
           </p>
 
           <div class="mb-8">
-            <div class="flex items-center justify-between text-sm font-medium text-zinc-700 mb-2">
+            <div class="flex items-center justify-between text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-2">
               <span>Backfill progress</span>
               <span>{{ Math.floor(progressPct) }}%</span>
             </div>
-            <div class="h-2 bg-zinc-100 rounded-full overflow-hidden">
+            <div class="h-2 bg-zinc-100 dark:bg-zinc-800 rounded-full overflow-hidden">
               <div
                 class="h-full bg-gradient-to-r from-indigo-500 to-purple-500 transition-all duration-500"
                 :style="{ width: Math.min(100, progressPct) + '%' }"
@@ -254,7 +259,7 @@ function finishOnboarding() {
             </p>
           </div>
 
-          <p v-if="escapeHatchVisible" class="text-sm text-zinc-500 mb-6">
+          <p v-if="escapeHatchVisible" class="text-sm text-zinc-500 dark:text-zinc-400 mb-6">
             This is taking longer than usual — you can continue and we'll keep syncing in the background.
           </p>
 
@@ -266,14 +271,14 @@ function finishOnboarding() {
 
         <!-- STEP 4: Tour -->
         <template v-else>
-          <h1 class="text-3xl font-semibold tracking-tight text-zinc-900 mb-3">You're all set</h1>
-          <p class="text-zinc-500 leading-relaxed mb-8">
+          <h1 class="text-3xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-100 mb-3">You're all set</h1>
+          <p class="text-zinc-500 dark:text-zinc-400 leading-relaxed mb-8">
             A quick tour of the dashboard, or jump straight in?
           </p>
-          <ul class="space-y-3 text-sm text-zinc-700 mb-10">
-            <li><span class="font-semibold text-zinc-900">Insights Feed</span> — your prioritized comment stream.</li>
-            <li><span class="font-semibold text-zinc-900">Saved Comments</span> — flagged items for follow-up.</li>
-            <li><span class="font-semibold text-zinc-900">Channels</span> — connect more or pause syncing.</li>
+          <ul class="space-y-3 text-sm text-zinc-700 dark:text-zinc-300 mb-10">
+            <li><span class="font-semibold text-zinc-900 dark:text-zinc-100">Insights Feed</span> — your prioritized comment stream.</li>
+            <li><span class="font-semibold text-zinc-900 dark:text-zinc-100">Saved Comments</span> — flagged items for follow-up.</li>
+            <li><span class="font-semibold text-zinc-900 dark:text-zinc-100">Channels</span> — connect more or pause syncing.</li>
           </ul>
           <div class="flex flex-col sm:flex-row gap-3">
             <PrimaryButton full-width @click="finishOnboarding">Take me to the dashboard</PrimaryButton>

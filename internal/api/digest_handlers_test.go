@@ -223,3 +223,54 @@ func TestUpdatePreferences_Unauthenticated(t *testing.T) {
 		t.Fatalf("expected 401 got %d", w.Code)
 	}
 }
+
+func TestUpdatePreferences_OptInTrue(t *testing.T) {
+	mock := &MockQuery{}
+	r := newDigestRouter(&api.DigestHandler{Queries: mock}, "user-1")
+
+	body := bytes.NewBufferString(`{"digest_email_opt_in": true}`)
+	req := httptest.NewRequest(http.MethodPatch, "/api/user/preferences", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		DigestEmailOptIn bool `json:"digest_email_opt_in"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if !resp.DigestEmailOptIn {
+		t.Fatalf("expected opt_in=true in response")
+	}
+	if v, ok := mock.digestOptIn["user-1"]; !ok || v != true {
+		t.Fatalf("expected opt_in=true persisted, got %v (ok=%v)", v, ok)
+	}
+}
+
+func TestDigestList_EmptyListReturnsEmptyArray(t *testing.T) {
+	mock := &MockQuery{
+		digestsByUser: map[string][]*db.WeeklyDigest{},
+	}
+	r := newDigestRouter(&api.DigestHandler{Queries: mock}, "user-1")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/digests", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d", w.Code)
+	}
+	var resp struct {
+		Digests []*db.WeeklyDigest `json:"digests"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if resp.Digests == nil {
+		t.Fatalf("expected empty array, got null")
+	}
+}

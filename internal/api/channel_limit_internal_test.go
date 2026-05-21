@@ -2,11 +2,10 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"testing"
 	"time"
-
-	"github.com/jackc/pgx/v5"
 
 	"noumena/internal/billing"
 	"noumena/internal/db"
@@ -84,7 +83,7 @@ func (g *guardMockQuery) GetUnprocessedComments(context.Context, int) ([]*db.Com
 func (g *guardMockQuery) GetUnprocessedCommentsByChannel(context.Context, int) (map[string][]*db.Comment, error) {
 	panic("not implemented")
 }
-func (g *guardMockQuery) UpdateCommentLLMData(context.Context, string, string, string, string, string, float64, float64) error {
+func (g *guardMockQuery) UpdateCommentLLMData(context.Context, string, string, string, string, string, []byte, float64) error {
 	panic("not implemented")
 }
 func (g *guardMockQuery) IncrementCommentsUsed(context.Context, string, int) error {
@@ -281,10 +280,10 @@ func (g *guardMockQuery) GetCommentCountForChannel(context.Context, string) (int
 func (g *guardMockQuery) IsStripeEventProcessed(context.Context, string) (bool, error) {
 	panic("not implemented")
 }
-func (g *guardMockQuery) InsertProcessedStripeEvent(context.Context, pgx.Tx, string, string) error {
+func (g *guardMockQuery) InsertProcessedStripeEvent(context.Context, *sql.Tx, string, string) error {
 	panic("not implemented")
 }
-func (g *guardMockQuery) ApplySubscriptionUpdate(context.Context, pgx.Tx, db.SubscriptionUpdate) error {
+func (g *guardMockQuery) ApplySubscriptionUpdate(context.Context, *sql.Tx, db.SubscriptionUpdate) error {
 	panic("not implemented")
 }
 func (g *guardMockQuery) GetUserByStripeCustomerID(context.Context, string) (*db.User, error) {
@@ -293,16 +292,103 @@ func (g *guardMockQuery) GetUserByStripeCustomerID(context.Context, string) (*db
 func (g *guardMockQuery) GetOverageCostForCurrentPeriod(context.Context, string, time.Time, time.Time) (float64, error) {
 	panic("not implemented")
 }
-func (g *guardMockQuery) InsertCommentUsageLog(context.Context, pgx.Tx, string, int, time.Time, time.Time) error {
+func (g *guardMockQuery) InsertCommentUsageLog(context.Context, *sql.Tx, string, int, time.Time, time.Time) error {
 	panic("not implemented")
 }
-func (g *guardMockQuery) PauseChannelsAlphabetically(context.Context, pgx.Tx, string, int) error {
+func (g *guardMockQuery) PauseChannelsAlphabetically(context.Context, *sql.Tx, string, int) error {
 	panic("not implemented")
 }
 func (g *guardMockQuery) ResetFreeTierQuotas(context.Context) (int64, error) {
 	panic("not implemented")
 }
 func (g *guardMockQuery) ExpirePastDueGrace(context.Context, int) (int64, error) {
+	panic("not implemented")
+}
+
+// New methods added by spec-gap-improvements
+func (g *guardMockQuery) UpdateChannelCustomPrompt(context.Context, string, string, *string) error {
+	panic("not implemented")
+}
+func (g *guardMockQuery) CreateWorkspace(context.Context, string, string) (*db.Workspace, error) {
+	panic("not implemented")
+}
+func (g *guardMockQuery) GetWorkspace(context.Context, string) (*db.Workspace, error) {
+	panic("not implemented")
+}
+func (g *guardMockQuery) UpdateWorkspace(context.Context, string, string) error {
+	panic("not implemented")
+}
+func (g *guardMockQuery) DeleteWorkspace(context.Context, string) error { panic("not implemented") }
+func (g *guardMockQuery) ListWorkspacesForUser(context.Context, string) ([]*db.WorkspaceWithMembers, error) {
+	panic("not implemented")
+}
+func (g *guardMockQuery) GetWorkspaceMember(context.Context, string, string) (*db.WorkspaceMember, error) {
+	panic("not implemented")
+}
+func (g *guardMockQuery) AddWorkspaceMember(context.Context, string, string, string) error {
+	panic("not implemented")
+}
+func (g *guardMockQuery) RemoveWorkspaceMember(context.Context, string, string) error {
+	panic("not implemented")
+}
+func (g *guardMockQuery) UpdateWorkspaceMemberRole(context.Context, string, string, string) error {
+	panic("not implemented")
+}
+func (g *guardMockQuery) CountWorkspaceMembers(context.Context, string) (int, error) {
+	panic("not implemented")
+}
+func (g *guardMockQuery) CountWorkspaceAdmins(context.Context, string) (int, error) {
+	panic("not implemented")
+}
+func (g *guardMockQuery) CreateWorkspaceInvite(context.Context, string, string, string, string, time.Time) (*db.WorkspaceInvite, error) {
+	panic("not implemented")
+}
+func (g *guardMockQuery) GetWorkspaceInviteByToken(context.Context, string) (*db.WorkspaceInvite, error) {
+	panic("not implemented")
+}
+func (g *guardMockQuery) ConsumeWorkspaceInvite(context.Context, string) error {
+	panic("not implemented")
+}
+func (g *guardMockQuery) GetWorkspaceInviteByEmail(context.Context, string, string) (*db.WorkspaceInvite, error) {
+	panic("not implemented")
+}
+func (g *guardMockQuery) SetUserActiveWorkspace(context.Context, string, string) error {
+	panic("not implemented")
+}
+func (g *guardMockQuery) GetUserActiveWorkspaceID(context.Context, string) (string, error) {
+	panic("not implemented")
+}
+func (g *guardMockQuery) IsWorkspaceOwner(context.Context, string, string) (bool, error) {
+	panic("not implemented")
+}
+func (g *guardMockQuery) InsertAuditLog(context.Context, string, string, string, string) error {
+	panic("not implemented")
+}
+func (g *guardMockQuery) IncrementRateLimit(context.Context, string, time.Time, int) (int, error) {
+	panic("not implemented")
+}
+func (g *guardMockQuery) GetRateLimitStatus(context.Context, string, time.Time, int) (*db.RateLimitStatus, error) {
+	panic("not implemented")
+}
+func (g *guardMockQuery) CleanupExpiredRateLimitBuckets(context.Context, time.Time) (int64, error) {
+	panic("not implemented")
+}
+func (g *guardMockQuery) SearchComments(context.Context, string, string) ([]*db.Comment, error) {
+	panic("not implemented")
+}
+func (g *guardMockQuery) BulkStarComments(context.Context, string, []string) (int, error) {
+	panic("not implemented")
+}
+func (g *guardMockQuery) BulkUnstarComments(context.Context, string, []string) (int, error) {
+	panic("not implemented")
+}
+func (g *guardMockQuery) GetCommentThread(context.Context, string, string, int) ([]*db.Comment, error) {
+	panic("not implemented")
+}
+func (g *guardMockQuery) GetChannelCustomPrompt(context.Context, string, string) (string, error) {
+	panic("not implemented")
+}
+func (g *guardMockQuery) GetCommentBodyByID(context.Context, string) (string, error) {
 	panic("not implemented")
 }
 

@@ -1,0 +1,121 @@
+# Comment Ingestion Specification
+
+## Purpose
+Handles polling YouTube API for new comments, deduplicating across runs, and storing comments once in a shared database for all users tracking a channel.
+
+## Requirements
+
+### Requirement: Ingestion Scheduler
+The system SHALL scan for channels needing sync and enqueue ingestion jobs at a configurable interval.
+
+#### Scenario: Schedule Poll Job
+- **GIVEN** a channel with last_synced_at within the poll interval (default 30 minutes)
+- **WHEN** the scheduler ticks (default every 30 seconds)
+- **THEN** the system SHALL NOT enqueue a new job for that channel
+
+#### Scenario: Schedule Backfill Job
+- **GIVEN** a channel with last_synced_at = NULL (never synced)
+- **WHEN** the scheduler ticks
+- **THEN** the system SHALL enqueue a job with type='backfill' for that channel
+
+#### Scenario: Idempotent Enqueue
+- **GIVEN** a channel with a pending or running ingestion job
+- **WHEN** the scheduler ticks for that channel
+- **THEN** the system SHALL skip enqueueing and increment the skipped counter
+
+### Requirement: Ingestion Worker
+The system SHALL process ingestion jobs by fetching comments from YouTube API and storing them in the database.
+
+#### Scenario: Successful Comment Ingestion
+- **GIVEN** a pending ingestion job for a YouTube channel
+- **WHEN** a worker claims the job
+- **THEN** the system SHALL acquire a per-channel PostgreSQL advisory lock, fetch videos and comment threads via YouTube API, batch-insert comments (100 per batch), update last_synced_at, mark the job completed, and reset any prior ingestion error
+
+#### Scenario: Per-Channel Mutual Exclusion
+- **GIVEN** two workers running concurrently
+- **WHEN** both attempt to process the same channel
+- **THEN** the system SHALL use pg_try_advisory_lock to ensure only one worker processes the channel at a time. The losing worker SHALL release the job back to pending without consuming retry budget
+
+#### Scenario: Comment Deduplication
+- **GIVEN** a comment already stored with the same (platform_channel_id, platform_comment_id)
+- **WHEN** the ingestion worker attempts to insert it again
+- **THEN** the system SHALL NOT create a duplicate record (unique constraint enforcement)
+
+#### Scenario: Token Refresh Before API Call
+- **GIVEN** an encrypted access/refresh token pair for a channel
+- **WHEN** the worker prepares to call the YouTube API
+- **THEN** the system SHALL decrypt the tokens, construct an oauth2.TokenSource, and force a refresh to obtain a valid access token
+
+#### Scenario: Token Invalid - Promote Fallback
+- **GIVEN** a token that returns 401 from YouTube API
+- **WHEN** the worker detects the failure
+- **THEN** the system SHALL attempt to promote the next ingestion token (by token_priority), release the job back to pending for re-processing with the new token, and not consume the retry budget
+
+#### Scenario: No Token Available
+- **GIVEN** a channel with no active ingestion token
+- **WHEN** the worker attempts to obtain a token
+- **THEN** the system SHALL initialize last_synced_at if NULL and mark the job completed without error
+
+#### Scenario: Rate Limit Handling
+- **GIVEN** a YouTube API rate limit response
+- **WHEN** the worker encounters it
+- **THEN** the system SHALL mark the channel in backoff until the retry-after time, mark the job completed (not a failure), and not consume retry budget
+
+#### Scenario: Job Retry on Transient Error
+- **GIVEN** a job that fails with a transient error and retry_count < 5
+- **WHEN** the worker processes it
+- **THEN** the system SHALL mark the job as failed with incremented retry count for later re-processing
+
+#### Scenario: Dead Letter on Exhausted Retries
+- **GIVEN** a job that fails with retry_count >= 5
+- **WHEN** the worker processes it
+- **THEN** the system SHALL mark the job as dead-lettered, park the channel in backoff for 1 hour, log the error, and emit an alert
+
+#### Scenario: Job Deadline Exceeded
+- **GIVEN** a job running longer than the deadline (default 5 minutes)
+- **WHEN** the context times out
+- **THEN** the system SHALL flush any pending comment batch, mark the job completed (not a failure), and allow re-enqueue on the next tick
+
+#### Scenario: Non-YouTube Platform
+- **GIVEN** an ingestion job for a non-YouTube platform (e.g., TikTok)
+- **WHEN** the worker processes it
+- **THEN** the system SHALL mark the job completed without making any API calls
+
+### Requirement: Backfill Window
+The system SHALL support configurable backfill windows for initial channel sync.
+
+#### Scenario: Backfill with Configured Days
+- **GIVEN** a backfill job with backfill_days = 90
+- **WHEN** the worker computes the publishedAfter window
+- **THEN** the system SHALL fetch comments published after (NOW - 90 days)
+
+#### Scenario: Poll After Initial Backfill
+- **GIVEN** a channel with last_synced_at already set
+- **WHEN** a poll job runs
+- **THEN** the system SHALL fetch comments published after last_synced_at (incremental sync)
+
+### Requirement: Comment Thread Structure
+The system SHALL preserve comment thread structure during ingestion using parent_comment_id.
+
+#### Scenario: Ingest Top-Level Comment
+- **WHEN** the ingestion worker processes a top-level YouTube comment (no parent)
+- **THEN** the system SHALL store the comment with parent_comment_id = NULL
+
+#### Scenario: Ingest Reply Comment
+- **WHEN** the ingestion worker processes a reply comment via YouTube API threads.list
+- **THEN** the system SHALL store the comment with parent_comment_id set to the parent's platform_comment_id
+
+#### Scenario: Thread Depth Tracking
+- **WHEN** the ingestion worker processes a comment
+- **THEN** the system SHALL compute and store reply_depth (0 for top-level, 1 for direct reply, 2 for reply-to-reply)
+
+### Requirement: YouTube threads.list API
+The system SHALL fetch comment threads (not just top-level comments) from the YouTube API.
+
+#### Scenario: Fetch Comment Threads
+- **WHEN** the ingestion worker calls the YouTube API for a video
+- **THEN** the system SHALL use commentThreads.list with `textFormat=plainText` and `maxResults=100` to fetch both top-level comments and their replies
+
+#### Scenario: Reply Pagination
+- **WHEN** a comment thread has more replies than fit in a single API response
+- **THEN** the system SHALL follow the nextPageToken to fetch all replies for that thread

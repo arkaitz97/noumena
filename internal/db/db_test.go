@@ -11,19 +11,25 @@ import (
 )
 
 func TestDBQueries_Full(t *testing.T) {
-	dbURL := os.Getenv("TEST_DATABASE_URL")
-	if dbURL == "" {
-		t.Skip("Skipping DB integration tests; TEST_DATABASE_URL not set")
+	dbPath := os.Getenv("TEST_DATABASE_PATH")
+	if dbPath == "" {
+		dbPath = ":memory:"
 	}
 
-	err := db.InitDB(dbURL)
+	err := db.InitDB(dbPath)
 	if err != nil {
-		t.Fatalf("Failed to connect to dev database: %v", err)
+		t.Fatalf("Failed to connect to database: %v", err)
 	}
 	defer db.CloseDB()
 
-	queries := db.NewPostgresQuery(db.Pool)
+	// Apply schema to in-memory database
 	ctx := context.Background()
+	if err := db.ApplyMigrations(ctx); err != nil {
+		t.Fatalf("Failed to apply migrations: %v", err)
+	}
+
+	queries := db.NewSQLiteQuery(db.DB)
+	sq := queries.(*db.SQLiteQuery)
 
 	// 1. User
 	email := fmt.Sprintf("test_full_%d@example.com", time.Now().UnixNano())
@@ -58,10 +64,10 @@ func TestDBQueries_Full(t *testing.T) {
 	}
 
 	// Unpause manually for further tests
-	_, _ = db.Pool.Exec(ctx, "UPDATE user_channel_tracking SET tracking_status='active'")
+	_, _ = sq.DB().ExecContext(ctx, "UPDATE user_channel_tracking SET tracking_status='active'")
 
 	// Sync
-	_, _ = db.Pool.Exec(ctx, "UPDATE platform_channels SET last_synced_at = NOW() - interval '1 hour' WHERE id = $1", pcID)
+	_, _ = sq.DB().ExecContext(ctx, "UPDATE platform_channels SET last_synced_at = datetime('now', '-1 hour') WHERE id = ?", pcID)
 
 	syncChans, err := queries.GetChannelsForSync(ctx, 30)
 	if err != nil || len(syncChans) == 0 {
@@ -97,7 +103,7 @@ func TestDBQueries_Full(t *testing.T) {
 
 	// Fetch comment ID correctly
 	var commID string
-	err = db.Pool.QueryRow(ctx, "SELECT id FROM comments WHERE platform_comment_id = $1 LIMIT 1", testCommentID).Scan(&commID)
+	err = sq.DB().QueryRowContext(ctx, "SELECT id FROM comments WHERE platform_comment_id = ? LIMIT 1", testCommentID).Scan(&commID)
 	if err != nil {
 		t.Fatalf("Failed to find inserted comment: %v", err)
 	}
@@ -113,7 +119,7 @@ func TestDBQueries_Full(t *testing.T) {
 		t.Fatalf("GetUnprocessedComments failed: %v", err)
 	}
 
-	err = queries.UpdateCommentLLMData(ctx, commID, "praise", "none", "openai", "gpt-4o", 0.5, 0.9)
+	err = queries.UpdateCommentLLMData(ctx, commID, "praise", "none", "openai", "gpt-4o", []byte(`[]`), 0.9)
 	if err != nil {
 		t.Fatalf("UpdateCommentLLMData failed: %v", err)
 	}
@@ -127,15 +133,22 @@ func TestDBQueries_Full(t *testing.T) {
 	}
 
 	// 6. Digests
-	db.Pool.Exec(ctx, "UPDATE users SET email_verified_at = NOW() WHERE id = $1", user.ID)
+	sq.DB().ExecContext(ctx, "UPDATE users SET email_verified_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?", user.ID)
 	digestUsers, err := queries.GetUsersForDigest(ctx)
-	if err != nil || len(digestUsers) == 0 {
-		t.Fatalf("GetUsersForDigest failed")
+	if err != nil {
+		t.Fatalf("GetUsersForDigest error: %v", err)
+	}
+	if len(digestUsers) == 0 {
+		t.Fatalf("GetUsersForDigest returned 0 users")
 	}
 
-	recent, err := queries.GetRecentProcessedCommentsForUser(ctx, user.ID, time.Now().Add(-1*time.Hour))
-	if err != nil || len(recent) == 0 {
-		t.Fatalf("GetRecentProcessedCommentsForUser failed")
+	since := time.Now().Add(-1 * time.Hour)
+	recent, err := queries.GetRecentProcessedCommentsForUser(ctx, user.ID, since)
+	if err != nil {
+		t.Fatalf("GetRecentProcessedCommentsForUser error: %v", err)
+	}
+	if len(recent) == 0 {
+		t.Fatalf("GetRecentProcessedCommentsForUser returned 0 comments")
 	}
 
 	digest := &db.WeeklyDigest{

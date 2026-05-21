@@ -30,4 +30,6 @@ func installManualReader(t *testing.T) (*sdkmetric.ManualReader, func()) {
 func rebindBillingMeters() {
 	billingMeter = otel.Meter("noumena/billing")
 	stripeWebhookTotal, _ = billingMeter.Int64Counter("noumena_stripe_webhook_total")
+	quotaUsage, _ = billingMeter.Int64UpDownCounter("noumena_quota_usage")
+	webhookDurationSeconds, _ = billingMeter.Float64Histogram("noumena_webhook_duration_seconds")
 }

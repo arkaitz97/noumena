@@ -15,8 +15,8 @@
 //   - Idempotency is enforced at two layers: a pre-insert SELECT checks
 //     for existing `status='sent'` rows, and the unique constraint on
 //     `idempotency_key` durably enforces single-row-per-key under
-//     concurrent inserts (the second caller's INSERT raises a
-//     pgconn.PgError 23505 which we translate to an idempotent short-
+//     concurrent inserts (the second caller's INSERT raises a UNIQUE
+//     constraint violation which we translate to an idempotent short-
 //     circuit on read).
 //   - Rendering uses html/template (HTML body) + text/template (text
 //     body) sharing the same variable map; templates live next to this
@@ -31,10 +31,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgconn"
 
 	"noumena/internal/config"
 	"noumena/internal/db"
@@ -163,8 +162,7 @@ func (p *Pipeline) Send(ctx context.Context, msg Message) error {
 	if err != nil {
 		// Race: another caller raced us through the unique constraint.
 		// Treat as idempotent success.
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		if isUniqueConstraintViolation(err) {
 			p.logf("email_idempotent_race template=%s key=%s", msg.Template, msg.IdempotencyKey)
 			// Race-resolved duplicate is semantically the same as
 			// the read-side dedupe above.
@@ -249,4 +247,10 @@ func redactAddr(addr string) string {
 		return "***"
 	}
 	return string(addr[0]) + "***" + addr[at:]
+}
+
+// isUniqueConstraintViolation returns true when the error indicates a
+// SQLite UNIQUE constraint failure (the cross-DB equivalent of PgError 23505).
+func isUniqueConstraintViolation(err error) bool {
+	return strings.Contains(err.Error(), "UNIQUE constraint failed")
 }

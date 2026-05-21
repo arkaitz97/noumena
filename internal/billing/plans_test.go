@@ -157,3 +157,79 @@ func TestPriceMapPlanFromPriceID(t *testing.T) {
 		}
 	}
 }
+
+// Task 7.6: annual pricing tests.
+
+func TestAnnualDiscountPercent(t *testing.T) {
+	if got := AnnualDiscountPercent(); got != 20.0 {
+		t.Errorf("AnnualDiscountPercent: want 20.0, got %f", got)
+	}
+}
+
+func TestAnnualPriceFromMonthly(t *testing.T) {
+	cases := []struct {
+		monthly int
+		want    int
+	}{
+		{2900, 27840},    // Creator: 2900*12*0.8 = 27840 (catalog uses 27800, rounded)
+		{9900, 95040},    // Studio: 9900*12*0.8 = 95040 (catalog uses 95000)
+		{29900, 287040},  // Agency: 29900*12*0.8 = 287040 (catalog uses 287000)
+		{0, 0},           // Free
+		{100, 960},         // 100*12*0.8 = 960
+	}
+	for _, c := range cases {
+		got := AnnualPriceFromMonthly(c.monthly)
+		if got != c.want {
+			t.Errorf("AnnualPriceFromMonthly(%d): want %d, got %d", c.monthly, c.want, got)
+		}
+	}
+}
+
+func TestCatalogAnnualPricesConsistent(t *testing.T) {
+	// Verify that the catalog's AnnualPriceCents matches the 20% discount
+	// formula (within rounding tolerance of ±100 cents).
+	for plan, limits := range catalog {
+		if limits.MonthlyPriceCents == 0 {
+			continue // free plan
+		}
+		calculated := AnnualPriceFromMonthly(limits.MonthlyPriceCents)
+		diff := limits.AnnualPriceCents - calculated
+		if diff < -100 || diff > 100 {
+			t.Errorf("plan %s: catalog annual=%d, calculated=%d, diff=%d",
+				plan, limits.AnnualPriceCents, calculated, diff)
+		}
+	}
+}
+
+func TestPriceMapAnnualRoundTrip(t *testing.T) {
+	pm := PriceMap{
+		CreatorAnnual: "price_creator_annual",
+		StudioAnnual:  "price_studio_annual",
+		AgencyAnnual:  "price_agency_annual",
+	}
+	cases := []struct {
+		plan, interval, priceID string
+	}{
+		{PlanCreator, IntervalYear, "price_creator_annual"},
+		{PlanStudio, IntervalYear, "price_studio_annual"},
+		{PlanAgency, IntervalYear, "price_agency_annual"},
+	}
+	for _, c := range cases {
+		// Lookup → price ID
+		got, err := pm.Lookup(c.plan, c.interval)
+		if err != nil {
+			t.Errorf("Lookup(%s,%s): unexpected err %v", c.plan, c.interval, err)
+			continue
+		}
+		if got != c.priceID {
+			t.Errorf("Lookup(%s,%s): want %s, got %s", c.plan, c.interval, c.priceID, got)
+			continue
+		}
+		// Reverse: price ID → (plan, interval)
+		rPlan, rIvl, ok := pm.PlanFromPriceID(c.priceID)
+		if !ok || rPlan != c.plan || rIvl != c.interval {
+			t.Errorf("PlanFromPriceID(%s): want (%s,%s,true), got (%s,%s,%v)",
+				c.priceID, c.plan, c.interval, rPlan, rIvl, ok)
+		}
+	}
+}

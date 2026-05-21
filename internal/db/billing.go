@@ -2,30 +2,18 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
-
-	"github.com/jackc/pgx/v5"
 )
 
-// ============================================================================
-// billing change: Stripe webhook idempotency, subscription state mutations,
-// channel-pause primitive, billing-status read helpers.
-//
-// All methods here are added on *PostgresQuery. The DBQuery interface
-// (see db.go) exposes the corresponding contract for handlers and workers.
-// ============================================================================
-
-// IsStripeEventProcessed reports whether the given Stripe event id has
-// already been processed (and an audit row inserted). Webhook handlers
-// short-circuit on true to make event delivery idempotent.
-func (q *PostgresQuery) IsStripeEventProcessed(ctx context.Context, eventID string) (bool, error) {
+func (q *SQLiteQuery) IsStripeEventProcessed(ctx context.Context, eventID string) (bool, error) {
 	var n int
-	err := q.pool.QueryRow(ctx,
-		`SELECT 1 FROM processed_stripe_events WHERE stripe_event_id = $1`,
+	err := q.db.QueryRowContext(ctx,
+		`SELECT 1 FROM processed_stripe_events WHERE stripe_event_id = ?`,
 		eventID).Scan(&n)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
@@ -34,32 +22,25 @@ func (q *PostgresQuery) IsStripeEventProcessed(ctx context.Context, eventID stri
 	return true, nil
 }
 
-// InsertProcessedStripeEvent inserts an audit row for a successfully-handled
-// (or no-op) Stripe webhook delivery. Conflict on the primary key is
-// reported back so callers can detect a redelivery race.
-func (q *PostgresQuery) InsertProcessedStripeEvent(ctx context.Context, tx pgx.Tx, eventID, eventType string) error {
-	exec := func(sql string, args ...any) error {
+func (q *SQLiteQuery) InsertProcessedStripeEvent(ctx context.Context, tx *sql.Tx, eventID, eventType string) error {
+	exec := func(sqlStr string, args ...any) error {
 		if tx != nil {
-			_, err := tx.Exec(ctx, sql, args...)
+			_, err := tx.ExecContext(ctx, sqlStr, args...)
 			return err
 		}
-		_, err := q.pool.Exec(ctx, sql, args...)
+		_, err := q.db.ExecContext(ctx, sqlStr, args...)
 		return err
 	}
 	return exec(
 		`INSERT INTO processed_stripe_events (stripe_event_id, event_type)
-		 VALUES ($1, $2) ON CONFLICT (stripe_event_id) DO NOTHING`,
+		 VALUES (?, ?) ON CONFLICT (stripe_event_id) DO NOTHING`,
 		eventID, eventType)
 }
 
-// SubscriptionUpdate carries the fields written by the Stripe webhook
-// handlers. Pointer fields that are nil are left unchanged. The shape
-// keeps the SQL straightforward while letting each event handler scope
-// its mutation.
 type SubscriptionUpdate struct {
 	UserID                 string
 	SubscriptionPlan       *string
-	BillingInterval        *string // pass &"" to clear (set NULL via empty)
+	BillingInterval        *string
 	StripeCustomerID       *string
 	CommentQuotaMonthly    *int
 	CommentsUsedThisPeriod *int
@@ -67,32 +48,21 @@ type SubscriptionUpdate struct {
 	CurrentPeriodEnd       *time.Time
 	QuotaResetAt           *time.Time
 	PastDueSince           *time.Time
-	// PastDueSinceClear sets past_due_since to NULL when true.
-	PastDueSinceClear bool
-	// BillingIntervalClear sets billing_interval to NULL when true.
-	BillingIntervalClear bool
-	// StripeSubscriptionID, when non-nil, sets users.stripe_subscription_id
-	// to the dereferenced value. Written by checkout.session.completed and
-	// customer.subscription.{created,updated}.
-	StripeSubscriptionID *string
-	// StripeSubscriptionIDClear, when true, sets users.stripe_subscription_id
-	// to NULL. Written by customer.subscription.deleted alongside the
-	// free-plan downgrade. Takes precedence over StripeSubscriptionID.
+	PastDueSinceClear      bool
+	BillingIntervalClear   bool
+	StripeSubscriptionID   *string
 	StripeSubscriptionIDClear bool
 }
 
-// ApplySubscriptionUpdate writes the SubscriptionUpdate inside the supplied
-// transaction (or against the pool if tx is nil). Only non-nil/non-zero
-// fields are emitted into the SQL.
-func (q *PostgresQuery) ApplySubscriptionUpdate(ctx context.Context, tx pgx.Tx, u SubscriptionUpdate) error {
+func (q *SQLiteQuery) ApplySubscriptionUpdate(ctx context.Context, tx *sql.Tx, u SubscriptionUpdate) error {
 	if u.UserID == "" {
 		return errors.New("UserID is required")
 	}
 	sets := []string{}
-	args := []any{u.UserID}
+	args := []any{}
 	add := func(col string, val any) {
 		args = append(args, val)
-		sets = append(sets, fmt.Sprintf("%s = $%d", col, len(args)))
+		sets = append(sets, fmt.Sprintf("%s = ?", col))
 	}
 	if u.SubscriptionPlan != nil {
 		add("subscription_plan", *u.SubscriptionPlan)
@@ -115,15 +85,15 @@ func (q *PostgresQuery) ApplySubscriptionUpdate(ctx context.Context, tx pgx.Tx, 
 		add("subscription_status", *u.SubscriptionStatus)
 	}
 	if u.CurrentPeriodEnd != nil {
-		add("current_period_end", *u.CurrentPeriodEnd)
+		add("current_period_end", u.CurrentPeriodEnd.Format(time.RFC3339))
 	}
 	if u.QuotaResetAt != nil {
-		add("quota_reset_at", *u.QuotaResetAt)
+		add("quota_reset_at", u.QuotaResetAt.Format(time.RFC3339))
 	}
 	if u.PastDueSinceClear {
 		sets = append(sets, "past_due_since = NULL")
 	} else if u.PastDueSince != nil {
-		add("past_due_since", *u.PastDueSince)
+		add("past_due_since", u.PastDueSince.Format(time.RFC3339))
 	}
 	if u.StripeSubscriptionIDClear {
 		sets = append(sets, "stripe_subscription_id = NULL")
@@ -133,175 +103,148 @@ func (q *PostgresQuery) ApplySubscriptionUpdate(ctx context.Context, tx pgx.Tx, 
 	if len(sets) == 0 {
 		return nil
 	}
-	sql := "UPDATE users SET updated_at = NOW()"
+	sqlStr := "UPDATE users SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')"
 	for _, s := range sets {
-		sql += ", " + s
+		sqlStr += ", " + s
 	}
-	sql += " WHERE id = $1"
+	sqlStr += " WHERE id = ?"
+	args = append(args, u.UserID)
 
 	if tx != nil {
-		_, err := tx.Exec(ctx, sql, args...)
+		_, err := tx.ExecContext(ctx, sqlStr, args...)
 		return err
 	}
-	_, err := q.pool.Exec(ctx, sql, args...)
+	_, err := q.db.ExecContext(ctx, sqlStr, args...)
 	return err
 }
 
-// GetUserByStripeCustomerID resolves a user from a Stripe customer id —
-// the only reliable identifier on invoice.* events.
-func (q *PostgresQuery) GetUserByStripeCustomerID(ctx context.Context, customerID string) (*User, error) {
-	query := `SELECT ` + userColumns + ` FROM users WHERE stripe_customer_id = $1`
-	u, err := scanUser(q.pool.QueryRow(ctx, query, customerID))
+func (q *SQLiteQuery) GetUserByStripeCustomerID(ctx context.Context, customerID string) (*User, error) {
+	query := `SELECT ` + userColumns + ` FROM users WHERE stripe_customer_id = ?`
+	u, err := scanUser(q.db.QueryRowContext(ctx, query, customerID))
 	if errors.Is(err, ErrNotFound) {
 		return nil, nil
 	}
 	return u, err
 }
 
-// GetActiveChannelCount returns the number of channels the user currently
-// has in tracking_status active or paused. Used by the channel-connect
-// guard and the GET /api/billing/status response.
-func (q *PostgresQuery) GetActiveChannelCount(ctx context.Context, userID string) (int, error) {
+func (q *SQLiteQuery) GetActiveChannelCount(ctx context.Context, userID string) (int, error) {
 	var n int
-	err := q.pool.QueryRow(ctx,
+	err := q.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM user_channel_tracking
-		 WHERE user_id = $1 AND tracking_status IN ('active','paused')`,
+		 WHERE user_id = ? AND tracking_status IN ('active','paused')`,
 		userID).Scan(&n)
 	return n, err
 }
 
-// GetOverageCostForCurrentPeriod sums the count column of comment_usage_logs
-// for the user inside [periodStart, periodEnd) and returns the rolled-up
-// USD overage cost: ceil(sum/1000) * $0.50. Plans free and agency are
-// expected to never see rows in this table; for them the value is 0.
-func (q *PostgresQuery) GetOverageCostForCurrentPeriod(ctx context.Context, userID string, periodStart, periodEnd time.Time) (float64, error) {
+func (q *SQLiteQuery) GetOverageCostForCurrentPeriod(ctx context.Context, userID string, periodStart, periodEnd time.Time) (float64, error) {
 	var total int
-	err := q.pool.QueryRow(ctx,
+	err := q.db.QueryRowContext(ctx,
 		`SELECT COALESCE(SUM(count), 0) FROM comment_usage_logs
-		 WHERE user_id = $1 AND period_start >= $2 AND period_start < $3`,
-		userID, periodStart, periodEnd).Scan(&total)
+		 WHERE user_id = ? AND period_start >= ? AND period_start < ?`,
+		userID, periodStart.Format(time.RFC3339), periodEnd.Format(time.RFC3339)).Scan(&total)
 	if err != nil {
 		return 0, err
 	}
 	if total <= 0 {
 		return 0, nil
 	}
-	// ceil(total/1000) * 0.50
 	chunks := (total + 999) / 1000
 	return float64(chunks) * 0.50, nil
 }
 
-// InsertCommentUsageLog records overage rows for the LLM processor when a
-// batch crosses the comment_quota_monthly boundary for a Creator/Studio
-// user. Tx-aware so the row lands in the same transaction as the LLM result.
-func (q *PostgresQuery) InsertCommentUsageLog(ctx context.Context, tx pgx.Tx, userID string, count int, periodStart, periodEnd time.Time) error {
-	sql := `INSERT INTO comment_usage_logs (user_id, count, period_start, period_end)
-	        VALUES ($1, $2, $3, $4)`
+func (q *SQLiteQuery) InsertCommentUsageLog(ctx context.Context, tx *sql.Tx, userID string, count int, periodStart, periodEnd time.Time) error {
+	sqlStr := `INSERT INTO comment_usage_logs (id, user_id, count, period_start, period_end)
+	        VALUES (?, ?, ?, ?, ?)`
 	if tx != nil {
-		_, err := tx.Exec(ctx, sql, userID, count, periodStart, periodEnd)
+		_, err := tx.ExecContext(ctx, sqlStr, generateUUID(), userID, count, periodStart.Format(time.RFC3339), periodEnd.Format(time.RFC3339))
 		return err
 	}
-	_, err := q.pool.Exec(ctx, sql, userID, count, periodStart, periodEnd)
+	_, err := q.db.ExecContext(ctx, sqlStr, generateUUID(), userID, count, periodStart.Format(time.RFC3339), periodEnd.Format(time.RFC3339))
 	return err
 }
 
-// PauseChannelsAlphabetically sets tracking_status='paused' on every active
-// tracker for the user beyond keepCount, ordered by the channel's display
-// name ascending (id ascending as a deterministic tie-breaker). It is the
-// downgrade-on-cancel primitive (Spec D7).
-func (q *PostgresQuery) PauseChannelsAlphabetically(ctx context.Context, tx pgx.Tx, userID string, keepCount int) error {
+func (q *SQLiteQuery) PauseChannelsAlphabetically(ctx context.Context, tx *sql.Tx, userID string, keepCount int) error {
 	if keepCount < 0 {
 		keepCount = 0
 	}
-	sql := `
+	sqlStr := `
 		UPDATE user_channel_tracking
 		   SET tracking_status = 'paused'
 		 WHERE id IN (
 		     SELECT uct.id
 		       FROM user_channel_tracking uct
 		       JOIN platform_channels pc ON pc.id = uct.platform_channel_id
-		      WHERE uct.user_id = $1
+		      WHERE uct.user_id = ?
 		        AND uct.tracking_status = 'active'
 		      ORDER BY pc.display_name ASC, uct.id ASC
-		      OFFSET $2
+		      LIMIT -1 OFFSET ?
 		 )`
 	if tx != nil {
-		_, err := tx.Exec(ctx, sql, userID, keepCount)
+		_, err := tx.ExecContext(ctx, sqlStr, userID, keepCount)
 		return err
 	}
-	_, err := q.pool.Exec(ctx, sql, userID, keepCount)
+	_, err := q.db.ExecContext(ctx, sqlStr, userID, keepCount)
 	return err
 }
 
-// IncrementCommentsUsedTx is the transactional sibling of
-// IncrementCommentsUsed used by the LLM processor when it persists a batch
-// inside one transaction (LLM results + quota bump + optional overage log).
-// Returns the new value of comments_used_this_period so callers can detect
-// the moment a batch crosses the quota boundary.
-func (q *PostgresQuery) IncrementCommentsUsedTx(ctx context.Context, tx pgx.Tx, userID string, count int) (int, error) {
+func (q *SQLiteQuery) IncrementCommentsUsedTx(ctx context.Context, tx *sql.Tx, userID string, count int) (int, error) {
 	var used int
-	err := tx.QueryRow(ctx,
+	err := tx.QueryRowContext(ctx,
 		`UPDATE users
-		    SET comments_used_this_period = comments_used_this_period + $1,
-		        updated_at = NOW()
-		  WHERE id = $2
+		    SET comments_used_this_period = comments_used_this_period + ?,
+		        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+		  WHERE id = ?
 		 RETURNING comments_used_this_period`,
 		count, userID).Scan(&used)
 	return used, err
 }
 
-// ResetFreeTierQuotas runs the daily cron that catches free users whose
-// quota_reset_at is in the past. Returns rows affected.
-func (q *PostgresQuery) ResetFreeTierQuotas(ctx context.Context) (int64, error) {
-	tag, err := q.pool.Exec(ctx,
+func (q *SQLiteQuery) ResetFreeTierQuotas(ctx context.Context) (int64, error) {
+	quotaReset := time.Now().UTC().AddDate(0, 1, 0).Format(time.RFC3339)
+	result, err := q.db.ExecContext(ctx,
 		`UPDATE users
 		    SET comments_used_this_period = 0,
-		        quota_reset_at = NOW() + INTERVAL '1 month',
-		        updated_at = NOW()
+		        quota_reset_at = ?,
+		        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
 		  WHERE subscription_plan = 'free'
 		    AND quota_reset_at IS NOT NULL
-		    AND quota_reset_at <= NOW()`)
+		    AND quota_reset_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now')`, quotaReset)
 	if err != nil {
 		return 0, err
 	}
-	return tag.RowsAffected(), nil
+	return result.RowsAffected()
 }
 
-// ExpirePastDueGrace transitions users from past_due to paused when they
-// have been in that state for more than 3 days without a successful payment.
-// "Time in past_due" is derived from the past_due_since column written by
-// the invoice.payment_failed handler.
-func (q *PostgresQuery) ExpirePastDueGrace(ctx context.Context, graceHours int) (int64, error) {
-	tag, err := q.pool.Exec(ctx,
+func (q *SQLiteQuery) ExpirePastDueGrace(ctx context.Context, graceHours int) (int64, error) {
+	cutoff := time.Now().UTC().Add(-time.Duration(graceHours) * time.Hour).Format(time.RFC3339)
+	result, err := q.db.ExecContext(ctx,
 		`UPDATE users
 		    SET subscription_status = 'paused',
-		        updated_at = NOW()
+		        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
 		  WHERE subscription_status = 'past_due'
 		    AND past_due_since IS NOT NULL
-		    AND past_due_since <= NOW() - make_interval(hours => $1)`,
-		graceHours)
+		    AND past_due_since <= ?`,
+		cutoff)
 	if err != nil {
 		return 0, err
 	}
-	return tag.RowsAffected(), nil
+	return result.RowsAffected()
 }
 
-// ExpirePastDueGraceWithUsers is the data-lifecycle (12.4) variant of
-// ExpirePastDueGrace: same transition, but RETURNINGs (id, email) for
-// each user that crossed the boundary so the caller can emit the
-// payment_grace_final email. Returning the rows is essential — without
-// it, the cron has no way to enumerate the affected users without a
-// second SELECT race window.
-func (q *PostgresQuery) ExpirePastDueGraceWithUsers(ctx context.Context, graceHours int) ([]ExpiredGraceUser, error) {
-	rows, err := q.pool.Query(ctx,
-		`UPDATE users
-		    SET subscription_status = 'paused',
-		        updated_at = NOW()
+type ExpiredGraceUser struct {
+	ID    string
+	Email string
+}
+
+func (q *SQLiteQuery) ExpirePastDueGraceWithUsers(ctx context.Context, graceHours int) ([]ExpiredGraceUser, error) {
+	cutoff := time.Now().UTC().Add(-time.Duration(graceHours) * time.Hour).Format(time.RFC3339)
+	rows, err := q.db.QueryContext(ctx,
+		`SELECT id, email
+		   FROM users
 		  WHERE subscription_status = 'past_due'
 		    AND past_due_since IS NOT NULL
-		    AND past_due_since <= NOW() - make_interval(hours => $1)
-		  RETURNING id, email`,
-		graceHours)
+		    AND past_due_since <= ?`,
+		cutoff)
 	if err != nil {
 		return nil, err
 	}
@@ -317,36 +260,22 @@ func (q *PostgresQuery) ExpirePastDueGraceWithUsers(ctx context.Context, graceHo
 	return out, rows.Err()
 }
 
-// ExpiredGraceUser is the (id, email) tuple ExpirePastDueGraceWithUsers
-// returns per transitioned user. Used by the billing quota cron to emit
-// payment_grace_final emails (12.4).
-type ExpiredGraceUser struct {
-	ID    string
-	Email string
-}
-
-// TrialReminderUser is the (id, email, trial_ends_at) tuple the trial
-// reminder cron (12.5) consumes.
 type TrialReminderUser struct {
 	ID          string
 	Email       string
 	TrialEndsAt time.Time
 }
 
-// ListUsersForTrialExpiryReminder returns users whose trial_ends_at is
-// within (lo, hi]. The caller picks lo/hi to define the 1-day reminder
-// window (typically NOW+2d, NOW+3d). subscription_status is constrained
-// to 'trialing' so users who already paid (or were paused) are skipped.
-func (q *PostgresQuery) ListUsersForTrialExpiryReminder(ctx context.Context, lo, hi time.Time) ([]TrialReminderUser, error) {
-	rows, err := q.pool.Query(ctx,
+func (q *SQLiteQuery) ListUsersForTrialExpiryReminder(ctx context.Context, lo, hi time.Time) ([]TrialReminderUser, error) {
+	rows, err := q.db.QueryContext(ctx,
 		`SELECT id, email, trial_ends_at
 		   FROM users
 		  WHERE subscription_status = 'trialing'
 		    AND trial_ends_at IS NOT NULL
-		    AND trial_ends_at >  $1
-		    AND trial_ends_at <= $2
+		    AND trial_ends_at >  ?
+		    AND trial_ends_at <= ?
 		    AND deletion_requested_at IS NULL`,
-		lo, hi)
+		lo.Format(time.RFC3339), hi.Format(time.RFC3339))
 	if err != nil {
 		return nil, err
 	}
@@ -354,9 +283,11 @@ func (q *PostgresQuery) ListUsersForTrialExpiryReminder(ctx context.Context, lo,
 	var out []TrialReminderUser
 	for rows.Next() {
 		var u TrialReminderUser
-		if err := rows.Scan(&u.ID, &u.Email, &u.TrialEndsAt); err != nil {
+		var trialEndsAt string
+		if err := rows.Scan(&u.ID, &u.Email, &trialEndsAt); err != nil {
 			return nil, err
 		}
+		u.TrialEndsAt = parseTime(trialEndsAt)
 		out = append(out, u)
 	}
 	return out, rows.Err()

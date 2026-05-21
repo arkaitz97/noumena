@@ -1,19 +1,17 @@
-// Package export implements streaming CSV/JSON encoders and a Postgres-cursor
+// Package export implements streaming CSV/JSON encoders and a SQLite-cursor
 // reader for the insights-api export lifecycle. It is consumed by the sync
 // path of POST /api/comments/export and by the background export worker.
 package export
 
 import (
 	"context"
+	"database/sql"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
 	"strconv"
 	"time"
-
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"noumena/internal/db"
 )
@@ -23,7 +21,7 @@ import (
 // on it. Task 10.1, 14.5.
 var CSVHeader = []string{
 	"id", "channel_name", "author_handle", "body",
-	"posted_at", "category", "sentiment_score",
+	"posted_at", "category", "actionable_insights",
 	"topic", "confidence", "processed_at",
 }
 
@@ -37,9 +35,9 @@ func rowValues(r *db.FeedRow) []string {
 	if r.Category != nil {
 		category = *r.Category
 	}
-	sentiment := ""
-	if r.SentimentScore != nil {
-		sentiment = strconv.FormatFloat(*r.SentimentScore, 'f', -1, 64)
+	actionableInsights := string(r.ActionableInsights)
+	if actionableInsights == "" || actionableInsights == "null" {
+		actionableInsights = "[]"
 	}
 	topic := ""
 	if r.Topic != nil {
@@ -60,7 +58,7 @@ func rowValues(r *db.FeedRow) []string {
 		r.Body,
 		r.PostedAt.UTC().Format(time.RFC3339),
 		category,
-		sentiment,
+		actionableInsights,
 		topic,
 		confidence,
 		processedAt,
@@ -101,7 +99,7 @@ type jsonExportRow struct {
 	Body              string     `json:"body"`
 	PostedAt          time.Time  `json:"posted_at"`
 	Category          *string    `json:"category,omitempty"`
-	SentimentScore    *float64   `json:"sentiment_score,omitempty"`
+	ActionableInsights []byte    `json:"actionable_insights,omitempty"`
 	Topic             *string    `json:"topic,omitempty"`
 	Confidence        *float64   `json:"confidence,omitempty"`
 	ProcessedAt       *time.Time `json:"processed_at,omitempty"`
@@ -116,7 +114,7 @@ func toJSONRow(r *db.FeedRow) jsonExportRow {
 		Body:              r.Body,
 		PostedAt:          r.PostedAt,
 		Category:          r.Category,
-		SentimentScore:    r.SentimentScore,
+		ActionableInsights: r.ActionableInsights,
 		Topic:             r.Topic,
 		Confidence:        r.Confidence,
 		ProcessedAt:       r.ProcessedAt,
@@ -153,13 +151,13 @@ func EncodeJSON(w io.Writer, rows <-chan *db.FeedRow) (int64, error) {
 	return count, nil
 }
 
-// StreamExport opens a Postgres cursor with BuildFeedQuery(ModeStream),
+// StreamExport opens a SQLite query with BuildFeedQuery(ModeStream),
 // fans rows into a channel, and dispatches to the requested encoder. The
 // row channel decouples the DB cursor from the encoder so the encoder can
 // flush before the next row is fetched, bounding memory. Task 10.4.
-func StreamExport(ctx context.Context, pool *pgxpool.Pool, userID string, filters db.FeedFilters, format string, dst io.Writer) (int64, error) {
-	sql, args := db.BuildFeedQuery(userID, filters, db.ModeStream)
-	rows, err := pool.Query(ctx, sql, args...)
+func StreamExport(ctx context.Context, pool *sql.DB, userID string, filters db.FeedFilters, format string, dst io.Writer) (int64, error) {
+	sqlQuery, args := db.BuildFeedQuery(userID, filters, db.ModeStream)
+	rows, err := pool.QueryContext(ctx, sqlQuery, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -173,7 +171,7 @@ func StreamExport(ctx context.Context, pool *pgxpool.Pool, userID string, filter
 			r := &db.FeedRow{}
 			if err := rows.Scan(
 				&r.ID, &r.PlatformChannelID, &r.PlatformCommentID, &r.ParentCommentID,
-				&r.AuthorHandle, &r.Body, &r.PostedAt, &r.Category, &r.SentimentScore,
+				&r.AuthorHandle, &r.Body, &r.PostedAt, &r.Category, &r.ActionableInsights,
 				&r.Topic, &r.Confidence, &r.ProcessedAt, &r.CreatedAt,
 				&r.ChannelName, &r.IsStarred,
 			); err != nil {
@@ -211,6 +209,3 @@ func StreamExport(ctx context.Context, pool *pgxpool.Pool, userID string, filter
 	}
 	return count, encErr
 }
-
-// Compile-time anchor for pgx import.
-var _ pgx.Rows = (pgx.Rows)(nil)

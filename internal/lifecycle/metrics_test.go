@@ -124,3 +124,35 @@ func TestExportBytesIgnoresNonPositive(t *testing.T) {
 		t.Errorf("export_bytes_total non-positive: want 0, got %d", got)
 	}
 }
+
+// TestDeletionStageGauge verifies the deletion_stage gauge records
+// stage transitions with the job_id attribute.
+func TestDeletionStageGauge(t *testing.T) {
+	reader, restore := installManualReader(t)
+	defer restore()
+
+	ctx := context.Background()
+	recordDeletionStage(ctx, "job-42", 0) // pending
+	recordDeletionStage(ctx, "job-42", 1) // exporting
+	recordDeletionStage(ctx, "job-42", 2) // detaching
+	recordDeletionStage(ctx, "job-42", 3) // finalizing
+	recordDeletionStage(ctx, "job-42", 4) // completed
+
+	rm := collect(t, reader)
+	got := sumInt64WithAttr(&rm, "noumena_deletion_stage", "job_id", "job-42")
+	// UpDownCounter accumulates: 0+1+2+3+4 = 10
+	if got != 10 {
+		t.Errorf("deletion_stage{job-42}: want 10, got %d", got)
+	}
+}
+
+// TestNoOpLifecycleMetricsDoNotPanic verifies that with the default
+// no-op MeterProvider, calling every lifecycle record function is safe.
+func TestNoOpLifecycleMetricsDoNotPanic(t *testing.T) {
+	ctx := context.Background()
+	recordDeletionCompleted(ctx, telemetry.OutcomeSuccess)
+	recordDeletionChunkRows(ctx, 500)
+	recordExportCompleted(ctx, telemetry.OutcomeSuccess)
+	recordExportBytes(ctx, 4096)
+	recordDeletionStage(ctx, "job-x", 1)
+}

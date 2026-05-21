@@ -72,11 +72,10 @@ func TestBuildFeedQuery_IncludeToxicTwoLayer(t *testing.T) {
 
 func TestBuildFeedQuery_SortModes(t *testing.T) {
 	cases := map[string]string{
-		"newest":         "ORDER BY c.posted_at DESC",
-		"sentiment_desc": "ORDER BY c.sentiment_score DESC NULLS LAST",
-		"sentiment_asc":  "ORDER BY c.sentiment_score ASC NULLS LAST",
-		"":               "ORDER BY c.posted_at DESC", // default
-		"bogus":          "ORDER BY c.posted_at DESC", // fallback
+		"newest":  "ORDER BY c.posted_at DESC",
+		"oldest":  "ORDER BY c.posted_at ASC",
+		"":        "ORDER BY c.posted_at DESC", // default
+		"bogus":   "ORDER BY c.posted_at DESC", // fallback
 	}
 	for sort, want := range cases {
 		sql, _ := BuildFeedQuery("u1", FeedFilters{Sort: sort}, ModeFeed)
@@ -87,7 +86,7 @@ func TestBuildFeedQuery_SortModes(t *testing.T) {
 }
 
 func TestBuildFeedQuery_ModeSaved_OverridesSort(t *testing.T) {
-	sql, _ := BuildFeedQuery("u1", FeedFilters{Sort: "sentiment_desc"}, ModeSaved)
+	sql, _ := BuildFeedQuery("u1", FeedFilters{Sort: "newest"}, ModeSaved)
 	if !strings.Contains(sql, "ORDER BY ucs2.starred_at DESC") {
 		t.Errorf("saved mode did not force starred_at DESC: %s", sql)
 	}
@@ -120,15 +119,12 @@ func TestBuildFeedQuery_NoSQLi(t *testing.T) {
 	evil := "x'; DROP TABLE users; --"
 	from := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 	to := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
-	min := -0.5
-	max := 0.9
 
 	sql, args := BuildFeedQuery(evil, FeedFilters{
 		Channels:     []string{evil},
 		Categories:   []string{evil},
 		IncludeToxic: true,
-		SentimentMin: &min,
-		SentimentMax: &max,
+		InsightType:  "video_idea",
 		DateFrom:     &from,
 		DateTo:       &to,
 		Search:       &evil,
@@ -155,13 +151,12 @@ func TestBuildFeedQuery_NoSQLi(t *testing.T) {
 }
 
 func TestBuildFeedQuery_FilterCombinations(t *testing.T) {
-	min := 0.5
 	from := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	q := "lighting"
 	sql, args := BuildFeedQuery("u1", FeedFilters{
 		Channels:     []string{"ch1", "ch2"},
 		Categories:   []string{"question"},
-		SentimentMin: &min,
+		InsightType:  "video_idea",
 		DateFrom:     &from,
 		Search:       &q,
 		Limit:        50,
@@ -171,13 +166,13 @@ func TestBuildFeedQuery_FilterCombinations(t *testing.T) {
 	if !strings.Contains(sql, "c.platform_channel_id IN") {
 		t.Errorf("channels filter missing")
 	}
-	if !strings.Contains(sql, "c.sentiment_score >=") {
-		t.Errorf("sentiment_min filter missing")
+	if !strings.Contains(sql, "json_extract(c.actionable_insights") {
+		t.Errorf("insight_type filter missing")
 	}
 	if !strings.Contains(sql, "c.posted_at >=") {
 		t.Errorf("date_from filter missing")
 	}
-	if !strings.Contains(sql, "c.body ILIKE") {
+	if !strings.Contains(sql, "c.body LIKE") {
 		t.Errorf("search filter missing")
 	}
 	if len(args) < 6 {

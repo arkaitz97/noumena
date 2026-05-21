@@ -2,38 +2,48 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 )
 
-type fakeDigestLLM struct {
-	raw string
-	err error
-	// blockUntilDone simulates a slow call; respect ctx cancellation.
-	delay time.Duration
-}
-
-func (f *fakeDigestLLM) GenerateDigestRaw(ctx context.Context, prompt string) (string, error) {
-	if f.delay > 0 {
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-time.After(f.delay):
+func newMockOpenCode(t *testing.T, raw string, errStr string, delay time.Duration) *opencodeClient {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if delay > 0 {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(delay):
+			}
 		}
-	}
-	if f.err != nil {
-		return "", f.err
-	}
-	return f.raw, nil
+		if errStr != "" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		resp := map[string]any{
+			"choices": []any{
+				map[string]any{
+					"message": map[string]any{"content": raw},
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	t.Cleanup(srv.Close)
+	return newOpenCodeClientWithHTTP(srv.Client(), srv.URL, "test-key", "test-model")
 }
 
 func truthFixture() DigestContent {
 	return DigestContent{
-		SentimentTrend:        SentimentTrend{CurrentAvg: 0.5, ChangePct: 10, Direction: "improving"},
+		TopActionableInsights: []ActionableInsightAgg{{Type: "video_idea", Description: "Make a tutorial", Count: 5}},
 		EngagementHealthScore: 75,
-		HealthScoreBreakdown:  HealthScoreBreakdown{ResponseRate: 60, SentimentQuality: 75, EngagementDepth: 90},
+		HealthScoreBreakdown:  HealthScoreBreakdown{ResponseRate: 60, EngagementDepth: 90},
 		TotalCommentsAnalyzed: 42,
 		FilteredComments:      3,
 	}
@@ -43,13 +53,13 @@ func TestCallDigestLLM_Success(t *testing.T) {
 	raw := `{
 		"top_ideas":[{"idea":"Make a tutorial","evidence":"7 viewers asked","sample_comments":["please tutorial"]}],
 		"top_questions":[{"question":"When is the next video?","count":4,"unanswered":true}],
-		"sentiment_trend":{"current_avg":0,"change_pct":0,"direction":"stable"},
+		"top_actionable_insights":[{"type":"video_idea","description":"tutorial","count":3}],
 		"engagement_health_score":0,
-		"health_score_breakdown":{"response_rate":0,"sentiment_quality":0,"engagement_depth":0},
+		"health_score_breakdown":{"response_rate":0,"engagement_depth":0},
 		"total_comments_analyzed":0,
 		"filtered_comments":0
 	}`
-	got, err := CallDigestLLM(context.Background(), &fakeDigestLLM{raw: raw}, "p", truthFixture())
+	got, err := CallDigestLLM(context.Background(), newMockOpenCode(t, raw, "", 0), "p", truthFixture())
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -57,8 +67,8 @@ func TestCallDigestLLM_Success(t *testing.T) {
 	if got.EngagementHealthScore != 75 {
 		t.Errorf("health score not overwritten: %d", got.EngagementHealthScore)
 	}
-	if got.SentimentTrend.Direction != "improving" {
-		t.Errorf("trend not overwritten: %+v", got.SentimentTrend)
+	if got.TopActionableInsights[0].Count != 5 {
+		t.Errorf("insights not overwritten: %+v", got.TopActionableInsights)
 	}
 	if got.TotalCommentsAnalyzed != 42 {
 		t.Errorf("totals not overwritten: %d", got.TotalCommentsAnalyzed)
@@ -85,7 +95,7 @@ func TestCallDigestLLM_TruncatesToFive(t *testing.T) {
 		sb.WriteString(`{"question":"q","count":1,"unanswered":false}`)
 	}
 	sb.WriteString(`]}`)
-	got, err := CallDigestLLM(context.Background(), &fakeDigestLLM{raw: sb.String()}, "p", truthFixture())
+	got, err := CallDigestLLM(context.Background(), newMockOpenCode(t, sb.String(), "", 0), "p", truthFixture())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -98,7 +108,7 @@ func TestCallDigestLLM_TruncatesToFive(t *testing.T) {
 }
 
 func TestCallDigestLLM_MalformedJSON(t *testing.T) {
-	_, err := CallDigestLLM(context.Background(), &fakeDigestLLM{raw: "this is not json"}, "p", truthFixture())
+	_, err := CallDigestLLM(context.Background(), newMockOpenCode(t, "this is not json", "", 0), "p", truthFixture())
 	if err == nil {
 		t.Fatal("expected error on malformed JSON")
 	}
@@ -107,7 +117,7 @@ func TestCallDigestLLM_MalformedJSON(t *testing.T) {
 func TestCallDigestLLM_MissingRequiredField(t *testing.T) {
 	// Empty idea string fails validation.
 	raw := `{"top_ideas":[{"idea":"","evidence":"e","sample_comments":[]}],"top_questions":[]}`
-	_, err := CallDigestLLM(context.Background(), &fakeDigestLLM{raw: raw}, "p", truthFixture())
+	_, err := CallDigestLLM(context.Background(), newMockOpenCode(t, raw, "", 0), "p", truthFixture())
 	if err == nil {
 		t.Fatal("expected validation error for empty idea")
 	}
@@ -116,7 +126,7 @@ func TestCallDigestLLM_MissingRequiredField(t *testing.T) {
 func TestCallDigestLLM_TimeoutFromCaller(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	_, err := CallDigestLLM(ctx, &fakeDigestLLM{delay: 200 * time.Millisecond, raw: "{}"}, "p", truthFixture())
+	_, err := CallDigestLLM(ctx, newMockOpenCode(t, "{}", "", 200*time.Millisecond), "p", truthFixture())
 	if err == nil {
 		t.Fatal("expected error on timeout")
 	}

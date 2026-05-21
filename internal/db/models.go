@@ -36,6 +36,7 @@ type User struct {
 	// subscription synchronously when the user requests deletion.
 	StripeSubscriptionID *string    `json:"stripe_subscription_id,omitempty"`
 	PastDueSince         *time.Time `json:"-"`
+	ActiveWorkspaceID    *string    `json:"active_workspace_id,omitempty"`
 	CreatedAt          time.Time  `json:"created_at"`
 	UpdatedAt          time.Time  `json:"updated_at"`
 }
@@ -51,7 +52,6 @@ type PlatformChannel struct {
 
 	// Ingestion-pipeline state (comment-ingestion change). Optional: zero
 	// values are equivalent to "no ingestion state recorded".
-	IngestionLockID       *int64     `json:"-"`
 	IngestionErrorCount   int        `json:"ingestion_error_count,omitempty"`
 	IngestionLastErrorAt  *time.Time `json:"ingestion_last_error_at,omitempty"`
 	IngestionBackoffUntil *time.Time `json:"ingestion_backoff_until,omitempty"`
@@ -97,6 +97,8 @@ type UserChannelTracking struct {
 	LastSeenAt            *time.Time `json:"last_seen_at,omitempty"`
 	BackfillDays          int        `json:"backfill_days"`
 	TokenExpiryNotifiedAt *time.Time `json:"token_expiry_notified_at,omitempty"`
+	CustomPrompt          *string    `json:"custom_prompt,omitempty"`
+	WorkspaceID           *string    `json:"workspace_id,omitempty"`
 	CreatedAt             time.Time  `json:"created_at"`
 }
 
@@ -119,11 +121,12 @@ type Comment struct {
 	PlatformChannelID string     `json:"platform_channel_id"`
 	PlatformCommentID string     `json:"platform_comment_id"`
 	ParentCommentID   *string    `json:"parent_comment_id,omitempty"`
+	ReplyDepth        int        `json:"reply_depth"`
 	AuthorHandle      *string    `json:"author_handle,omitempty"`
 	Body              string     `json:"body"`
 	PostedAt          time.Time  `json:"posted_at"`
 	Category          *string    `json:"category,omitempty"`
-	SentimentScore    *float64   `json:"sentiment_score,omitempty"`
+	ActionableInsights []byte    `json:"actionable_insights,omitempty"`
 	Topic             *string    `json:"topic,omitempty"`
 	Confidence        *float64   `json:"confidence,omitempty"`
 	ProcessedAt       *time.Time `json:"processed_at,omitempty"`

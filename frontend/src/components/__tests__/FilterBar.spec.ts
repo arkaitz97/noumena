@@ -1,4 +1,3 @@
-// FilterBar.spec.ts — variant-based sort selector visibility + update:filters emit.
 import { describe, it, expect } from 'vitest'
 import { mount } from '@vue/test-utils'
 import FilterBar from '../FilterBar.vue'
@@ -8,8 +7,7 @@ function makeFilters(overrides: Partial<FeedFilters> = {}): FeedFilters {
   return {
     channels: [],
     categories: [],
-    sentiment_min: null,
-    sentiment_max: null,
+    insight_type: null,
     date_from: null,
     date_to: null,
     search: '',
@@ -20,18 +18,18 @@ function makeFilters(overrides: Partial<FeedFilters> = {}): FeedFilters {
 }
 
 describe('FilterBar', () => {
-  it('renders the sort selector in feed variant', () => {
+  it('renders the insight type filter in feed variant', () => {
     const wrapper = mount(FilterBar, {
       props: { filters: makeFilters(), channels: [], variant: 'feed' },
     })
-    expect(wrapper.find('#filterbar-sort').exists()).toBe(true)
+    expect(wrapper.text()).toContain('Insight type')
   })
 
-  it('hides the sort selector in saved variant', () => {
+  it('hides the insight type filter in saved variant', () => {
     const wrapper = mount(FilterBar, {
       props: { filters: makeFilters(), channels: [], variant: 'saved' },
     })
-    expect(wrapper.find('#filterbar-sort').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('Insight type')
   })
 
   it('emits reset when the Reset button is clicked', async () => {

@@ -10,7 +10,6 @@
 package db
 
 import (
-	"fmt"
 	"strings"
 	"time"
 )
@@ -36,15 +35,14 @@ const (
 type FeedFilters struct {
 	Channels      []string // platform_channels.id (UUID strings)
 	Categories    []string // category enum values
-	SentimentMin  *float64
-	SentimentMax  *float64
+	InsightType   string   // filter by insight type (JSONB containment)
 	DateFrom      *time.Time
 	DateTo        *time.Time
 	Search        *string
 	IncludeToxic  bool
 	Limit         int
 	Offset        int
-	Sort          string // "newest" | "sentiment_desc" | "sentiment_asc"
+	Sort          string // "newest" | "oldest"
 }
 
 // HighSignalCategories is the default category set applied when the caller
@@ -63,9 +61,8 @@ var ToxicCategories = map[string]struct{}{
 // AllowedSorts enumerates the sort modes accepted on /feed. /saved overrides
 // the sort internally and so is not constrained by this set.
 var AllowedSorts = map[string]string{
-	"newest":         "ORDER BY c.posted_at DESC",
-	"sentiment_desc": "ORDER BY c.sentiment_score DESC NULLS LAST",
-	"sentiment_asc":  "ORDER BY c.sentiment_score ASC NULLS LAST",
+	"newest":  "ORDER BY c.posted_at DESC",
+	"oldest":  "ORDER BY c.posted_at ASC",
 }
 
 // applyToxicLayer enforces the two-layer toxic filter described in
@@ -104,7 +101,7 @@ func BuildFeedQuery(userID string, filters FeedFilters, mode FeedMode) (string, 
 	// Helper that records an arg and returns its placeholder ($N).
 	addArg := func(v any) string {
 		args = append(args, v)
-		return fmt.Sprintf("$%d", len(args))
+		return "?"
 	}
 
 	// --- Projection -------------------------------------------------------
@@ -113,11 +110,8 @@ func BuildFeedQuery(userID string, filters FeedFilters, mode FeedMode) (string, 
 	case ModeCount:
 		projection = "COUNT(*)"
 	case ModeFeed, ModeSaved, ModeStream:
-		// Full row + channel_name + is_starred. The EXISTS subquery is keyed
-		// on (user_id, comment_id) and uses idx_user_comment_stars_user_starred
-		// for a fast index-only probe.
-		projection = `c.id, c.platform_channel_id, c.platform_comment_id, c.parent_comment_id,
-			c.author_handle, c.body, c.posted_at, c.category, c.sentiment_score,
+		projection = `c.id, c.platform_channel_id, c.platform_comment_id, c.parent_comment_id, c.reply_depth,
+			c.author_handle, c.body, c.posted_at, c.category, c.actionable_insights,
 			c.topic, c.confidence, c.processed_at, c.created_at,
 			pc.display_name AS channel_name,
 			EXISTS (SELECT 1 FROM user_comment_stars ucs
@@ -175,11 +169,8 @@ func BuildFeedQuery(userID string, filters FeedFilters, mode FeedMode) (string, 
 		where = append(where, "c.platform_channel_id IN ("+strings.Join(ph, ",")+")")
 	}
 
-	if filters.SentimentMin != nil {
-		where = append(where, "c.sentiment_score >= "+addArg(*filters.SentimentMin))
-	}
-	if filters.SentimentMax != nil {
-		where = append(where, "c.sentiment_score <= "+addArg(*filters.SentimentMax))
+	if filters.InsightType != "" {
+		where = append(where, "json_extract(c.actionable_insights, '$[0].type') = "+addArg(filters.InsightType))
 	}
 	if filters.DateFrom != nil {
 		where = append(where, "c.posted_at >= "+addArg(*filters.DateFrom))
@@ -189,11 +180,8 @@ func BuildFeedQuery(userID string, filters FeedFilters, mode FeedMode) (string, 
 	}
 	if filters.Search != nil && *filters.Search != "" {
 		ph := addArg(*filters.Search)
-		// Same parameter is referenced twice; both ILIKE patterns are
-		// constructed at SQL evaluation time via concatenation of '%'
-		// literals with the parameter — never with raw user input.
 		where = append(where,
-			"(c.body ILIKE '%' || "+ph+" || '%' OR COALESCE(c.topic,'') ILIKE '%' || "+ph+" || '%')")
+			"(c.body LIKE '%' || "+ph+" || '%' OR COALESCE(c.topic,'') LIKE '%' || "+ph+" || '%')")
 	}
 
 	// --- ORDER BY / LIMIT / OFFSET ---------------------------------------

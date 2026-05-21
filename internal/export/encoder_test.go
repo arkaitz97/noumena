@@ -14,7 +14,6 @@ import (
 func makeRow(id, body string) *db.FeedRow {
 	cat := "question"
 	topic := "lighting"
-	sent := 0.4
 	conf := 0.85
 	posted := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	processed := posted.Add(time.Minute)
@@ -26,7 +25,7 @@ func makeRow(id, body string) *db.FeedRow {
 			Body:              body,
 			PostedAt:          posted,
 			Category:          &cat,
-			SentimentScore:    &sent,
+			ActionableInsights: []byte(`[]`),
 			Topic:             &topic,
 			Confidence:        &conf,
 			ProcessedAt:       &processed,
@@ -55,7 +54,7 @@ func TestEncodeCSV_HeaderOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read header: %v", err)
 	}
-	want := []string{"id", "channel_name", "author_handle", "body", "posted_at", "category", "sentiment_score", "topic", "confidence", "processed_at"}
+	want := []string{"id", "channel_name", "author_handle", "body", "posted_at", "category", "actionable_insights", "topic", "confidence", "processed_at"}
 	if len(header) != len(want) {
 		t.Fatalf("header length: got %d want %d", len(header), len(want))
 	}

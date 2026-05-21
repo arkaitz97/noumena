@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/stripe/stripe-go/v76"
@@ -43,6 +44,7 @@ func newAccountRouter(h *api.AccountHandler, userID string) *chi.Mux {
 			})
 		})
 		r.Delete("/user/account", h.DeleteAccount)
+		r.Post("/user/account/cancel-deletion", h.CancelAccountDeletion)
 		r.Get("/user/data-export/{id}/status", h.GetExportStatus)
 		r.Get("/user/me", h.GetProfile)
 	})
@@ -211,3 +213,119 @@ func TestDeleteAccount_NoStripeCallWhenSubscriptionIDNil(t *testing.T) {
 // the embedded interface — keeps go vet happy if the embed is later
 // replaced with concrete fields).
 var _ = stripe.SubscriptionStatusActive
+
+// ============================================================================
+// 5.6: Integration tests for audit trail on deletion events
+// ============================================================================
+
+// auditMockQuery extends MockQuery with ScheduleAccountDeletion support.
+type auditMockQuery struct {
+	MockQuery
+	scheduleCalls []string
+	cancelCalls   []string
+}
+
+func (m *auditMockQuery) ScheduleAccountDeletion(_ context.Context, userID string, totalChannels int) (*db.AccountDeletionJob, error) {
+	m.scheduleCalls = append(m.scheduleCalls, userID)
+	return &db.AccountDeletionJob{ID: "job-" + userID, UserID: userID, Status: "pending"}, nil
+}
+
+func (m *auditMockQuery) CancelAccountDeletion(_ context.Context, userID string) error {
+	m.cancelCalls = append(m.cancelCalls, userID)
+	return nil
+}
+
+func TestDeleteAccount_CreatesAuditLogEntry(t *testing.T) {
+	user := &db.User{ID: "u-audit1", Email: "audit@example.com"}
+	mock := &auditMockQuery{MockQuery: MockQuery{users: map[string]*db.User{"u-audit1": user}}}
+	h := &api.AccountHandler{Queries: mock, Cfg: config.Default}
+	r := newAccountRouter(h, "u-audit1")
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/user/account",
+		bytes.NewBufferString(`{"email_confirmation":"audit@example.com"}`))
+	req.RemoteAddr = "192.168.1.1:12345"
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(mock.auditLogs) != 1 {
+		t.Fatalf("expected 1 audit log entry, got %d", len(mock.auditLogs))
+	}
+	entry := mock.auditLogs[0]
+	if entry.UserID != "u-audit1" {
+		t.Errorf("expected userID u-audit1, got %s", entry.UserID)
+	}
+	if entry.Action != "deletion_requested" {
+		t.Errorf("expected action deletion_requested, got %s", entry.Action)
+	}
+	if entry.IPAddress != "192.168.1.1:12345" {
+		t.Errorf("expected IP 192.168.1.1:12345, got %s", entry.IPAddress)
+	}
+}
+
+func TestCancelAccountDeletion_CreatesAuditLogEntry(t *testing.T) {
+	now := time.Now().UTC()
+	user := &db.User{ID: "u-audit2", Email: "cancel@example.com", DeletionRequestedAt: &now}
+	mock := &auditMockQuery{MockQuery: MockQuery{users: map[string]*db.User{"u-audit2": user}}}
+	h := &api.AccountHandler{Queries: mock, Cfg: config.Default}
+	r := newAccountRouter(h, "u-audit2")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/user/account/cancel-deletion", nil)
+	req.RemoteAddr = "10.0.0.1:54321"
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(mock.auditLogs) != 1 {
+		t.Fatalf("expected 1 audit log entry, got %d", len(mock.auditLogs))
+	}
+	entry := mock.auditLogs[0]
+	if entry.Action != "deletion_cancelled" {
+		t.Errorf("expected action deletion_cancelled, got %s", entry.Action)
+	}
+	if entry.UserID != "u-audit2" {
+		t.Errorf("expected userID u-audit2, got %s", entry.UserID)
+	}
+}
+
+func TestCancelAccountDeletion_RejectsPastReversibleWindow(t *testing.T) {
+	// Set deletion_requested_at to 31 days ago (past the 720-hour / 30-day window)
+	pastDate := time.Now().UTC().Add(-31 * 24 * time.Hour)
+	user := &db.User{ID: "u-audit3", Email: "late@example.com", DeletionRequestedAt: &pastDate}
+	mock := &auditMockQuery{MockQuery: MockQuery{users: map[string]*db.User{"u-audit3": user}}}
+	h := &api.AccountHandler{Queries: mock, Cfg: config.Default}
+	r := newAccountRouter(h, "u-audit3")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/user/account/cancel-deletion", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(mock.auditLogs) != 0 {
+		t.Fatalf("expected no audit log entry for rejected cancellation, got %d", len(mock.auditLogs))
+	}
+	if len(mock.cancelCalls) != 0 {
+		t.Fatalf("expected no CancelAccountDeletion call, got %v", mock.cancelCalls)
+	}
+}
+
+func TestCancelAccountDeletion_RejectsWithoutPendingDeletion(t *testing.T) {
+	user := &db.User{ID: "u-audit4", Email: "nopending@example.com"}
+	mock := &auditMockQuery{MockQuery: MockQuery{users: map[string]*db.User{"u-audit4": user}}}
+	h := &api.AccountHandler{Queries: mock, Cfg: config.Default}
+	r := newAccountRouter(h, "u-audit4")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/user/account/cancel-deletion", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict, got %d: %s", w.Code, w.Body.String())
+	}
+}

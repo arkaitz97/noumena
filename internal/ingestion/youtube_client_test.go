@@ -177,15 +177,234 @@ func TestParseRetryAfterAny(t *testing.T) {
 	}
 }
 
-func TestDeriveLockID_Deterministic(t *testing.T) {
-	id := "00000000-0000-0000-0000-000000000001"
-	a := DeriveLockID(id)
-	b := DeriveLockID(id)
-	if a != b {
-		t.Fatalf("expected stable id, got %d vs %d", a, b)
+func TestYouTubeClient_TopLevelCommentDepth(t *testing.T) {
+	resp := commentThreadsResponse{
+		Items: []commentThreadItem{
+			{
+				ID: "T1",
+				Snippet: struct {
+					TopLevelComment ytComment `json:"topLevelComment"`
+					TotalReplyCount int       `json:"totalReplyCount"`
+				}{
+					TopLevelComment: ytComment{
+						ID: "top-1",
+						Snippet: commentSnippet{
+							AuthorDisplayName: "Alice",
+							TextDisplay:       "top level",
+							PublishedAt:       "2025-01-01T10:00:00Z",
+						},
+					},
+				},
+			},
+		},
 	}
-	c := DeriveLockID("00000000-0000-0000-0000-000000000002")
-	if a == c {
-		t.Fatalf("expected different ids for different uuids")
+	body, _ := json.Marshal(resp)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	c := &YouTubeClient{HTTP: srv.Client(), BaseURL: srv.URL}
+	next := c.ListCommentThreads(context.Background(), "tok", "vid")
+
+	tlc, ok, err := next()
+	if err != nil || !ok {
+		t.Fatalf("first: ok=%v err=%v", ok, err)
+	}
+	if tlc.ReplyDepth != 0 {
+		t.Fatalf("expected reply_depth=0 for top-level, got %d", tlc.ReplyDepth)
+	}
+	if tlc.ParentCommentID != nil {
+		t.Fatalf("expected parent_comment_id=nil for top-level, got %v", tlc.ParentCommentID)
+	}
+}
+
+func TestYouTubeClient_ReplyDepthMapping(t *testing.T) {
+	tlcID := "top-level-comment"
+	resp := commentThreadsResponse{
+		Items: []commentThreadItem{
+			{
+				ID: tlcID,
+				Snippet: struct {
+					TopLevelComment ytComment `json:"topLevelComment"`
+					TotalReplyCount int       `json:"totalReplyCount"`
+				}{
+					TopLevelComment: ytComment{
+						ID: tlcID,
+						Snippet: commentSnippet{
+							AuthorDisplayName: "Alice",
+							TextDisplay:       "top level",
+							PublishedAt:       "2025-01-01T10:00:00Z",
+						},
+					},
+				},
+				Replies: &struct {
+					Comments []ytComment `json:"comments"`
+				}{
+					Comments: []ytComment{
+						{
+							ID: "reply-1",
+							Snippet: commentSnippet{
+								AuthorDisplayName: "Bob",
+								TextDisplay:       "reply to top",
+								PublishedAt:       "2025-01-01T11:00:00Z",
+								ParentID:          tlcID,
+							},
+						},
+						{
+							ID: "reply-2",
+							Snippet: commentSnippet{
+								AuthorDisplayName: "Charlie",
+								TextDisplay:       "reply to reply",
+								PublishedAt:       "2025-01-01T12:00:00Z",
+								ParentID:          "reply-1",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	body, _ := json.Marshal(resp)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	c := &YouTubeClient{HTTP: srv.Client(), BaseURL: srv.URL}
+	next := c.ListCommentThreads(context.Background(), "tok", "vid")
+
+	top, _, _ := next()
+	if top.ReplyDepth != 0 {
+		t.Fatalf("top-level: expected depth=0, got %d", top.ReplyDepth)
+	}
+
+	reply1, _, _ := next()
+	if reply1.ReplyDepth != 1 {
+		t.Fatalf("reply-to-top: expected depth=1, got %d", reply1.ReplyDepth)
+	}
+	if reply1.ParentCommentID == nil || *reply1.ParentCommentID != tlcID {
+		t.Fatalf("reply-to-top: expected parent=%s, got %v", tlcID, reply1.ParentCommentID)
+	}
+
+	reply2, _, _ := next()
+	if reply2.ReplyDepth != 2 {
+		t.Fatalf("reply-to-reply: expected depth=2, got %d", reply2.ReplyDepth)
+	}
+}
+
+func TestYouTubeClient_ListReplies_Pagination(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		switch calls {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"nextPageToken":"P2",
+				"items":[
+					{"id":"r1","snippet":{"authorDisplayName":"A","textDisplay":"reply 1","publishedAt":"2025-01-01T10:00:00Z","parentId":"top"}},
+					{"id":"r2","snippet":{"authorDisplayName":"B","textDisplay":"reply 2","publishedAt":"2025-01-01T11:00:00Z","parentId":"top"}}
+				]}`))
+		case 2:
+			_, _ = w.Write([]byte(`{
+				"items":[
+					{"id":"r3","snippet":{"authorDisplayName":"C","textDisplay":"reply 3","publishedAt":"2025-01-01T12:00:00Z","parentId":"top"}}
+				]}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := &YouTubeClient{HTTP: srv.Client(), BaseURL: srv.URL}
+	next := c.ListReplies(context.Background(), "tok", "top")
+
+	var ids []string
+	for {
+		thread, ok, err := next()
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if !ok {
+			break
+		}
+		ids = append(ids, thread.CommentID)
+	}
+	if got := len(ids); got != 3 {
+		t.Fatalf("expected 3 replies, got %d", got)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 API calls, got %d", calls)
+	}
+}
+
+func TestYouTubeClient_ListReplies_ParentIdExtraction(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"items":[
+				{"id":"r1","snippet":{"authorDisplayName":"A","textDisplay":"reply","publishedAt":"2025-01-01T10:00:00Z","parentId":"parent-123"}}
+			]}`))
+	}))
+	defer srv.Close()
+
+	c := &YouTubeClient{HTTP: srv.Client(), BaseURL: srv.URL}
+	next := c.ListReplies(context.Background(), "tok", "parent-123")
+
+	reply, ok, err := next()
+	if err != nil || !ok {
+		t.Fatalf("unexpected: ok=%v err=%v", ok, err)
+	}
+	if reply.ParentCommentID == nil || *reply.ParentCommentID != "parent-123" {
+		t.Fatalf("expected parent_id=parent-123, got %v", reply.ParentCommentID)
+	}
+}
+
+func TestYouTubeClient_ToDBComment_RoundTrip(t *testing.T) {
+	parentID := "parent-abc"
+	ct := CommentThread{
+		CommentID:       "comment-1",
+		ParentCommentID: &parentID,
+		ReplyDepth:      1,
+		AuthorHandle:    "TestUser",
+		Body:            "test body",
+		PostedAt:        time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC),
+	}
+
+	dbComment := ct.ToDBComment("channel-xyz")
+
+	if dbComment.PlatformCommentID != "comment-1" {
+		t.Fatalf("expected platform_comment_id=comment-1, got %s", dbComment.PlatformCommentID)
+	}
+	if dbComment.ParentCommentID == nil || *dbComment.ParentCommentID != parentID {
+		t.Fatalf("expected parent_comment_id=%s, got %v", parentID, dbComment.ParentCommentID)
+	}
+	if dbComment.ReplyDepth != 1 {
+		t.Fatalf("expected reply_depth=1, got %d", dbComment.ReplyDepth)
+	}
+	if dbComment.AuthorHandle == nil || *dbComment.AuthorHandle != "TestUser" {
+		t.Fatalf("expected author_handle=TestUser, got %v", dbComment.AuthorHandle)
+	}
+	if dbComment.Body != "test body" {
+		t.Fatalf("expected body=test body, got %s", dbComment.Body)
+	}
+}
+
+func TestYouTubeClient_ToDBComment_TopLevel(t *testing.T) {
+	ct := CommentThread{
+		CommentID:       "top-1",
+		ParentCommentID: nil,
+		ReplyDepth:      0,
+		AuthorHandle:    "TopUser",
+		Body:            "top comment",
+		PostedAt:        time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC),
+	}
+
+	dbComment := ct.ToDBComment("channel-xyz")
+
+	if dbComment.ParentCommentID != nil {
+		t.Fatalf("expected parent_comment_id=nil for top-level, got %v", dbComment.ParentCommentID)
+	}
+	if dbComment.ReplyDepth != 0 {
+		t.Fatalf("expected reply_depth=0 for top-level, got %d", dbComment.ReplyDepth)
 	}
 }

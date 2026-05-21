@@ -22,8 +22,7 @@ function defaultFilters(): FeedFilters {
   return {
     channels: [],
     categories: [...HIGH_SIGNAL_CATEGORIES],
-    sentiment_min: -1,
-    sentiment_max: 1,
+    insight_type: null,
     date_from: null,
     date_to: null,
     search: '',

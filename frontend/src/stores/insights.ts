@@ -1,4 +1,4 @@
-// useInsightsStore — sentiment, toxicity, trends, latest digest. Caches
+// useInsightsStore — toxicity, trends, actionable insights, latest digest. Caches
 // per-`channelId` (with the special key '__all__' for "no channel filter")
 // for 5 minutes so the chart's window toggle and the polling tick don't
 // re-fetch unnecessarily.
@@ -8,7 +8,7 @@ import { defineStore } from 'pinia'
 import * as insightsApi from '../services/insights'
 import { toast } from '../lib/toast'
 import type {
-  SentimentResponse,
+  InsightAggregatesResponse,
   ToxicityResponse,
   TrendsResponse,
   WeeklyDigest,
@@ -33,38 +33,37 @@ function fresh<T>(entry: CacheEntry<T> | undefined): T | null {
 }
 
 export const useInsightsStore = defineStore('insights', () => {
-  const sentimentByKey = ref<Record<string, CacheEntry<SentimentResponse>>>({})
+  const insightsByKey = ref<Record<string, CacheEntry<InsightAggregatesResponse>>>({})
   const toxicityByKey = ref<Record<string, CacheEntry<ToxicityResponse>>>({})
   const trendsByKey = ref<Record<string, CacheEntry<TrendsResponse>>>({})
   const latestDigest = ref<WeeklyDigest | null>(null)
   const digestFetchedAt = ref<number>(0)
   const loadingDigest = ref(false)
 
-  // Most-recently-fetched values (convenience getters for views).
-  const sentiment = ref<SentimentResponse | null>(null)
+  const actionableInsights = ref<InsightAggregatesResponse | null>(null)
   const toxicity = ref<ToxicityResponse | null>(null)
   const trends = ref<TrendsResponse | null>(null)
 
-  async function fetchSentiment(
+  async function fetchActionableInsights(
     channelId?: string,
     windowKey: WindowKey = '7d',
     opts: { force?: boolean } = {},
-  ): Promise<SentimentResponse | null> {
+  ): Promise<InsightAggregatesResponse | null> {
     const key = cacheKey(channelId, windowKey)
     if (!opts.force) {
-      const hit = fresh(sentimentByKey.value[key])
+      const hit = fresh(insightsByKey.value[key])
       if (hit) {
-        sentiment.value = hit
+        actionableInsights.value = hit
         return hit
       }
     }
     try {
-      const res = await insightsApi.sentiment(channelId, windowKey)
-      sentimentByKey.value[key] = { fetchedAt: Date.now(), value: res }
-      sentiment.value = res
+      const res = await insightsApi.actionableInsights(channelId, windowKey)
+      insightsByKey.value[key] = { fetchedAt: Date.now(), value: res }
+      actionableInsights.value = res
       return res
     } catch {
-      return sentiment.value
+      return actionableInsights.value
     }
   }
 
@@ -129,12 +128,12 @@ export const useInsightsStore = defineStore('insights', () => {
   }
 
   return {
-    sentiment,
+    actionableInsights,
     toxicity,
     trends,
     latestDigest,
     loadingDigest,
-    fetchSentiment,
+    fetchActionableInsights,
     fetchToxicity,
     fetchTrends,
     fetchLatestDigest,

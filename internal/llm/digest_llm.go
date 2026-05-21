@@ -8,13 +8,6 @@ import (
 	"time"
 )
 
-// DigestLLMClient is the narrow interface the digest worker depends on. The
-// production implementation is `*Client` (digest_client.go); tests use a
-// fake that satisfies this signature without hitting the network.
-type DigestLLMClient interface {
-	GenerateDigestRaw(ctx context.Context, prompt string) (string, error)
-}
-
 // digestCallTimeout is the per-call context timeout (Spec 06: per-call
 // timeout 90s). Applied via context.WithTimeout in CallDigestLLM regardless
 // of the parent context's deadline so a slow LLM cannot hold the worker.
@@ -30,10 +23,10 @@ const digestSampleLimit = 30
 // into the LLM-facing string. Keeping the inputs as a struct (rather than
 // passing 10 args) makes unit tests for the prompt builder readable.
 type DigestPromptInputs struct {
-	Aggregates      DigestContent
-	TopTopics       []TopicAgg
-	CategoryCounts  map[string]int
-	SampleComments  []string
+	Aggregates     DigestContent
+	TopTopics      []TopicAgg
+	CategoryCounts map[string]int
+	SampleComments []string
 }
 
 // BuildDigestPrompt produces the LLM prompt described in Spec 06. Numeric
@@ -46,15 +39,16 @@ func BuildDigestPrompt(in DigestPromptInputs) string {
 	b.WriteString("GROUND TRUTH (computed by the application — do NOT recalculate; ECHO these values verbatim in your response):\n")
 	fmt.Fprintf(&b, "  total_comments_analyzed: %d\n", in.Aggregates.TotalCommentsAnalyzed)
 	fmt.Fprintf(&b, "  filtered_comments: %d\n", in.Aggregates.FilteredComments)
-	fmt.Fprintf(&b, "  sentiment_trend: current_avg=%.3f change_pct=%.2f direction=%q\n",
-		in.Aggregates.SentimentTrend.CurrentAvg,
-		in.Aggregates.SentimentTrend.ChangePct,
-		in.Aggregates.SentimentTrend.Direction)
 	fmt.Fprintf(&b, "  engagement_health_score: %d\n", in.Aggregates.EngagementHealthScore)
-	fmt.Fprintf(&b, "  health_score_breakdown: response_rate=%d sentiment_quality=%d engagement_depth=%d\n",
+	fmt.Fprintf(&b, "  health_score_breakdown: response_rate=%d engagement_depth=%d\n",
 		in.Aggregates.HealthScoreBreakdown.ResponseRate,
-		in.Aggregates.HealthScoreBreakdown.SentimentQuality,
 		in.Aggregates.HealthScoreBreakdown.EngagementDepth)
+	if len(in.Aggregates.TopActionableInsights) > 0 {
+		b.WriteString("  top_actionable_insights:\n")
+		for _, ins := range in.Aggregates.TopActionableInsights {
+			fmt.Fprintf(&b, "    - [%s] %s (count: %d)\n", ins.Type, ins.Description, ins.Count)
+		}
+	}
 
 	if len(in.TopTopics) > 0 {
 		b.WriteString("  top_topics:\n")
@@ -82,9 +76,9 @@ TASK: Produce a JSON object with EXACTLY this shape:
 {
   "top_ideas": [{"idea": "...", "evidence": "...", "sample_comments": ["...","..."]}],
   "top_questions": [{"question": "...", "count": <int>=1, "unanswered": <bool>}],
-  "sentiment_trend": {"current_avg": <number>, "change_pct": <number>, "direction": "improving|stable|declining"},
+  "top_actionable_insights": [{"type": "video_idea", "description": "...", "count": <int>}],
   "engagement_health_score": <int 0-100>,
-  "health_score_breakdown": {"response_rate": <int 0-100>, "sentiment_quality": <int 0-100>, "engagement_depth": <int 0-100>},
+  "health_score_breakdown": {"response_rate": <int 0-100>, "engagement_depth": <int 0-100>},
   "total_comments_analyzed": <int>,
   "filtered_comments": <int>
 }
@@ -92,18 +86,19 @@ TASK: Produce a JSON object with EXACTLY this shape:
 RULES:
 - top_ideas: at most 5 entries; each must have non-empty idea + evidence; sample_comments quotes drawn from the SAMPLE COMMENTS section above.
 - top_questions: at most 5 entries; count >= 1; unanswered is your best estimate.
-- sentiment_trend, engagement_health_score, health_score_breakdown, totals: ECHO the GROUND TRUTH values exactly.
+- top_actionable_insights: at most 5 entries; type must be one of: video_idea, editing_tip, feature_request, collaboration_ask, improvement_suggestion, content_format_request, other.
+- engagement_health_score, health_score_breakdown, totals: ECHO the GROUND TRUTH values exactly.
 - Return ONLY the JSON object. No markdown fences, no prose before or after.
 `)
 	return b.String()
 }
 
-// CallDigestLLM invokes the underlying LLM client with a 90-second timeout,
+// CallDigestLLM invokes the OpenCode client with a 90-second timeout,
 // parses the JSON response, validates required fields, truncates top_ideas /
 // top_questions to 5 entries, and authoritatively overwrites the numeric
 // fields with the application-computed values from `truth`. On any error
 // the digest is treated as a failed attempt by the caller's retry loop.
-func CallDigestLLM(ctx context.Context, client DigestLLMClient, prompt string, truth DigestContent) (DigestContent, error) {
+func CallDigestLLM(ctx context.Context, client *opencodeClient, prompt string, truth DigestContent) (DigestContent, error) {
 	cctx, cancel := context.WithTimeout(ctx, digestCallTimeout)
 	defer cancel()
 
@@ -128,7 +123,7 @@ func CallDigestLLM(ctx context.Context, client DigestLLMClient, prompt string, t
 	// Authoritatively overwrite numeric ground truth (Spec 06: numeric fields
 	// authoritative over LLM output). The LLM-supplied numbers are advisory
 	// only; we never trust them for persistence.
-	parsed.SentimentTrend = truth.SentimentTrend
+	parsed.TopActionableInsights = truth.TopActionableInsights
 	parsed.EngagementHealthScore = truth.EngagementHealthScore
 	parsed.HealthScoreBreakdown = truth.HealthScoreBreakdown
 	parsed.TotalCommentsAnalyzed = truth.TotalCommentsAnalyzed

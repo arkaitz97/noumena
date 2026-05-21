@@ -15,7 +15,7 @@ const faqs = [
   },
   {
     question: "How fast will I see results?",
-    answer: "You'll get your first batch of insights and sentiment analysis within 30 minutes of connecting your channel."
+    answer: "You'll get your first batch of actionable insights within 30 minutes of connecting your channel."
   },
   {
     question: "Is my channel data secure?",
@@ -162,7 +162,7 @@ const toggleFaq = (index: number) => {
                    </div>
                    <div>
                       <h4 class="font-bold text-zinc-900">Outcome 1: Move Faster</h4>
-                      <p class="text-sm text-zinc-500 mt-1">Get instant sentiment analysis and categorization instead of spending hours reading manually.</p>
+                       <p class="text-sm text-zinc-500 mt-1">Get instant insight extraction and categorization instead of spending hours reading manually.</p>
                    </div>
                 </div>
                 <div class="flex items-start gap-4 pb-6 border-b border-zinc-100">
@@ -209,7 +209,7 @@ const toggleFaq = (index: number) => {
             <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z"></path></svg>
           </div>
           <h3 class="text-xl font-bold text-zinc-900 mb-2 tracking-tight">AI does the Heavy Lifting</h3>
-          <p class="text-sm text-zinc-500 leading-relaxed">Our LLM engine categorizes sentiment, answers, and extracts questions so you don't have to read them manually.</p>
+          <p class="text-sm text-zinc-500 leading-relaxed">Our LLM engine categorizes comments, extracts actionable insights, and surfaces questions so you don't have to read them manually.</p>
         </div>
 
         <div class="bg-white shadow-sm ring-1 ring-zinc-950/5 rounded-2xl p-8 hover:shadow-md transition-shadow duration-300 group">
@@ -217,7 +217,7 @@ const toggleFaq = (index: number) => {
             <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
           </div>
           <h3 class="text-xl font-bold text-zinc-900 mb-2 tracking-tight">Act on Real Insights</h3>
-          <p class="text-sm text-zinc-500 leading-relaxed">Visualize your audience's sentiment over time, get weekly digest emails, and discover common themes instantly.</p>
+          <p class="text-sm text-zinc-500 leading-relaxed">Track actionable insight trends, get weekly digest emails, and discover common themes instantly.</p>
         </div>
       </div>
     </section>

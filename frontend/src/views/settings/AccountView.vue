@@ -251,7 +251,7 @@ onBeforeUnmount(() => {
             <span class="flex-1">
               <span class="block text-sm font-medium text-zinc-900">Weekly digest email</span>
               <span class="block text-xs text-zinc-500 mt-0.5">
-                Get a Monday summary of your top ideas, questions, and sentiment trend.
+                Get a Monday summary of your top ideas, questions, and actionable insights.
               </span>
               <span
                 v-if="!account.supportsDigestOptIn"

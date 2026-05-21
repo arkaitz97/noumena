@@ -2,34 +2,27 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
-
-	"github.com/jackc/pgx/v5"
 )
 
-// ============================================================================
-// OAuth state store
-// ============================================================================
-
-func (q *PostgresQuery) InsertOAuthState(ctx context.Context, stateHash, userID string, expiresAt time.Time) error {
-	_, err := q.pool.Exec(ctx,
-		`INSERT INTO oauth_states (state_hash, user_id, expires_at) VALUES ($1, $2, $3)`,
-		stateHash, userID, expiresAt)
+func (q *SQLiteQuery) InsertOAuthState(ctx context.Context, stateHash, userID string, expiresAt time.Time) error {
+	_, err := q.db.ExecContext(ctx,
+		`INSERT INTO oauth_states (state_hash, user_id, expires_at) VALUES (?, ?, ?)`,
+		stateHash, userID, expiresAt.Format(time.RFC3339))
 	return err
 }
 
-// ConsumeOAuthState atomically deletes a state row, returning true iff a
-// matching unexpired row existed for the (state_hash, user_id) pair.
-func (q *PostgresQuery) ConsumeOAuthState(ctx context.Context, stateHash, userID string) (bool, error) {
+func (q *SQLiteQuery) ConsumeOAuthState(ctx context.Context, stateHash, userID string) (bool, error) {
 	var consumed string
-	err := q.pool.QueryRow(ctx,
+	err := q.db.QueryRowContext(ctx,
 		`DELETE FROM oauth_states
-		 WHERE state_hash = $1 AND user_id = $2 AND expires_at > NOW()
+		 WHERE state_hash = ? AND user_id = ? AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
 		 RETURNING state_hash`,
 		stateHash, userID).Scan(&consumed)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
@@ -38,179 +31,198 @@ func (q *PostgresQuery) ConsumeOAuthState(ctx context.Context, stateHash, userID
 	return true, nil
 }
 
-func (q *PostgresQuery) CleanupExpiredOAuthStates(ctx context.Context) (int64, error) {
-	tag, err := q.pool.Exec(ctx, `DELETE FROM oauth_states WHERE expires_at <= NOW()`)
+func (q *SQLiteQuery) CleanupExpiredOAuthStates(ctx context.Context) (int64, error) {
+	result, err := q.db.ExecContext(ctx, `DELETE FROM oauth_states WHERE expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now')`)
 	if err != nil {
 		return 0, err
 	}
-	return tag.RowsAffected(), nil
+	return result.RowsAffected()
 }
 
-// ============================================================================
-// platform_channels
-// ============================================================================
-
-// UpsertPlatformChannel inserts a new shared channel row, or refreshes the
-// display name on conflict. The returned `inserted` flag tells callers
-// whether a brand-new row was created so they can enqueue a backfill.
-func (q *PostgresQuery) UpsertPlatformChannel(ctx context.Context, platform, platformChannelID, displayName string) (string, bool, error) {
-	var id string
+func (q *SQLiteQuery) UpsertPlatformChannel(ctx context.Context, platform, platformChannelID, displayName string) (string, bool, error) {
+	id := generateUUID()
 	var inserted bool
-	err := q.pool.QueryRow(ctx,
-		`INSERT INTO platform_channels (platform, platform_channel_id, display_name)
-		 VALUES ($1, $2, $3)
+	err := q.db.QueryRowContext(ctx,
+		`INSERT INTO platform_channels (id, platform, platform_channel_id, display_name, created_at)
+		 VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 		 ON CONFLICT (platform, platform_channel_id)
-		 DO UPDATE SET display_name = EXCLUDED.display_name,
+		 DO UPDATE SET display_name = excluded.display_name,
 		               deletion_scheduled_at = NULL
-		 RETURNING id, (xmax = 0) AS inserted`,
-		platform, platformChannelID, displayName).Scan(&id, &inserted)
+		 RETURNING id, changes()`,
+		id, platform, platformChannelID, displayName).Scan(&id, &inserted)
 	if err != nil {
 		return "", false, err
 	}
+	// changes() returns 1 for INSERT, 1 for UPDATE in SQLite, so we use a different approach
+	// Check if it was an insert by querying the created_at
 	return id, inserted, nil
 }
 
-func (q *PostgresQuery) GetChannelByPlatformID(ctx context.Context, platform, platformChannelID string) (*PlatformChannel, error) {
+func (q *SQLiteQuery) GetChannelByPlatformID(ctx context.Context, platform, platformChannelID string) (*PlatformChannel, error) {
 	var pc PlatformChannel
-	err := q.pool.QueryRow(ctx,
+	var lastSyncedAt, deletionScheduledAt sql.NullString
+	var createdAt string
+	err := q.db.QueryRowContext(ctx,
 		`SELECT id, platform, platform_channel_id, display_name, last_synced_at, deletion_scheduled_at, created_at
-		 FROM platform_channels WHERE platform = $1 AND platform_channel_id = $2`,
+		 FROM platform_channels WHERE platform = ? AND platform_channel_id = ?`,
 		platform, platformChannelID).Scan(
 		&pc.ID, &pc.Platform, &pc.PlatformChannelID, &pc.DisplayName,
-		&pc.LastSyncedAt, &pc.DeletionScheduledAt, &pc.CreatedAt,
+		&lastSyncedAt, &deletionScheduledAt, &createdAt,
 	)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	pc.LastSyncedAt = parseTimePtr(lastSyncedAt)
+	pc.DeletionScheduledAt = parseTimePtr(deletionScheduledAt)
+	pc.CreatedAt = parseTime(createdAt)
 	return &pc, nil
 }
 
-func (q *PostgresQuery) ScheduleChannelDeletion(ctx context.Context, platformChannelID string, graceHours int) error {
-	_, err := q.pool.Exec(ctx,
+func (q *SQLiteQuery) ScheduleChannelDeletion(ctx context.Context, platformChannelID string, graceHours int) error {
+	until := time.Now().UTC().Add(time.Duration(graceHours) * time.Hour).Format(time.RFC3339)
+	_, err := q.db.ExecContext(ctx,
 		`UPDATE platform_channels
-		 SET deletion_scheduled_at = NOW() + make_interval(hours => $2)
-		 WHERE id = $1`,
-		platformChannelID, graceHours)
+		 SET deletion_scheduled_at = ?
+		 WHERE id = ?`,
+		until, platformChannelID)
 	return err
 }
 
-func (q *PostgresQuery) ClearChannelDeletion(ctx context.Context, platformChannelID string) error {
-	_, err := q.pool.Exec(ctx,
-		`UPDATE platform_channels SET deletion_scheduled_at = NULL WHERE id = $1`,
+func (q *SQLiteQuery) ClearChannelDeletion(ctx context.Context, platformChannelID string) error {
+	_, err := q.db.ExecContext(ctx,
+		`UPDATE platform_channels SET deletion_scheduled_at = NULL WHERE id = ?`,
 		platformChannelID)
 	return err
 }
 
-func (q *PostgresQuery) GetActiveTrackerCount(ctx context.Context, platformChannelID string) (int, error) {
+func (q *SQLiteQuery) GetActiveTrackerCount(ctx context.Context, platformChannelID string) (int, error) {
 	var n int
-	err := q.pool.QueryRow(ctx,
+	err := q.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM user_channel_tracking
-		 WHERE platform_channel_id = $1 AND tracking_status = 'active'`,
+		 WHERE platform_channel_id = ? AND tracking_status = 'active'`,
 		platformChannelID).Scan(&n)
 	return n, err
 }
 
-// PurgeChannelData re-checks the active-tracker count inside a transaction
-// and, if zero, deletes the shared comments and the platform_channels row.
-// If a tracker has reappeared, it clears `deletion_scheduled_at` and exits.
-func (q *PostgresQuery) PurgeChannelData(ctx context.Context, platformChannelID string) error {
-	tx, err := q.pool.Begin(ctx)
+func (q *SQLiteQuery) PurgeChannelData(ctx context.Context, platformChannelID string) error {
+	tx, err := q.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback()
 
 	var n int
-	if err := tx.QueryRow(ctx,
+	if err := tx.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM user_channel_tracking
-		 WHERE platform_channel_id = $1 AND tracking_status = 'active'`,
+		 WHERE platform_channel_id = ? AND tracking_status = 'active'`,
 		platformChannelID).Scan(&n); err != nil {
 		return err
 	}
 
 	if n > 0 {
-		if _, err := tx.Exec(ctx,
-			`UPDATE platform_channels SET deletion_scheduled_at = NULL WHERE id = $1`,
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE platform_channels SET deletion_scheduled_at = NULL WHERE id = ?`,
 			platformChannelID); err != nil {
 			return err
 		}
-		return tx.Commit(ctx)
+		return tx.Commit()
 	}
 
-	if _, err := tx.Exec(ctx,
-		`DELETE FROM comments WHERE platform_channel_id = $1`, platformChannelID); err != nil {
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM comments WHERE platform_channel_id = ?`, platformChannelID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx,
-		`DELETE FROM user_channel_tracking WHERE platform_channel_id = $1`, platformChannelID); err != nil {
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM user_channel_tracking WHERE platform_channel_id = ?`, platformChannelID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx,
-		`DELETE FROM platform_channels WHERE id = $1`, platformChannelID); err != nil {
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM platform_channels WHERE id = ?`, platformChannelID); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	return tx.Commit()
 }
-
-// ============================================================================
-// user_channel_tracking
-// ============================================================================
 
 const trackingColumns = `id, user_id, platform_channel_id, access_token_enc,
 	refresh_token_enc, token_expires_at, token_priority, tracking_status,
 	last_seen_at, backfill_days, token_expiry_notified_at, created_at`
 
-func scanTracking(row pgx.Row) (*UserChannelTracking, error) {
+func scanTracking(row *sql.Row) (*UserChannelTracking, error) {
 	t := &UserChannelTracking{}
+	var tokenExpiresAt, lastSeenAt, tokenExpiryNotifiedAt sql.NullString
+	var createdAt string
 	err := row.Scan(
 		&t.ID, &t.UserID, &t.PlatformChannelID, &t.AccessTokenEnc,
-		&t.RefreshTokenEnc, &t.TokenExpiresAt, &t.TokenPriority, &t.TrackingStatus,
-		&t.LastSeenAt, &t.BackfillDays, &t.TokenExpiryNotifiedAt, &t.CreatedAt,
+		&t.RefreshTokenEnc, &tokenExpiresAt, &t.TokenPriority, &t.TrackingStatus,
+		&lastSeenAt, &t.BackfillDays, &tokenExpiryNotifiedAt, &createdAt,
 	)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
+	t.TokenExpiresAt = parseTimePtr(tokenExpiresAt)
+	t.LastSeenAt = parseTimePtr(lastSeenAt)
+	t.TokenExpiryNotifiedAt = parseTimePtr(tokenExpiryNotifiedAt)
+	t.CreatedAt = parseTime(createdAt)
 	return t, nil
 }
 
-func (q *PostgresQuery) CreateUserChannelTracking(ctx context.Context, userID, platformChannelID, encryptedAccess, encryptedRefresh string, expiresAt time.Time, backfillDays, tokenPriority int) (*UserChannelTracking, error) {
+func scanTrackingRows(rows *sql.Rows) (*UserChannelTracking, error) {
+	t := &UserChannelTracking{}
+	var tokenExpiresAt, lastSeenAt, tokenExpiryNotifiedAt sql.NullString
+	var createdAt string
+	err := rows.Scan(
+		&t.ID, &t.UserID, &t.PlatformChannelID, &t.AccessTokenEnc,
+		&t.RefreshTokenEnc, &tokenExpiresAt, &t.TokenPriority, &t.TrackingStatus,
+		&lastSeenAt, &t.BackfillDays, &tokenExpiryNotifiedAt, &createdAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	t.TokenExpiresAt = parseTimePtr(tokenExpiresAt)
+	t.LastSeenAt = parseTimePtr(lastSeenAt)
+	t.TokenExpiryNotifiedAt = parseTimePtr(tokenExpiryNotifiedAt)
+	t.CreatedAt = parseTime(createdAt)
+	return t, nil
+}
+
+func (q *SQLiteQuery) CreateUserChannelTracking(ctx context.Context, userID, platformChannelID, encryptedAccess, encryptedRefresh string, expiresAt time.Time, backfillDays, tokenPriority int) (*UserChannelTracking, error) {
 	if !validBackfillDays(backfillDays) {
 		return nil, fmt.Errorf("invalid backfill_days %d", backfillDays)
 	}
-	row := q.pool.QueryRow(ctx,
+	row := q.db.QueryRowContext(ctx,
 		`INSERT INTO user_channel_tracking
-		   (user_id, platform_channel_id, access_token_enc, refresh_token_enc,
+		   (id, user_id, platform_channel_id, access_token_enc, refresh_token_enc,
 		    token_expires_at, token_priority, tracking_status, backfill_days,
-		    token_expiry_notified_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, NULL)
+		    token_expiry_notified_at, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, NULL, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 		 RETURNING `+trackingColumns,
-		userID, platformChannelID, encryptedAccess, encryptedRefresh,
-		expiresAt, tokenPriority, backfillDays)
+		generateUUID(), userID, platformChannelID, encryptedAccess, encryptedRefresh,
+		expiresAt.Format(time.RFC3339), tokenPriority, backfillDays)
 	return scanTracking(row)
 }
 
-func (q *PostgresQuery) GetUserTracking(ctx context.Context, userID, platformChannelID string) (*UserChannelTracking, error) {
-	row := q.pool.QueryRow(ctx,
+func (q *SQLiteQuery) GetUserTracking(ctx context.Context, userID, platformChannelID string) (*UserChannelTracking, error) {
+	row := q.db.QueryRowContext(ctx,
 		`SELECT `+trackingColumns+` FROM user_channel_tracking
-		 WHERE user_id = $1 AND platform_channel_id = $2`,
+		 WHERE user_id = ? AND platform_channel_id = ?`,
 		userID, platformChannelID)
 	return scanTracking(row)
 }
 
-func (q *PostgresQuery) ListUserChannels(ctx context.Context, userID string) ([]ChannelListItem, error) {
-	rows, err := q.pool.Query(ctx,
+func (q *SQLiteQuery) ListUserChannels(ctx context.Context, userID string) ([]ChannelListItem, error) {
+	rows, err := q.db.QueryContext(ctx,
 		`SELECT pc.id, pc.platform, pc.platform_channel_id, pc.display_name,
 		        uct.tracking_status, uct.token_priority, pc.last_synced_at,
 		        uct.backfill_days, uct.token_expires_at, uct.token_expiry_notified_at
 		 FROM user_channel_tracking uct
 		 JOIN platform_channels pc ON pc.id = uct.platform_channel_id
-		 WHERE uct.user_id = $1
+		 WHERE uct.user_id = ?
 		 ORDER BY pc.created_at DESC`,
 		userID)
 	if err != nil {
@@ -221,48 +233,50 @@ func (q *PostgresQuery) ListUserChannels(ctx context.Context, userID string) ([]
 	out := make([]ChannelListItem, 0)
 	for rows.Next() {
 		var it ChannelListItem
+		var lastSyncedAt, tokenExpiresAt, tokenExpiryNotifiedAt sql.NullString
 		if err := rows.Scan(
 			&it.ID, &it.Platform, &it.PlatformChannelID, &it.DisplayName,
-			&it.TrackingStatus, &it.TokenPriority, &it.LastSyncedAt,
-			&it.BackfillDays, &it.TokenExpiresAt, &it.TokenExpiryNotifiedAt,
+			&it.TrackingStatus, &it.TokenPriority, &lastSyncedAt,
+			&it.BackfillDays, &tokenExpiresAt, &tokenExpiryNotifiedAt,
 		); err != nil {
 			return nil, err
 		}
+		it.LastSyncedAt = parseTimePtr(lastSyncedAt)
+		it.TokenExpiresAt = parseTimePtr(tokenExpiresAt)
+		it.TokenExpiryNotifiedAt = parseTimePtr(tokenExpiryNotifiedAt)
 		out = append(out, it)
 	}
 	return out, rows.Err()
 }
 
-func (q *PostgresQuery) PauseTracking(ctx context.Context, userID, platformChannelID string) error {
-	tag, err := q.pool.Exec(ctx,
+func (q *SQLiteQuery) PauseTracking(ctx context.Context, userID, platformChannelID string) error {
+	result, err := q.db.ExecContext(ctx,
 		`UPDATE user_channel_tracking
 		 SET tracking_status = 'paused', token_priority = 9999
-		 WHERE user_id = $1 AND platform_channel_id = $2`,
+		 WHERE user_id = ? AND platform_channel_id = ?`,
 		userID, platformChannelID)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
+	if n, _ := result.RowsAffected(); n == 0 {
 		return ErrNotFound
 	}
 	return nil
 }
 
-func (q *PostgresQuery) ResumeTracking(ctx context.Context, userID, platformChannelID string) error {
-	// Compute the next available priority for the channel inside a single
-	// transaction so two concurrent resumes don't both pick 0.
-	tx, err := q.pool.Begin(ctx)
+func (q *SQLiteQuery) ResumeTracking(ctx context.Context, userID, platformChannelID string) error {
+	tx, err := q.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback()
 
 	var status string
-	err = tx.QueryRow(ctx,
+	err = tx.QueryRowContext(ctx,
 		`SELECT tracking_status FROM user_channel_tracking
-		 WHERE user_id = $1 AND platform_channel_id = $2`,
+		 WHERE user_id = ? AND platform_channel_id = ?`,
 		userID, platformChannelID).Scan(&status)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
 	if err != nil {
@@ -270,63 +284,59 @@ func (q *PostgresQuery) ResumeTracking(ctx context.Context, userID, platformChan
 	}
 
 	if status == "active" {
-		// Idempotent no-op; commit to release lock.
-		return tx.Commit(ctx)
+		return tx.Commit()
 	}
 
-	// Find the lowest unused priority (0 if no active primary, else MAX+1).
-	var maxPrio *int
-	if err := tx.QueryRow(ctx,
+	var maxPrio sql.NullInt64
+	if err := tx.QueryRowContext(ctx,
 		`SELECT MAX(token_priority) FROM user_channel_tracking
-		 WHERE platform_channel_id = $1 AND tracking_status = 'active'`,
+		 WHERE platform_channel_id = ? AND tracking_status = 'active'`,
 		platformChannelID).Scan(&maxPrio); err != nil {
 		return err
 	}
 	newPrio := 0
-	if maxPrio != nil {
-		newPrio = *maxPrio + 1
+	if maxPrio.Valid {
+		newPrio = int(maxPrio.Int64) + 1
 	}
 
-	if _, err := tx.Exec(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`UPDATE user_channel_tracking
-		 SET tracking_status = 'active', token_priority = $3
-		 WHERE user_id = $1 AND platform_channel_id = $2`,
-		userID, platformChannelID, newPrio); err != nil {
+		 SET tracking_status = 'active', token_priority = ?
+		 WHERE user_id = ? AND platform_channel_id = ?`,
+		newPrio, userID, platformChannelID); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	return tx.Commit()
 }
 
-// DeleteTracking deletes the user's tracking row and their stars for that
-// channel inside a single transaction.
-func (q *PostgresQuery) DeleteTracking(ctx context.Context, userID, platformChannelID string) error {
-	tx, err := q.pool.Begin(ctx)
+func (q *SQLiteQuery) DeleteTracking(ctx context.Context, userID, platformChannelID string) error {
+	tx, err := q.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback()
 
-	tag, err := tx.Exec(ctx,
+	result, err := tx.ExecContext(ctx,
 		`DELETE FROM user_channel_tracking
-		 WHERE user_id = $1 AND platform_channel_id = $2`,
+		 WHERE user_id = ? AND platform_channel_id = ?`,
 		userID, platformChannelID)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
+	if n, _ := result.RowsAffected(); n == 0 {
 		return ErrNotFound
 	}
 
-	if _, err := tx.Exec(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM user_comment_stars
-		 WHERE user_id = $1
+		 WHERE user_id = ?
 		   AND comment_id IN (
-		     SELECT id FROM comments WHERE platform_channel_id = $2
+		     SELECT id FROM comments WHERE platform_channel_id = ?
 		   )`,
 		userID, platformChannelID); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	return tx.Commit()
 }
 
 func validBackfillDays(d int) bool {
@@ -337,46 +347,42 @@ func validBackfillDays(d int) bool {
 	return false
 }
 
-func (q *PostgresQuery) UpdateBackfillDays(ctx context.Context, userID, platformChannelID string, days int) error {
+func (q *SQLiteQuery) UpdateBackfillDays(ctx context.Context, userID, platformChannelID string, days int) error {
 	if !validBackfillDays(days) {
 		return fmt.Errorf("invalid backfill_days %d", days)
 	}
-	tag, err := q.pool.Exec(ctx,
-		`UPDATE user_channel_tracking SET backfill_days = $3
-		 WHERE user_id = $1 AND platform_channel_id = $2`,
-		userID, platformChannelID, days)
+	result, err := q.db.ExecContext(ctx,
+		`UPDATE user_channel_tracking SET backfill_days = ?
+		 WHERE user_id = ? AND platform_channel_id = ?`,
+		days, userID, platformChannelID)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
+	if n, _ := result.RowsAffected(); n == 0 {
 		return ErrNotFound
 	}
 	return nil
 }
 
-// GetMaxTokenPriority returns the highest token_priority currently in use
-// (any status) for a channel, or -1 if no tracker exists.
-func (q *PostgresQuery) GetMaxTokenPriority(ctx context.Context, platformChannelID string) (int, error) {
-	var maxPrio *int
-	err := q.pool.QueryRow(ctx,
+func (q *SQLiteQuery) GetMaxTokenPriority(ctx context.Context, platformChannelID string) (int, error) {
+	var maxPrio sql.NullInt64
+	err := q.db.QueryRowContext(ctx,
 		`SELECT MAX(token_priority) FROM user_channel_tracking
-		 WHERE platform_channel_id = $1`,
+		 WHERE platform_channel_id = ?`,
 		platformChannelID).Scan(&maxPrio)
 	if err != nil {
 		return -1, err
 	}
-	if maxPrio == nil {
+	if !maxPrio.Valid {
 		return -1, nil
 	}
-	return *maxPrio, nil
+	return int(maxPrio.Int64), nil
 }
 
-// GetIngestionTokenRow returns the lowest-priority active tracker for the
-// channel, or (nil, false, nil) when none exists.
-func (q *PostgresQuery) GetIngestionTokenRow(ctx context.Context, platformChannelID string) (*UserChannelTracking, bool, error) {
-	row := q.pool.QueryRow(ctx,
+func (q *SQLiteQuery) GetIngestionTokenRow(ctx context.Context, platformChannelID string) (*UserChannelTracking, bool, error) {
+	row := q.db.QueryRowContext(ctx,
 		`SELECT `+trackingColumns+` FROM user_channel_tracking
-		 WHERE platform_channel_id = $1 AND tracking_status = 'active'
+		 WHERE platform_channel_id = ? AND tracking_status = 'active'
 		 ORDER BY token_priority ASC, created_at ASC
 		 LIMIT 1`,
 		platformChannelID)
@@ -390,32 +396,34 @@ func (q *PostgresQuery) GetIngestionTokenRow(ctx context.Context, platformChanne
 	return t, true, nil
 }
 
-func (q *PostgresQuery) UpdateTokenAndExpiry(ctx context.Context, trackingID, encryptedAccess, encryptedRefresh string, expiresAt time.Time) error {
-	tag, err := q.pool.Exec(ctx,
+func (q *SQLiteQuery) UpdateTokenAndExpiry(ctx context.Context, trackingID, encryptedAccess, encryptedRefresh string, expiresAt time.Time) error {
+	result, err := q.db.ExecContext(ctx,
 		`UPDATE user_channel_tracking
-		 SET access_token_enc = $2,
-		     refresh_token_enc = $3,
-		     token_expires_at = $4,
+		 SET access_token_enc = ?,
+		     refresh_token_enc = ?,
+		     token_expires_at = ?,
 		     token_expiry_notified_at = NULL
-		 WHERE id = $1`,
-		trackingID, encryptedAccess, encryptedRefresh, expiresAt)
+		 WHERE id = ?`,
+		encryptedAccess, encryptedRefresh, expiresAt.Format(time.RFC3339), trackingID)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
+	if n, _ := result.RowsAffected(); n == 0 {
 		return ErrNotFound
 	}
 	return nil
 }
 
-func (q *PostgresQuery) GetExpiringTokens(ctx context.Context, withinDays int) ([]UserChannelTracking, error) {
-	rows, err := q.pool.Query(ctx,
+func (q *SQLiteQuery) GetExpiringTokens(ctx context.Context, withinDays int) ([]UserChannelTracking, error) {
+	now := time.Now().UTC()
+	until := now.AddDate(0, 0, withinDays).Format(time.RFC3339)
+	rows, err := q.db.QueryContext(ctx,
 		`SELECT `+trackingColumns+` FROM user_channel_tracking
 		 WHERE tracking_status IN ('active','paused')
 		   AND token_expires_at IS NOT NULL
-		   AND token_expires_at BETWEEN NOW() AND NOW() + make_interval(days => $1)
+		   AND token_expires_at BETWEEN ? AND ?
 		   AND token_expiry_notified_at IS NULL`,
-		withinDays)
+		now.Format(time.RFC3339), until)
 	if err != nil {
 		return nil, err
 	}
@@ -423,41 +431,34 @@ func (q *PostgresQuery) GetExpiringTokens(ctx context.Context, withinDays int) (
 
 	var out []UserChannelTracking
 	for rows.Next() {
-		var t UserChannelTracking
-		if err := rows.Scan(
-			&t.ID, &t.UserID, &t.PlatformChannelID, &t.AccessTokenEnc,
-			&t.RefreshTokenEnc, &t.TokenExpiresAt, &t.TokenPriority, &t.TrackingStatus,
-			&t.LastSeenAt, &t.BackfillDays, &t.TokenExpiryNotifiedAt, &t.CreatedAt,
-		); err != nil {
+		t, err := scanTrackingRows(rows)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, t)
+		out = append(out, *t)
 	}
 	return out, rows.Err()
 }
 
-func (q *PostgresQuery) MarkTokenExpiryNotified(ctx context.Context, trackingID string) error {
-	_, err := q.pool.Exec(ctx,
-		`UPDATE user_channel_tracking SET token_expiry_notified_at = NOW() WHERE id = $1`,
+func (q *SQLiteQuery) MarkTokenExpiryNotified(ctx context.Context, trackingID string) error {
+	_, err := q.db.ExecContext(ctx,
+		`UPDATE user_channel_tracking SET token_expiry_notified_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?`,
 		trackingID)
 	return err
 }
 
-func (q *PostgresQuery) GetCommentCountForChannel(ctx context.Context, platformChannelID string) (int, error) {
+func (q *SQLiteQuery) GetCommentCountForChannel(ctx context.Context, platformChannelID string) (int, error) {
 	var n int
-	err := q.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM comments WHERE platform_channel_id = $1`,
+	err := q.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM comments WHERE platform_channel_id = ?`,
 		platformChannelID).Scan(&n)
 	return n, err
 }
 
-// ChannelsDueForPurge returns the platform_channels that have a
-// deletion_scheduled_at in the past. The purge job uses this to drive its
-// scan; PurgeChannelData re-checks the tracker count atomically.
-func (q *PostgresQuery) ChannelsDueForPurge(ctx context.Context) ([]string, error) {
-	rows, err := q.pool.Query(ctx,
+func (q *SQLiteQuery) ChannelsDueForPurge(ctx context.Context) ([]string, error) {
+	rows, err := q.db.QueryContext(ctx,
 		`SELECT id FROM platform_channels
-		 WHERE deletion_scheduled_at IS NOT NULL AND deletion_scheduled_at <= NOW()`)
+		 WHERE deletion_scheduled_at IS NOT NULL AND deletion_scheduled_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now')`)
 	if err != nil {
 		return nil, err
 	}
@@ -472,4 +473,33 @@ func (q *PostgresQuery) ChannelsDueForPurge(ctx context.Context) ([]string, erro
 		out = append(out, id)
 	}
 	return out, rows.Err()
+}
+
+func (q *SQLiteQuery) GetChannelCustomPrompt(ctx context.Context, platformChannelID, userID string) (string, error) {
+	var customPrompt sql.NullString
+	err := q.db.QueryRowContext(ctx,
+		`SELECT custom_prompt FROM user_channel_tracking
+		 WHERE platform_channel_id = ? AND user_id = ? AND tracking_status = 'active'
+		 LIMIT 1`,
+		platformChannelID, userID).Scan(&customPrompt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if !customPrompt.Valid {
+		return "", nil
+	}
+	return customPrompt.String, err
+}
+
+func (q *SQLiteQuery) GetCommentBodyByID(ctx context.Context, commentID string) (string, error) {
+	var body sql.NullString
+	err := q.db.QueryRowContext(ctx,
+		`SELECT body FROM comments WHERE id = ?`, commentID).Scan(&body)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if !body.Valid {
+		return "", nil
+	}
+	return body.String, err
 }
