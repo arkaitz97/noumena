@@ -6,13 +6,22 @@
 #   make dev               # start backend + frontend in watch mode
 #   make stop              # stop dev servers
 
-.PHONY: test test-integration dev stop seed
+.PHONY: test fmt fmt-check test-integration dev stop seed
 
 test:
 	go test ./...
 
+fmt:
+	gofmt -w .
+
+fmt-check:
+	@out="$$(gofmt -l .)"; \
+	if [ -n "$$out" ]; then \
+		echo "gofmt needed on:"; echo "$$out"; exit 1; \
+	fi
+
 test-integration:
-	go test ./internal/db/... ./internal/dbtest/...
+	go test -race -timeout=10m ./internal/db/... ./internal/dbtest/...
 
 dev:
 	@echo "Starting dev servers..."

@@ -86,7 +86,7 @@ Existing tools (CommentShark, BrandBastion, SmartModeration, Respondology) solve
 | ING-03 | System deduplicates comments across ingestion runs | **Must** | Re-ingesting the same `platform_comment_id` for the same platform channel does not create duplicate records. |
 | ING-04 | Ingestion pipeline is fault-tolerant: failed API calls retry with exponential backoff (max 5 retries) | **Must** | Failed jobs retried at 1s, 2s, 4s, 8s, 16s. After 5 failures, job is dead-lettered and an alert sent to ops. |
 | ING-05 | System respects platform API rate limits | **Must** | Rate limit headers are read and respected. Queue throttling applied automatically. |
-| ING-06 | Only one ingestion job runs per platform channel at a time (distributed lock) | **Must** | Before starting an ingestion job for a `platform_channel_id`, the worker acquires a DB-level advisory lock (`pg_try_advisory_lock`). If the lock is already held (another worker is polling the same channel), the job is skipped until the next cycle. Prevents duplicate API calls and race conditions when many users track the same popular channel. |
+| ING-06 | Only one ingestion job runs per platform channel at a time (serialized) | **Must** | SQLite serializes all writes, so per-channel mutual exclusion is guaranteed by claim atomicity: jobs are claimed via a single atomic `UPDATE … WHERE status='pending' … RETURNING`, and comment inserts dedupe with `ON CONFLICT DO NOTHING`. A dedicated advisory lock is not needed (and is a no-op by design). |
 | ING-07 | Ingestion uses the OAuth token of the channel owner (one designated token per platform channel) | **Should** | If multiple users track the same channel, the system uses the token of the user who first connected it (the "primary token holder"). If that token is revoked or expired, the system automatically promotes the next active tracker's token. A `token_priority` field in `user_channel_tracking` controls ordering. |
 
 ### 3.3 LLM Comment Processing
@@ -175,7 +175,7 @@ Existing tools (CommentShark, BrandBastion, SmartModeration, Respondology) solve
 | SLA uptime | 99.5% monthly (≤ 3.6 hours downtime/month) |
 | RTO (Recovery Time Objective) | 4 hours |
 | RPO (Recovery Point Objective) | 1 hour |
-| Database backups | Daily full backup + continuous WAL archiving (PostgreSQL) |
+| Database backups | Daily SQLite backup (`sqlite3 .backup` after a WAL checkpoint), N-copy rotation |
 
 ---
 
@@ -382,12 +382,12 @@ Existing tools (CommentShark, BrandBastion, SmartModeration, Respondology) solve
 | Layer | Technology | Rationale |
 |-------|-----------|-----------|
 | **Backend API** | Go (Golang) | High performance, low memory footprint, excellent concurrency primitives for ingestion workers. |
-| **Database** | PostgreSQL 16 | ACID compliance, JSONB for flexible comment metadata, pg_partman for comment table partitioning. |
+| **Database** | SQLite (embedded, `modernc.org/sqlite`) | Zero-ops, single-file; WAL journaling + FK + busy_timeout; JSON stored as TEXT; full-text via FTS5. |
 | **Frontend** | Vue 3 (Composition API) + Vite | Component-driven, reactive UI. Excellent TypeScript support. |
 | **UI Styling** | Tailwind CSS | Utility-first for rapid UI development; design system enforced via `tailwind.config`. |
 | **Payments** | Stripe (Checkout + Billing + Webhooks) | Industry standard; eliminates PCI scope for raw card data. |
 | **LLM Processing** | OpenAI GPT-4o (primary), Anthropic Claude 3.5 Sonnet (fallback) | GPT-4o offers best cost/performance for classification; Claude as fallback for resilience. |
-| **Job Queue** | PostgreSQL-backed queue (pgq or River) | Avoids Redis dependency for MVP; reliable, transactional job enqueueing. |
+| **Job Queue** | SQLite-backed queue (atomic `UPDATE … RETURNING` claim) | Avoids Redis dependency; transactional enqueue; single-writer model. |
 | **Email** | Resend (transactional) | Developer-friendly, excellent deliverability, Vue email template support. |
 | **Auth** | Custom JWT (Go) + Google OAuth 2.0 | Full control, no vendor lock-in on auth. |
 | **Deployment** | Docker + Docker Compose (dev), VPS/Cloud (prod) | Simple containerization; horizontally scalable. |
@@ -406,8 +406,8 @@ Existing tools (CommentShark, BrandBastion, SmartModeration, Respondology) solve
 └──────┬───────────────────────────────────────┬──────────────────┘
        │                                       │
 ┌──────▼──────────┐                  ┌────────▼────────────────┐
-│   PostgreSQL 16  │                  │    Background Workers    │
-│  (primary DB)    │◄─────────────────│  Ingestion | LLM Batch  │
+│      SQLite      │                  │    Background Workers    │
+│   (embedded)     │◄─────────────────│  Ingestion | LLM Batch  │
 │  - users         │                  │  Digest Gen | Webhooks   │
 │  - platform_chs  │                  └────────────┬────────────┘
 │  - tracking      │                               │
@@ -421,88 +421,24 @@ Existing tools (CommentShark, BrandBastion, SmartModeration, Respondology) solve
 
 ### 6.3 Database Schema (Core Tables)
 
-```sql
--- Users and auth
-CREATE TABLE users (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    email TEXT UNIQUE NOT NULL,
-    password_hash TEXT,
-    google_sub TEXT UNIQUE,
-    email_verified_at TIMESTAMPTZ,
-    subscription_plan TEXT NOT NULL DEFAULT 'free',   -- 'free','creator','studio','agency'
-    stripe_customer_id TEXT,
-    comment_quota_monthly INT NOT NULL DEFAULT 1000,
-    comments_used_this_period INT NOT NULL DEFAULT 0,
-    quota_reset_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+The canonical schema lives in [`internal/db/schema.sql`](internal/db/schema.sql) — SQLite
+dialect (`modernc.org/sqlite`), applied idempotently (`CREATE … IF NOT EXISTS`) at startup.
+Core tables:
 
--- Canonical platform channel records (one per real-world channel, shared across users)
-CREATE TABLE platform_channels (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    platform TEXT NOT NULL,                     -- 'youtube','tiktok','instagram'
-    platform_channel_id TEXT NOT NULL,          -- e.g. YouTube channel ID
-    display_name TEXT NOT NULL,
-    last_synced_at TIMESTAMPTZ,
-    deletion_scheduled_at TIMESTAMPTZ,          -- set when tracker count drops to 0
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(platform, platform_channel_id)
-);
-
--- Per-user tracking relationships (join table between users and platform_channels)
-CREATE TABLE user_channel_tracking (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    platform_channel_id UUID NOT NULL REFERENCES platform_channels(id),
-    access_token_enc TEXT NOT NULL,             -- AES-256 encrypted, user-specific
-    refresh_token_enc TEXT NOT NULL,
-    token_expires_at TIMESTAMPTZ,
-    token_priority INT NOT NULL DEFAULT 0,      -- 0 = primary ingestion token; higher = fallback
-    tracking_status TEXT NOT NULL DEFAULT 'active', -- 'active','paused','removed'
-    last_seen_at TIMESTAMPTZ,                   -- last comment timestamp shown to this user
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(user_id, platform_channel_id)
-);
-
--- Shared comments (ingested once per platform_channel, visible to all trackers)
-CREATE TABLE comments (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    platform_channel_id UUID NOT NULL REFERENCES platform_channels(id) ON DELETE CASCADE,
-    platform_comment_id TEXT NOT NULL,
-    parent_comment_id TEXT,                     -- null = top-level
-    author_handle TEXT,
-    body TEXT NOT NULL,
-    posted_at TIMESTAMPTZ NOT NULL,
-    -- LLM outputs (shared; processed once for all users)
-    category TEXT,                              -- question,praise,constructive_criticism,toxic_criticism,content_idea,collaboration_ask,spam,other
-    sentiment_score NUMERIC(4,2),               -- -1.00 to +1.00
-    topic TEXT,
-    confidence NUMERIC(4,2),
-    processed_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(platform_channel_id, platform_comment_id)
-) PARTITION BY HASH (platform_channel_id);
-
--- Per-user starred comments (user-specific, not shared)
-CREATE TABLE user_comment_stars (
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    comment_id UUID NOT NULL REFERENCES comments(id) ON DELETE CASCADE,
-    starred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (user_id, comment_id)
-);
-
--- Weekly AI-generated digests (per-user, references the user's current tracked channels)
-CREATE TABLE weekly_digests (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    week_start_date DATE NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',     -- 'pending','generated','deferred','failed'
-    content JSONB,                              -- {top_ideas, top_questions, sentiment_trend, health_score}
-    emailed_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-```
+| Table | Purpose |
+|-------|---------|
+| `users` | Auth (bcrypt hash, `google_sub`), plan, quota counters, `token_version` |
+| `platform_channels` | One row per real YouTube channel, shared across users |
+| `user_channel_tracking` | Per-user OAuth tokens + tracking preferences per channel |
+| `channel_grants` | Workspace → channel sharing grants |
+| `comments` | Ingested comments + LLM classification (category, sentiment, topic, confidence) |
+| `comments_fts` | FTS5 virtual table over `comments.body` (kept in sync via triggers) |
+| `user_comment_stars` | Per-user starred comments |
+| `weekly_digests` | Per-user AI digests (`content` stored as JSON TEXT) |
+| `ingestion_jobs`, `llm_processing_jobs` | SQLite-backed job queues |
+| `account_deletion_jobs`, `data_export_jobs` | Async lifecycle jobs |
+| `email_send_log` | SMTP idempotency + retry ledger |
+| `rate_limit_buckets`, `workspaces`, `workspace_members`, `workspace_invites`, `audit_log`, `oauth_states`, `refresh_tokens`, `processed_stripe_events` | Supporting infrastructure |
 
 ---
 
@@ -568,8 +504,8 @@ CREATE TABLE weekly_digests (
 ## 10. Open Questions (for Engineering Kickoff)
 
 1. **LLM batching strategy:** Should we batch by channel (all comments from one channel) or globally (cross-channel)? Global batching is more cost-efficient but requires care to avoid cross-user data leakage in the prompt context.
-2. **Job queue choice:** River (Go-native, PostgreSQL-backed) vs. pgq vs. a managed queue (e.g., AWS SQS). River is preferred to minimize infrastructure complexity for v1.
-3. **Multitenancy isolation level:** Row-level security (RLS) in PostgreSQL vs. application-level WHERE clauses? RLS is recommended for defense in depth.
+2. **Job queue mechanics:** SQLite-backed queue with atomic `UPDATE … WHERE status='pending' … RETURNING` claim semantics; per-channel exclusion relies on SQLite's write serialization. No external queue infrastructure (Redis, SQS). [Resolved]
+3. **Multitenancy isolation level:** Application-level access-control joins at the SQL layer (mandatory on every data route); workspace role enforcement lands with the multi-seat workspaces change. [Resolved]
 4. **Frontend auth state management:** Pinia store with JWT in memory (preferred) vs. localStorage (XSS risk). Confirm with security-conscious approach.
 5. **Comment partitioning:** Hash partitioning by `channel_id` (even distribution) vs. range partitioning by `posted_at` (better for time-based queries). Recommend hybrid: partition by `channel_id` hash, add composite index `(channel_id, posted_at)`.
 
@@ -582,7 +518,7 @@ CREATE TABLE weekly_digests (
 > - [x] All functional requirements are measurable/testable via acceptance criteria.
 > - [x] Minimum 3 edge cases per major feature (7 flows, 30+ total edge cases documented).
 > - [x] NFRs cover Scalability, Security, Performance, and Availability.
-> - [x] Tech stack aligns with user-specified choices: Go, PostgreSQL, Vue 3, Tailwind CSS, Stripe.
+> - [x] Tech stack aligns with user-specified choices: Go, SQLite, Vue 3, Tailwind CSS, Stripe.
 > - [x] Risks documented with mitigations.
 > - [x] Open questions flagged for engineering team.
 > - [x] Full auth lifecycle documented in Flow 0: registration (email + Google SSO), login, session management, password reset.

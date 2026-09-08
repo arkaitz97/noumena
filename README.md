@@ -55,6 +55,22 @@ it to `.env` for local dev or use as a template for your production
 secret manager. Every variable read by `internal/config/config.go` is
 listed there with a `# REQUIRED | optional` annotation, grouped by
 feature area (auth, ingestion, LLM, billing, email, lifecycle, OTel).
+The pairing is enforced by `go test ./internal/config/...`
+(`TestEnvExampleParity`), so the list cannot drift.
+
+### Running with Docker
+
+The image runs as a non-root user and requires at minimum:
+
+- `ENCRYPTION_KEY` — raw AES key, 16/24/32 bytes (fail-fast).
+- `JWT_SECRET` — ≥32 bytes (fail-fast).
+- `DATABASE_PATH` — point at a persistent volume, e.g. `/data/noumena.db`
+  (the container pre-creates `/data` owned by the runtime user).
+
+`EXPORT_DIR` (default `/var/lib/noumena/exports`) and
+`EXPORT_STORAGE_DIR` (default `/var/lib/noumena/data-exports`) are
+pre-created and writable by the non-root user. Health is exposed at
+`/healthz` (and `/health`) and wired to the image `HEALTHCHECK`.
 
 > **How to add an env var.** When you introduce a new `os.Getenv(…)`
 > call in `internal/config/config.go`, add the variable to

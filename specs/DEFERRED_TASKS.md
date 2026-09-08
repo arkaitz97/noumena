@@ -266,11 +266,16 @@ All require live Postgres because the SUT relies on real `FOR UPDATE` locks, `RE
 
 ---
 
-## frontend-dashboard — 11 unchecked
+## frontend-dashboard — 1 unchecked
 
-### §4 Reusable components (10 tasks, no extracted files)
+### §4 Reusable components (10 tasks) — ✅ Resolved
 
-These were **inlined directly into views** rather than extracted into separate `.vue` component files. Functionality works (build green, main chunk 19.47 kB gzip), but reusability and testability suffer. Future cleanup task: extract these to `frontend/src/components/` for proper reuse.
+Extracted to `frontend/src/components/*.vue` (see the resolution note in the
+summary above): `CommentCard`, `FilterBar`, `SentimentChart`,
+`SentimentSparkline`, `ToxicityShield`, `WeeklyDigestCard`, `PlanComparison`,
+`UsageBar`, `ChannelCard`, `ConfirmModal`. Each component has a colocated
+`__tests__/<Component>.spec.ts` executed under Vitest. Remaining deferred work
+is the §10.8 staging walkthrough only.
 
 | # | Component | Used in |
 |---|-----------|---------|

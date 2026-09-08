@@ -17,7 +17,7 @@ Always run dry-run first.
 
 ```bash
 # 1. Dry-run (default). Prints the planned writes; modifies nothing.
-DATABASE_URL=postgres://... STRIPE_SECRET_KEY=sk_live_... \
+DATABASE_PATH=./noumena.db STRIPE_SECRET_KEY=sk_live_... \
   go run ./tools/backfill_stripe_subscription_id
 
 # 2. Review the output. Each line looks like:
@@ -27,7 +27,7 @@ DATABASE_URL=postgres://... STRIPE_SECRET_KEY=sk_live_... \
 #    drift; safe to leave unchanged.
 
 # 3. If the planned writes look correct, re-run with --apply.
-DATABASE_URL=... STRIPE_SECRET_KEY=... \
+DATABASE_PATH=... STRIPE_SECRET_KEY=... \
   go run ./tools/backfill_stripe_subscription_id --apply
 
 # 4. Re-run dry-run; output should be empty (or `0 candidates`).
@@ -59,7 +59,7 @@ inspect those specific user IDs.
 | -------------- | ----------------------- | ---------------------------------------------- |
 | `--apply`      | `false`                 | Actually write. Without this it's a dry-run.   |
 | `--dry-run`    | `true`                  | Explicit; ignored when `--apply` is set.       |
-| `--dsn`        | `$DATABASE_URL`         | Postgres DSN.                                  |
+| `--dsn`        | `$DATABASE_PATH`        | SQLite database path.                          |
 | `--stripe-key` | `$STRIPE_SECRET_KEY`    | Stripe secret key.                             |
 
 ## Idempotency

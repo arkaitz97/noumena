@@ -6,8 +6,8 @@ on:
   pull_request:
 
 jobs:
-  integration:
-    name: Integration tests
+  go:
+    name: Go (vet, fmt, tests)
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -20,10 +20,62 @@ jobs:
           go-version: '1.25.x'
           cache: true
 
+      - name: gofmt gate
+        run: make fmt-check
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Run all Go tests
+        run: go test ./...
+
       - name: Run integration tests
         run: make test-integration
-        env:
-          # testcontainers-go uses the host Docker daemon provided by
-          # ubuntu-latest. Disable the Ryuk reaper sidecar in CI to
-          # avoid privileged-container requirements.
-          TESTCONTAINERS_RYUK_DISABLED: "true"
+
+  frontend:
+    name: Frontend (install, build, tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Frontend install + unit tests (CI entrypoint)
+        run: bash scripts/test-frontend.sh
+
+      - name: Frontend build
+        working-directory: frontend
+        run: npm run build
+
+  audit:
+    name: Dependency audit (npm + Go)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+      - name: npm audit (production deps)
+        working-directory: frontend
+        run: npm audit --omit=dev

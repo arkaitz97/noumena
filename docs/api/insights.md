@@ -157,7 +157,7 @@ production is owned by the weekly-digest worker).
   }
   ```
   The non-base keys (`top_ideas`, `top_questions`, etc.) are passed
-  through verbatim from the `weekly_digests.content` JSONB column —
+  through verbatim from the `weekly_digests.content` JSON TEXT column —
   the producer (weekly-digest spec) owns their shape.
 - **Errors:** `404 no_digest_yet`, `500 digest_failed`.
 
@@ -170,12 +170,12 @@ schema.
 ## Example
 
 ```sh
-# All comments from a single channel, last 7 days, sorted by toxicity
+# All comments from a single channel, last 7 days, newest first
 curl -s -G https://api.noumena/api/comments/feed \
   -H "Authorization: Bearer ${ACCESS_TOKEN}" \
   --data-urlencode 'channels=11111111-2222-3333-4444-555555555555' \
   --data-urlencode 'date_from=2026-04-28' \
-  --data-urlencode 'sort=most_toxic' \
+  --data-urlencode 'sort=newest' \
   --data-urlencode 'include_toxic=true' \
   --data-urlencode 'limit=100' | jq
 ```

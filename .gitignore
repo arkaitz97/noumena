@@ -1,3 +1,12 @@
 noumena.db
+noumena.db-wal
+noumena.db-shm
+*.db-journal
 seed_db
 .env
+backups/
+exports/
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
+.opencode/node_modules/

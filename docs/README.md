@@ -33,6 +33,10 @@ Each runbook follows the **Symptoms → Verification → Recovery →
 Postmortem** shape. Configuration values are referenced from
 [`../.env.example`](../.env.example) rather than duplicated.
 
+- [`setup-guide.md`](setup-guide.md) — manual steps for obtaining API keys,
+  secrets, and configuring external services.
+- [`deploy-coolify.md`](deploy-coolify.md) — deploying to Coolify with
+  auto-deploy on push to `main`.
 - [`observability.md`](observability.md) — metrics, tracing, and
   the canonical meter names.
 - [`ops/runbooks/export-disk-monitoring.md`](ops/runbooks/export-disk-monitoring.md)
@@ -47,6 +51,14 @@ Postmortem** shape. Configuration values are referenced from
   — support workflows; `cancel_deletion` CLI usage.
 - [`ops/runbooks/channel-grace-window.md`](ops/runbooks/channel-grace-window.md)
   — shared-channel grace-window behaviour for support staff.
+- [`ops/runbooks/backup-restore.md`](ops/runbooks/backup-restore.md)
+  — SQLite backup script, rotation, and restore procedure.
+- [`ops/runbooks/data-export.md`](ops/runbooks/data-export.md)
+  — user-facing export lifecycle and re-enqueue procedure.
+- [`ops/runbooks/incident.md`](ops/runbooks/incident.md)
+  — basic incident response; health/readiness checks, single-writer rule.
+- [`ops/runbooks/onboarding.md`](ops/runbooks/onboarding.md)
+  — new operator/developer setup and daily operations.
 
 ## End-user help
 

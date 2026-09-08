@@ -146,6 +146,6 @@ curl -i -X POST https://api.noumena/api/billing/checkout \
 ## Related
 
 - Configuration: see [`.env.example`](../../.env.example) for
-  `BILLING_ENABLED`, `STRIPE_API_KEY`, `STRIPE_WEBHOOK_SECRET`, and
+  `BILLING_ENABLED`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, and
   every `STRIPE_PRICE_*` price ID.
 - [`./user.md`](./user.md) for `DELETE /api/user/account`.

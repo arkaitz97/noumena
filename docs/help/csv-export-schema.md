@@ -1,7 +1,7 @@
 # CSV export schema
 
 > Source of truth: `internal/export/encoder.go` (`CSVHeader`).
-> Capability: [`specs/03-comment-ingestion.md`](../../specs/03-comment-ingestion.md).
+> Capability: [`specs/03-comment-ingestion.md`](../../specs/03-ingestion.md).
 > Related API: [`../api/comments.md`](../api/comments.md).
 
 When you export comments from Noumena (`POST /api/comments/export`

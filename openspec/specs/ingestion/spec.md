@@ -29,12 +29,12 @@ The system SHALL process ingestion jobs by fetching comments from YouTube API an
 #### Scenario: Successful Comment Ingestion
 - **GIVEN** a pending ingestion job for a YouTube channel
 - **WHEN** a worker claims the job
-- **THEN** the system SHALL acquire a per-channel PostgreSQL advisory lock, fetch videos and comment threads via YouTube API, batch-insert comments (100 per batch), update last_synced_at, mark the job completed, and reset any prior ingestion error
+- **THEN** the system SHALL claim the job atomically via `UPDATE … WHERE status='pending' … RETURNING` (SQLite write serialization provides per-channel mutual exclusion), fetch videos and comment threads via YouTube API, batch-insert comments (100 per batch), update last_synced_at, mark the job completed, and reset any prior ingestion error
 
 #### Scenario: Per-Channel Mutual Exclusion
 - **GIVEN** two workers running concurrently
 - **WHEN** both attempt to process the same channel
-- **THEN** the system SHALL use pg_try_advisory_lock to ensure only one worker processes the channel at a time. The losing worker SHALL release the job back to pending without consuming retry budget
+- **THEN** only one worker SHALL process the channel at a time (SQLite serializes writes; claim atomicity + `ON CONFLICT DO NOTHING` dedupe guarantee it). A worker that loses the claim SHALL NOT consume retry budget
 
 #### Scenario: Comment Deduplication
 - **GIVEN** a comment already stored with the same (platform_channel_id, platform_comment_id)
@@ -119,3 +119,24 @@ The system SHALL fetch comment threads (not just top-level comments) from the Yo
 #### Scenario: Reply Pagination
 - **WHEN** a comment thread has more replies than fit in a single API response
 - **THEN** the system SHALL follow the nextPageToken to fetch all replies for that thread
+
+### Requirement: Job Crash Recovery
+The system SHALL recover ingestion and LLM jobs left in an in-progress state by a crash.
+
+#### Scenario: Crash Mid-Ingestion
+- **GIVEN** an ingestion job stuck in `running` due to process crash
+- **WHEN** the reaper runs at startup or on its tick
+- **THEN** the system SHALL reset the job to `pending` and allow the channel to resume ingesting
+
+#### Scenario: Stuck LLM Processing
+- **GIVEN** an LLM processing job stuck in `processing` due to process crash
+- **WHEN** the reaper runs
+- **THEN** the system SHALL reset the job without enqueuing a duplicate LLM job for the same comments
+
+### Requirement: Expiry-Aware Token Selection
+The system SHALL prefer unexpired ingestion tokens when more than one is available.
+
+#### Scenario: Primary Token Expired
+- **GIVEN** a primary token past its expiry and an unexpired fallback token
+- **WHEN** an ingestion token is selected
+- **THEN** the system SHALL use the unexpired fallback token

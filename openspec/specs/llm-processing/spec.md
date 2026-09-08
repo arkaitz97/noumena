@@ -11,7 +11,7 @@ The system SHALL process unprocessed comments in batches through the OpenCode LL
 #### Scenario: Successful Batch Processing
 - **GIVEN** unprocessed comments in the database
 - **WHEN** the processor ticks (default every 10 seconds)
-- **THEN** the system SHALL claim up to 50 comments per channel (FOR UPDATE SKIP LOCKED), send them to the OpenCode provider, apply confidence threshold (default 0.7), persist classification results (category, topic, confidence, actionable_insights), increment the primary token holder's quota usage, and mark the job completed
+- **THEN** the system SHALL claim up to 50 comments per channel (atomic `UPDATE … RETURNING` on the SQLite-backed queue), send them to the OpenCode provider, apply confidence threshold (default 0.7), persist classification results (category, topic, confidence, actionable_insights), increment the primary token holder's quota usage, and mark the job completed
 
 #### Scenario: Confidence Threshold Downgrade
 - **GIVEN** an LLM result with confidence below 0.7
@@ -113,3 +113,16 @@ The system SHALL include parent comment context when classifying reply comments.
 #### Scenario: Classify Top-Level Comment
 - **WHEN** the processor classifies a comment with parent_comment_id = NULL
 - **THEN** the system SHALL classify without parent context (existing behavior)
+
+### Requirement: LLM provider failover
+The system SHALL support a configurable primary and fallback LLM provider, switching to the fallback after an error window.
+
+#### Scenario: Primary provider fails
+- **GIVEN** a configured primary LLM provider
+- **WHEN** the primary produces N errors within a sliding window (default 5 in 60s)
+- **THEN** the system switches to the fallback provider for the process lifetime
+
+#### Scenario: No fallback configured
+- **GIVEN** only a primary provider is configured
+- **WHEN** the primary fails
+- **THEN** the system continues to retry the primary and does not crash
