@@ -1,0 +1,57 @@
+# Woodpecker CI — build & push to registry.arkaitzmolinuevo.com
+#
+# Workflow 1: push to main  -> :staging + :main-<short-sha>  -> staging webhook
+# Workflow 2: push v* tag   -> :<version> + :production       -> production webhook
+#
+# Secrets (Woodpecker UI -> Settings -> Secrets):
+#   REGISTRY_USERNAME, REGISTRY_PASSWORD,
+#   COOLIFY_STAGING_WEBHOOK, COOLIFY_PRODUCTION_WEBHOOK
+#
+# Webhook steps tolerate non-2xx responses (log + continue, build stays green).
+
+when:
+  event: push
+  branch: main
+
+steps:
+  build-and-push:
+    image: docker:27
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    secrets: [registry_username, registry_password]
+    commands:
+      - echo "$REGISTRY_PASSWORD" | docker login registry.arkaitzmolinuevo.com -u "$REGISTRY_USERNAME" --password-stdin
+      - docker buildx build --push \
+          -t registry.arkaitzmolinuevo.com/noumena:staging \
+          -t registry.arkaitzmolinuevo.com/noumena:main-$(echo "${CI_COMMIT_SHA}" | cut -c1-7) \
+          .
+
+  notify-staging:
+    image: curlimages/curl:latest
+    secrets: [coolify_staging_webhook]
+    commands:
+      - curl -fsS -X POST "$COOLIFY_STAGING_WEBHOOK" || echo "staging webhook failed (ignored)"
+
+---
+when:
+  event: tag
+  tag: v*
+
+steps:
+  build-and-push:
+    image: docker:27
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    secrets: [registry_username, registry_password]
+    commands:
+      - echo "$REGISTRY_PASSWORD" | docker login registry.arkaitzmolinuevo.com -u "$REGISTRY_USERNAME" --password-stdin
+      - docker buildx build --push \
+          -t registry.arkaitzmolinuevo.com/noumena:${CI_COMMIT_TAG} \
+          -t registry.arkaitzmolinuevo.com/noumena:production \
+          .
+
+  notify-production:
+    image: curlimages/curl:latest
+    secrets: [coolify_production_webhook]
+    commands:
+      - curl -fsS -X POST "$COOLIFY_PRODUCTION_WEBHOOK" || echo "production webhook failed (ignored)"
