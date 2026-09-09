@@ -3,6 +3,7 @@ noumena.db-wal
 noumena.db-shm
 *.db-journal
 seed_db
+/api
 .env
 backups/
 exports/

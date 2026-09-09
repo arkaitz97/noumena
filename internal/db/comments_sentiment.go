@@ -32,7 +32,7 @@ func (q *SQLiteQuery) UpdateCommentSentiment(ctx context.Context, id string, sco
 func (q *SQLiteQuery) GetSentimentSeries(ctx context.Context, userID, channelID string, days int) ([]SentimentDay, error) {
 	cutoff := time.Now().UTC().AddDate(0, 0, -days).Format(time.RFC3339)
 	channelClause := ""
-	args := []any{userID}
+	args := []any{userID, userID}
 	if channelID != "" {
 		channelClause = " AND c.platform_channel_id = ?"
 		args = append(args, channelID)
@@ -45,10 +45,17 @@ func (q *SQLiteQuery) GetSentimentSeries(ctx context.Context, userID, channelID 
 		       COALESCE(SUM(CASE WHEN c.sentiment_score = 1 THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(c.sentiment_score), 0)
 		FROM comments c
-		JOIN user_channel_tracking uct ON uct.platform_channel_id = c.platform_channel_id
-		WHERE uct.user_id = ?
-		  AND uct.tracking_status IN ('active','paused')
-		` + channelClause + `
+		WHERE (EXISTS (
+			SELECT 1 FROM user_channel_tracking uct
+			WHERE uct.platform_channel_id = c.platform_channel_id
+			  AND uct.user_id = ?
+			  AND uct.tracking_status IN ('active','paused')
+		) OR EXISTS (
+			SELECT 1 FROM channel_grants cg
+			JOIN workspace_members wm ON wm.workspace_id = cg.workspace_id
+			WHERE cg.channel_id = c.platform_channel_id
+			  AND wm.user_id = ?
+		))` + channelClause + `
 		  AND c.sentiment_score IS NOT NULL
 		  AND c.posted_at >= ?
 		GROUP BY date(c.posted_at)

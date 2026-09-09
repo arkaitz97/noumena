@@ -196,7 +196,7 @@ type CategoryRow struct {
 }
 
 func (q *SQLiteQuery) GetInsightDistribution(ctx context.Context, userID string, channelID *string, since time.Time) ([]InsightTypeCount, error) {
-	args := []any{userID, since.Format(time.RFC3339)}
+	args := []any{userID, userID, since.Format(time.RFC3339)}
 	channelClause := ""
 	if channelID != nil {
 		args = append(args, *channelID)
@@ -204,11 +204,19 @@ func (q *SQLiteQuery) GetInsightDistribution(ctx context.Context, userID string,
 	}
 	sqlStr := `
 		SELECT json_extract(elem.value, '$.type'), COUNT(*)
-		FROM comments c
-		JOIN user_channel_tracking uct ON uct.platform_channel_id = c.platform_channel_id,
+		FROM comments c,
 		json_each(c.actionable_insights) elem
-		WHERE uct.user_id = ?
-		  AND uct.tracking_status IN ('active','paused')
+		WHERE (EXISTS (
+			SELECT 1 FROM user_channel_tracking uct
+			WHERE uct.platform_channel_id = c.platform_channel_id
+			  AND uct.user_id = ?
+			  AND uct.tracking_status IN ('active','paused')
+		) OR EXISTS (
+			SELECT 1 FROM channel_grants cg
+			JOIN workspace_members wm ON wm.workspace_id = cg.workspace_id
+			WHERE cg.channel_id = c.platform_channel_id
+			  AND wm.user_id = ?
+		))
 		  AND c.processed_at IS NOT NULL
 		  AND c.posted_at >= ?
 		  AND c.category NOT IN ('toxic_criticism','spam')
@@ -233,7 +241,7 @@ func (q *SQLiteQuery) GetInsightDistribution(ctx context.Context, userID string,
 }
 
 func (q *SQLiteQuery) GetTopInsights(ctx context.Context, userID string, channelID *string, since time.Time, limit int) ([]TopInsight, error) {
-	args := []any{userID, since.Format(time.RFC3339)}
+	args := []any{userID, userID, since.Format(time.RFC3339)}
 	channelClause := ""
 	if channelID != nil {
 		args = append(args, *channelID)
@@ -243,11 +251,19 @@ func (q *SQLiteQuery) GetTopInsights(ctx context.Context, userID string, channel
 	limitParam := "?"
 	sqlStr := `
 		SELECT json_extract(elem.value, '$.type'), json_extract(elem.value, '$.description'), COUNT(*), AVG(json_extract(elem.value, '$.confidence'))
-		FROM comments c
-		JOIN user_channel_tracking uct ON uct.platform_channel_id = c.platform_channel_id,
+		FROM comments c,
 		json_each(c.actionable_insights) elem
-		WHERE uct.user_id = ?
-		  AND uct.tracking_status IN ('active','paused')
+		WHERE (EXISTS (
+			SELECT 1 FROM user_channel_tracking uct
+			WHERE uct.platform_channel_id = c.platform_channel_id
+			  AND uct.user_id = ?
+			  AND uct.tracking_status IN ('active','paused')
+		) OR EXISTS (
+			SELECT 1 FROM channel_grants cg
+			JOIN workspace_members wm ON wm.workspace_id = cg.workspace_id
+			WHERE cg.channel_id = c.platform_channel_id
+			  AND wm.user_id = ?
+		))
 		  AND c.processed_at IS NOT NULL
 		  AND c.posted_at >= ?
 		  AND c.category NOT IN ('toxic_criticism','spam')
@@ -273,7 +289,7 @@ func (q *SQLiteQuery) GetTopInsights(ctx context.Context, userID string, channel
 }
 
 func (q *SQLiteQuery) GetToxicityShield(ctx context.Context, userID string, channelID *string, since time.Time) (ToxicityBucket, error) {
-	args := []any{userID, since.Format(time.RFC3339)}
+	args := []any{userID, userID, since.Format(time.RFC3339)}
 	channelClause := ""
 	if channelID != nil {
 		args = append(args, *channelID)
@@ -282,11 +298,19 @@ func (q *SQLiteQuery) GetToxicityShield(ctx context.Context, userID string, chan
 	sqlStr := `
 		SELECT
 		  COUNT(*),
-		  SUM(CASE WHEN c.category IN ('toxic_criticism','spam') THEN 1 ELSE 0 END)
+		  COALESCE(SUM(CASE WHEN c.category IN ('toxic_criticism','spam') THEN 1 ELSE 0 END), 0)
 		FROM comments c
-		JOIN user_channel_tracking uct ON uct.platform_channel_id = c.platform_channel_id
-		WHERE uct.user_id = ?
-		  AND uct.tracking_status IN ('active','paused')
+		WHERE (EXISTS (
+			SELECT 1 FROM user_channel_tracking uct
+			WHERE uct.platform_channel_id = c.platform_channel_id
+			  AND uct.user_id = ?
+			  AND uct.tracking_status IN ('active','paused')
+		) OR EXISTS (
+			SELECT 1 FROM channel_grants cg
+			JOIN workspace_members wm ON wm.workspace_id = cg.workspace_id
+			WHERE cg.channel_id = c.platform_channel_id
+			  AND wm.user_id = ?
+		))
 		  AND c.processed_at IS NOT NULL
 		  AND c.posted_at >= ?` + channelClause
 	var b ToxicityBucket
@@ -301,7 +325,7 @@ func (q *SQLiteQuery) GetToxicityShield(ctx context.Context, userID string, chan
 
 func (q *SQLiteQuery) GetTopTopics(ctx context.Context, userID string, channelID *string, days int, limit int) ([]TopicRow, error) {
 	cutoff := time.Now().UTC().AddDate(0, 0, -days).Format(time.RFC3339)
-	args := []any{userID, cutoff}
+	args := []any{userID, userID, cutoff}
 	channelClause := ""
 	if channelID != nil {
 		args = append(args, *channelID)
@@ -311,9 +335,17 @@ func (q *SQLiteQuery) GetTopTopics(ctx context.Context, userID string, channelID
 	sqlStr := `
 		SELECT c.topic, COUNT(*)
 		FROM comments c
-		JOIN user_channel_tracking uct ON uct.platform_channel_id = c.platform_channel_id
-		WHERE uct.user_id = ?
-		  AND uct.tracking_status IN ('active','paused')
+		WHERE (EXISTS (
+			SELECT 1 FROM user_channel_tracking uct
+			WHERE uct.platform_channel_id = c.platform_channel_id
+			  AND uct.user_id = ?
+			  AND uct.tracking_status IN ('active','paused')
+		) OR EXISTS (
+			SELECT 1 FROM channel_grants cg
+			JOIN workspace_members wm ON wm.workspace_id = cg.workspace_id
+			WHERE cg.channel_id = c.platform_channel_id
+			  AND wm.user_id = ?
+		))
 		  AND c.processed_at IS NOT NULL
 		  AND c.posted_at >= ?
 		  AND c.category NOT IN ('toxic_criticism','spam')
@@ -340,7 +372,7 @@ func (q *SQLiteQuery) GetTopTopics(ctx context.Context, userID string, channelID
 
 func (q *SQLiteQuery) GetTopCategories(ctx context.Context, userID string, channelID *string, days int) ([]CategoryRow, error) {
 	cutoff := time.Now().UTC().AddDate(0, 0, -days).Format(time.RFC3339)
-	args := []any{userID, cutoff}
+	args := []any{userID, userID, cutoff}
 	channelClause := ""
 	if channelID != nil {
 		args = append(args, *channelID)
@@ -349,9 +381,17 @@ func (q *SQLiteQuery) GetTopCategories(ctx context.Context, userID string, chann
 	sqlStr := `
 		SELECT c.category, COUNT(*)
 		FROM comments c
-		JOIN user_channel_tracking uct ON uct.platform_channel_id = c.platform_channel_id
-		WHERE uct.user_id = ?
-		  AND uct.tracking_status IN ('active','paused')
+		WHERE (EXISTS (
+			SELECT 1 FROM user_channel_tracking uct
+			WHERE uct.platform_channel_id = c.platform_channel_id
+			  AND uct.user_id = ?
+			  AND uct.tracking_status IN ('active','paused')
+		) OR EXISTS (
+			SELECT 1 FROM channel_grants cg
+			JOIN workspace_members wm ON wm.workspace_id = cg.workspace_id
+			WHERE cg.channel_id = c.platform_channel_id
+			  AND wm.user_id = ?
+		))
 		  AND c.processed_at IS NOT NULL
 		  AND c.posted_at >= ?
 		  AND c.category IS NOT NULL

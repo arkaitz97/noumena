@@ -484,13 +484,27 @@ func (h *InsightsHandler) ToxicityShield(w http.ResponseWriter, r *http.Request)
 		writeJSONError(w, code, "not_tracked")
 		return
 	}
-	window := "7d"
-	if v := r.URL.Query().Get("window"); v == "30d" {
-		window = "30d"
-	}
+	q := r.URL.Query()
 	days := 7
-	if window == "30d" {
+	switch q.Get("window") {
+	case "7d":
+		days = 7
+	case "30d":
 		days = 30
+	case "90d":
+		days = 90
+	}
+	if v := q.Get("days"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && (n == 7 || n == 30 || n == 90) {
+			days = n
+		}
+	}
+	window := "7d"
+	switch days {
+	case 30:
+		window = "30d"
+	case 90:
+		window = "90d"
 	}
 	b, err := h.Queries.GetToxicityShield(r.Context(), userID, channelID, time.Now().Add(-time.Duration(days)*24*time.Hour))
 	if err != nil {
