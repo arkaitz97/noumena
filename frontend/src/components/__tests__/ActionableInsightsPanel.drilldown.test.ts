@@ -7,7 +7,7 @@ import { createMemoryHistory, createRouter } from 'vue-router'
 import { describe, expect, it } from 'vitest'
 
 import ActionableInsightsPanel from '../ActionableInsightsPanel.vue'
-import type { InsightAggregatesResponse, WindowKey } from '../../services/types'
+import type { InsightAggregatesResponse, InsightType } from '../../services/types'
 
 function makeRouter() {
   return createRouter({
@@ -30,12 +30,12 @@ function data(overrides: Partial<InsightAggregatesResponse> = {}): InsightAggreg
   }
 }
 
-async function mountPanel(payload: InsightAggregatesResponse, windowKey: WindowKey = '7d') {
+async function mountPanel(payload: InsightAggregatesResponse, typeFilter?: InsightType) {
   const router = makeRouter()
   await router.push('/dashboard')
   await router.isReady()
   const wrapper = mount(ActionableInsightsPanel, {
-    props: { data: payload, windowKey },
+    props: { data: payload, typeFilter },
     global: { plugins: [router] },
   })
   return { wrapper, router }
@@ -54,7 +54,20 @@ describe('ActionableInsightsPanel drill-down', () => {
     const { wrapper, router } = await mountPanel(data({ channel_id: 'ch-42' }))
     await wrapper.findAll('a')[1].trigger('click')
     await flushPromises()
+    expect(router.currentRoute.value.name).toBe('dashboard')
     expect(router.currentRoute.value.query.insight_type).toBe('feature_request')
     expect(router.currentRoute.value.query.channels).toBe('ch-42')
+  })
+
+  it('narrows the visible list when a type filter is passed', async () => {
+    const { wrapper } = await mountPanel(data(), 'feature_request')
+    const links = wrapper.findAll('a')
+    expect(links).toHaveLength(1)
+    expect(links[0].text()).toContain('Dark mode for the app')
+  })
+
+  it('shows the filtered empty state when no insight matches the type filter', async () => {
+    const { wrapper } = await mountPanel(data(), 'question')
+    expect(wrapper.text()).toContain('No insights of this type in range')
   })
 })

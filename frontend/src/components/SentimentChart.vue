@@ -1,26 +1,19 @@
 <script setup lang="ts">
 // SentimentChart — per-day negative/neutral/positive counts + net score
 // trend for one tracked channel. Spec 10-frontend-dashboard §4.3: props
-// `data: SentimentData`, line chart with 7d/30d/90d toggle, colour
-// gradient based on sentiment. The window toggle emits `update:days` so
-// the owning view re-fetches; the active option reflects the `days` of
-// the data currently shown. Rendered as plain SVG — no chart lib in
+// `data: SentimentData`, line chart, colour gradient based on sentiment.
+// Display-only: the active window comes from `data.days`; the range
+// selector lives at the view level (InsightsFeed) and re-fetches with a
+// new `days` value. Rendered as plain SVG — no chart lib in
 // package.json (mirrors InsightTypeDistributionChart's dependency-free
 // approach).
 
 import { computed } from 'vue'
 import type { SentimentData } from '../services/insights'
-import SegmentedControl from './SegmentedControl.vue'
 
 const props = defineProps<{
   data: SentimentData | null
 }>()
-
-const emit = defineEmits<{
-  'update:days': [days: number]
-}>()
-
-const DAYS_OPTIONS = [7, 30, 90] as const
 
 const series = computed(() => props.data?.series ?? [])
 const activeDays = computed(() => props.data?.days ?? 7)
@@ -92,12 +85,6 @@ function scoreColor(score: number): string {
   <div class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl p-5">
     <div class="flex items-center justify-between gap-3 mb-3">
       <p class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Sentiment trend</p>
-      <SegmentedControl
-        :model-value="activeDays"
-        :options="DAYS_OPTIONS.map((d) => ({ value: d, label: `${d}d` }))"
-        label="Sentiment window"
-        @update:model-value="(d) => emit('update:days', d as number)"
-      />
     </div>
 
     <div v-if="series.length === 0" class="h-32 flex items-center justify-center text-xs text-zinc-400">

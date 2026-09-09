@@ -105,7 +105,7 @@ onMounted(async () => {
     <!-- Header + connect button -->
     <div class="sm:flex sm:items-center sm:justify-between">
       <div>
-        <h1 class="text-2xl font-semibold leading-7 text-zinc-900 dark:text-zinc-100 tracking-tight">Connected channels</h1>
+        <h1 class="text-2xl font-semibold leading-7 text-zinc-900 dark:text-white tracking-tight">Connected channels</h1>
         <p class="mt-2 text-sm text-zinc-500 dark:text-zinc-400">
           Manage your tracked channels, pause processing, or remove channels you no longer need.
         </p>
@@ -116,12 +116,12 @@ onMounted(async () => {
           :disabled="atChannelLimit"
           @click="openConnect"
           :title="atChannelLimit ? 'Channel limit reached — upgrade your plan to add more.' : ''"
-          class="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-5 py-2.5 border border-transparent shadow-sm text-sm font-medium rounded-xl text-white bg-zinc-900 hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          class="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-5 py-2.5 border border-transparent shadow-card text-sm font-medium rounded-xl text-white bg-zinc-900 hover:bg-zinc-700 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900 disabled:opacity-50 disabled:cursor-not-allowed"
         >
           <Plus class="w-4 h-4" />
           Connect YouTube channel
         </button>
-        <p v-if="atChannelLimit" class="mt-2 text-xs text-rose-600">
+        <p v-if="atChannelLimit" class="mt-2 text-xs text-rose-600 dark:text-rose-400">
           Channel limit reached.
           <RouterLink to="/settings/billing?next=/settings/channels" class="underline font-medium">
             Upgrade your plan
@@ -136,25 +136,25 @@ onMounted(async () => {
       <div
         v-for="i in 2"
         :key="i"
-        class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl h-24 animate-pulse"
+        class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl h-24 animate-pulse"
       ></div>
     </div>
 
     <!-- Empty state -->
     <div
       v-else-if="channels.channels.length === 0"
-      class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl p-12 text-center"
+      class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-12 text-center"
     >
       <Tv class="mx-auto h-10 w-10 text-zinc-300 mb-3" />
-      <h2 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100 mb-1">No channels connected</h2>
-      <p class="text-sm text-zinc-500 max-w-sm mx-auto">
+      <h2 class="text-sm font-semibold text-zinc-900 dark:text-white mb-1">No channels connected</h2>
+      <p class="text-sm text-zinc-500 dark:text-zinc-400 max-w-sm mx-auto">
         Connect your first YouTube channel to start getting AI-powered insights.
       </p>
       <button
         type="button"
         :disabled="atChannelLimit"
         @click="openConnect"
-        class="mt-5 inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium text-white bg-zinc-900 hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900 disabled:opacity-50 disabled:cursor-not-allowed"
+        class="mt-5 inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium text-white bg-zinc-900 hover:bg-zinc-700 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 shadow-card dark:shadow-none transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900 disabled:opacity-50 disabled:cursor-not-allowed"
       >
         <Plus class="w-4 h-4" /> Connect channel
       </button>
@@ -197,7 +197,7 @@ onMounted(async () => {
             :class="[
               'flex-1 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors focus:outline-none',
               connectMode === 'oauth'
-                ? 'bg-white dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100 shadow-sm'
+                ? 'bg-white dark:bg-zinc-700 text-zinc-900 dark:text-white shadow-card'
                 : 'text-zinc-500 dark:text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200',
             ]"
             @click="connectMode = 'oauth'"
@@ -211,7 +211,7 @@ onMounted(async () => {
             :class="[
               'flex-1 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors focus:outline-none',
               connectMode === 'byName'
-                ? 'bg-white dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100 shadow-sm'
+                ? 'bg-white dark:bg-zinc-700 text-zinc-900 dark:text-white shadow-card'
                 : 'text-zinc-500 dark:text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200',
             ]"
             @click="connectMode = 'byName'"
@@ -229,9 +229,9 @@ onMounted(async () => {
             v-model="channelRef"
             type="text"
             placeholder="@MrBeast or https://www.youtube.com/@MrBeast"
-            class="block w-full px-3 py-2.5 border border-zinc-200 dark:border-zinc-700 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900 bg-zinc-50/50 dark:bg-zinc-800 dark:text-zinc-100"
+            class="block w-full px-3 py-2.5 border border-zinc-200/70 dark:border-white/5 rounded-xl text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60 focus-visible:border-brand-500/70 bg-zinc-50/50 dark:bg-zinc-800 dark:text-white"
           />
-          <p v-if="refError" class="mt-1.5 text-xs text-rose-600" role="alert">{{ refError }}</p>
+          <p v-if="refError" class="mt-1.5 text-xs text-rose-600 dark:text-rose-400" role="alert">{{ refError }}</p>
           <p class="mt-2 text-xs text-zinc-500 dark:text-zinc-400 flex items-start gap-1">
             <Info class="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
             Tracks the channel's public comments. No YouTube sign-in needed.
@@ -245,7 +245,7 @@ onMounted(async () => {
         <select
           id="backfill-days"
           v-model.number="backfillDays"
-          class="block w-full px-3 py-2.5 border border-zinc-200 dark:border-zinc-700 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900 bg-zinc-50/50 dark:bg-zinc-800 dark:text-zinc-100"
+          class="block w-full px-3 py-2.5 border border-zinc-200/70 dark:border-white/5 rounded-xl text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60 focus-visible:border-brand-500/70 bg-zinc-50/50 dark:bg-zinc-800 dark:text-white"
         >
           <option :value="30">Last 30 days</option>
           <option :value="60">Last 60 days</option>

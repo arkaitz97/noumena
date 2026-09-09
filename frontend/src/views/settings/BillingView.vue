@@ -102,7 +102,7 @@ onBeforeUnmount(() => {
 <template>
   <div class="max-w-5xl mx-auto py-8 px-4 sm:px-6 lg:px-8 space-y-8">
     <div>
-      <h1 class="text-2xl font-semibold leading-7 text-zinc-900 dark:text-zinc-100 tracking-tight">Billing & subscription</h1>
+      <h1 class="text-2xl font-semibold leading-7 text-zinc-900 dark:text-white tracking-tight">Billing & subscription</h1>
       <p class="mt-2 text-sm text-zinc-500 dark:text-zinc-400">Manage your plan, payment method, and invoices.</p>
     </div>
 
@@ -132,7 +132,7 @@ onBeforeUnmount(() => {
         <button
           type="button"
           @click="scrollToPlans"
-          class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-white bg-brand-600 hover:bg-brand-700 dark:bg-brand-500 dark:hover:bg-brand-400 transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-brand-600"
+          class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-white bg-brand-600 hover:bg-brand-700 dark:bg-brand-500 dark:hover:bg-brand-400 transition-all duration-200 ease-snappy focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60"
         >
           Upgrade
         </button>
@@ -156,7 +156,7 @@ onBeforeUnmount(() => {
         <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-5">
           <div>
             <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Current plan</p>
-            <h2 class="mt-1 text-xl font-semibold text-zinc-900 dark:text-zinc-100 tracking-tight capitalize">
+            <h2 class="mt-1 text-xl font-semibold text-zinc-900 dark:text-white tracking-tight capitalize">
               {{ billing.status.plan }}
               <span v-if="billing.status.interval" class="text-sm font-medium text-zinc-500 dark:text-zinc-400">
                 · {{ billing.status.interval }}
@@ -172,7 +172,7 @@ onBeforeUnmount(() => {
               :disabled="portalDisabled"
               :title="portalDisabled ? 'Available after your first paid plan.' : ''"
               @click="billing.openPortal()"
-              class="inline-flex items-center gap-1.5 py-2 px-4 rounded-xl text-sm font-medium text-zinc-700 dark:text-zinc-300 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              class="inline-flex items-center gap-1.5 py-2 px-4 rounded-xl text-sm font-medium text-zinc-700 dark:text-zinc-200 bg-white dark:bg-zinc-800/60 border border-zinc-200 dark:border-white/10 hover:border-zinc-300 hover:bg-zinc-50 dark:hover:border-white/20 dark:hover:bg-zinc-800 transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <ExternalLink class="w-4 h-4" />
               Manage payment & invoices
@@ -208,7 +208,7 @@ onBeforeUnmount(() => {
       <Card padding="lg">
         <div class="mb-5">
           <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Usage history</p>
-          <h3 class="mt-1 text-lg font-semibold text-zinc-900 dark:text-zinc-100 tracking-tight">
+          <h3 class="mt-1 text-lg font-semibold text-zinc-900 dark:text-white tracking-tight">
             Comment quota by period
           </h3>
         </div>
@@ -230,16 +230,16 @@ onBeforeUnmount(() => {
         <div v-else class="overflow-x-auto">
           <table class="w-full text-sm">
             <thead>
-              <tr class="text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider border-b border-zinc-200 dark:border-zinc-700">
+              <tr class="text-left text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider border-b border-zinc-200/70 dark:border-white/5">
                 <th scope="col" class="py-2 pr-4 font-medium">Period</th>
                 <th scope="col" class="py-2 pr-4 font-medium text-right">Comments used</th>
                 <th scope="col" class="py-2 pr-4 font-medium text-right">Quota</th>
                 <th scope="col" class="py-2 font-medium">Usage</th>
               </tr>
             </thead>
-            <tbody class="divide-y divide-zinc-100 dark:divide-zinc-800">
+            <tbody class="divide-y divide-zinc-200/70 dark:divide-white/5">
               <tr v-for="p in billing.usagePeriods" :key="p.period_start">
-                <td class="py-3 pr-4 text-zinc-900 dark:text-zinc-100 whitespace-nowrap">
+                <td class="py-3 pr-4 text-zinc-900 dark:text-white whitespace-nowrap">
                   {{ shortDate(p.period_start) }} – {{ shortDate(p.period_end) }}
                 </td>
                 <td class="py-3 pr-4 text-right text-zinc-700 dark:text-zinc-300 font-mono tabular-nums whitespace-nowrap">

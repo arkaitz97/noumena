@@ -114,7 +114,7 @@ const label = computed(() => currentWorkspace.value?.name ?? 'Workspace')
     <button
       ref="triggerRef"
       @click="toggle"
-      class="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:border-zinc-300 dark:hover:border-zinc-600 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors text-sm"
+      class="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-zinc-200 dark:border-white/10 hover:border-zinc-300 dark:hover:border-white/20 hover:bg-zinc-50 dark:hover:bg-zinc-800/60 transition-all duration-200 ease-snappy active:scale-[0.98] text-sm shadow-card dark:shadow-none"
       :aria-expanded="open"
       aria-haspopup="menu"
       :aria-label="'Switch workspace, current: ' + label"
@@ -130,7 +130,7 @@ const label = computed(() => currentWorkspace.value?.name ?? 'Workspace')
         ref="menuRef"
         role="menu"
         aria-label="Switch workspace"
-        class="absolute left-0 mt-2 w-64 bg-white dark:bg-zinc-900 shadow-lg ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl py-1 z-50"
+        class="absolute left-0 mt-2 w-64 bg-white dark:bg-zinc-900 shadow-pop ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl py-1 z-50 origin-top-left"
         @keydown="onMenuKeydown"
       >
         <button
@@ -141,11 +141,11 @@ const label = computed(() => currentWorkspace.value?.name ?? 'Workspace')
           :aria-disabled="w.is_active ? 'true' : undefined"
           @click="onWorkspaceClick(w)"
           class="w-full flex items-center gap-2 px-3 py-2 text-sm text-left transition-colors"
-          :class="w.is_active ? 'bg-zinc-50 dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 font-medium' : 'text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800'"
+          :class="w.is_active ? 'bg-zinc-100/70 dark:bg-white/5 text-zinc-900 dark:text-white font-medium' : 'text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100/70 dark:hover:bg-white/5'"
         >
           <span class="flex-1 truncate">{{ w.name }}</span>
           <span class="text-[10px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400">{{ w.role }}</span>
-          <svg v-if="w.is_active" class="w-4 h-4 text-zinc-900 dark:text-zinc-100" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <svg v-if="w.is_active" class="w-4 h-4 text-zinc-900 dark:text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
           </svg>
         </button>
@@ -159,7 +159,7 @@ const label = computed(() => currentWorkspace.value?.name ?? 'Workspace')
 <style scoped>
 .ws-enter-active,
 .ws-leave-active {
-  transition: opacity 0.15s ease, transform 0.15s ease;
+  transition: opacity 0.2s cubic-bezier(0.16, 1, 0.3, 1), transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
 }
 .ws-enter-from,
 .ws-leave-to {

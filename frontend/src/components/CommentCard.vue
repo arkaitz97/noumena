@@ -33,14 +33,16 @@ const hasInsights = computed(() => insights.value.length > 0)
 const author = computed(() =>
   props.comment.author_handle || props.comment.author_display_name || 'anonymous',
 )
-const channelLabel = computed(() => props.comment.channel_display_name || 'Channel')
-const channelUrl = computed(() =>
-  props.comment.platform_channel_id
-    ? `https://www.youtube.com/channel/${props.comment.platform_channel_id}`
-    : null,
-)
+const channelLabel = computed(() => props.comment.channel_name || props.comment.channel_display_name || 'Channel')
+const channelUrl = computed(() => {
+  const id = props.comment.platform_id || props.comment.platform_channel_id
+  return id ? `https://www.youtube.com/channel/${id}` : null
+})
 const videoUrl = computed(() =>
   props.comment.video_id ? `https://www.youtube.com/watch?v=${props.comment.video_id}` : null,
+)
+const videoLabel = computed(
+  () => props.comment.video_title || (props.comment.video_id ? 'Open video' : ''),
 )
 const postedAt = computed(() => relative(props.comment.posted_at))
 const isProcessing = computed(() => props.comment.processed_at === null)
@@ -52,15 +54,13 @@ function onToggleStar(): void {
 
 <template>
   <article
-    class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl p-5 hover:shadow-md transition-shadow duration-200 relative overflow-hidden"
+    class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-5 hover:shadow-pop transition-shadow duration-200 relative overflow-hidden"
     :class="isFocused ? 'ring-2 ring-brand-500 dark:ring-brand-400 shadow-md' : ''"
   >
-    <div class="absolute left-0 top-0 bottom-0 w-1 bg-brand-400" aria-hidden="true"></div>
-
-    <div class="pl-3">
+    <div>
       <div class="flex items-start justify-between gap-2">
         <div class="flex flex-wrap items-center gap-2 min-w-0">
-          <p class="text-sm font-semibold text-zinc-900 dark:text-zinc-100 truncate">{{ author }}</p>
+          <p class="text-sm font-semibold text-zinc-900 dark:text-white truncate">{{ author }}</p>
           <span class="text-zinc-300 dark:text-zinc-600">•</span>
           <a
             v-if="channelUrl"
@@ -72,11 +72,22 @@ function onToggleStar(): void {
             {{ channelLabel }}
           </a>
           <span v-else class="text-xs font-medium text-zinc-500 dark:text-zinc-400 truncate">{{ channelLabel }}</span>
+          <span v-if="videoUrl" class="text-zinc-300 dark:text-zinc-600">•</span>
+          <a
+            v-if="videoUrl"
+            :href="videoUrl"
+            target="_blank"
+            rel="noopener"
+            class="inline-flex items-center gap-1 text-xs font-medium text-zinc-500 dark:text-zinc-400 truncate underline-offset-2 hover:underline hover:text-zinc-900 dark:hover:text-zinc-100"
+          >
+            <Play class="w-3 h-3 shrink-0" aria-hidden="true" />
+            <span class="truncate">{{ videoLabel }}</span>
+          </a>
           <span v-if="postedAt" class="text-zinc-300 dark:text-zinc-600">•</span>
           <p v-if="postedAt" class="text-xs text-zinc-500 dark:text-zinc-400">{{ postedAt }}</p>
           <span
             v-if="isProcessing"
-            class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-50 text-amber-700 ring-1 ring-inset ring-amber-600/20" data-unslop-ignore
+            class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-50 dark:bg-amber-400/10 text-amber-700 dark:text-amber-300 ring-1 ring-inset ring-amber-600/20 dark:ring-amber-400/20" data-unslop-ignore
           >
             Processing…
           </span>
@@ -86,23 +97,12 @@ function onToggleStar(): void {
           :aria-pressed="isStarred"
           :aria-label="isStarred ? 'Unstar comment' : 'Star comment'"
           @click="onToggleStar"
-          class="flex items-center justify-center h-11 w-11 rounded-lg transition-colors focus:outline-none focus:ring-2 focus:ring-zinc-900 dark:focus:ring-zinc-100"
-          :class="isStarred ? 'text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-950/30' : 'text-zinc-400 hover:text-amber-400 hover:bg-zinc-50 dark:hover:bg-zinc-800'" data-unslop-ignore
+          class="flex items-center justify-center h-11 w-11 rounded-lg transition-all duration-200 active:scale-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60"
+          :class="isStarred ? 'text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-950/30' : 'text-zinc-400 hover:text-amber-400 hover:bg-zinc-100/80 dark:hover:bg-white/5'" data-unslop-ignore
         >
           <Star class="h-5 w-5" :fill="isStarred ? 'currentColor' : 'none'" />
         </button>
       </div>
-
-      <a
-        v-if="videoUrl && comment.video_title"
-        :href="videoUrl"
-        target="_blank"
-        rel="noopener"
-        class="mt-1 inline-flex items-center gap-1 max-w-full text-xs text-zinc-500 dark:text-zinc-400 truncate underline-offset-2 hover:underline hover:text-zinc-900 dark:hover:text-zinc-100"
-      >
-        <Play class="w-3 h-3 shrink-0" aria-hidden="true" />
-        <span class="truncate">{{ comment.video_title }}</span>
-      </a>
 
       <p class="text-[15px] text-zinc-800 dark:text-zinc-200 leading-relaxed mt-2 mb-3 break-words whitespace-pre-wrap">
         {{ visibleBody }}
@@ -110,7 +110,7 @@ function onToggleStar(): void {
           v-if="truncated"
           type="button"
           @click="expanded = !expanded"
-          class="ml-1 text-xs font-medium text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 underline-offset-2 hover:underline focus:outline-none focus:ring-2 focus:ring-zinc-900 dark:focus:ring-zinc-100 rounded"
+          class="ml-1 text-xs font-medium text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60 rounded"
         >
           {{ expanded ? 'Show less' : 'Show more' }}
         </button>
@@ -128,14 +128,14 @@ function onToggleStar(): void {
         </span>
         <span
           v-if="comment.topic"
-          class="inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium bg-zinc-50 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 ring-1 ring-inset ring-zinc-500/10 dark:ring-zinc-400/10"
+          class="inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium bg-zinc-50 dark:bg-white/5 text-zinc-700 dark:text-zinc-300 ring-1 ring-inset ring-zinc-500/10 dark:ring-white/10"
         >
           {{ comment.topic }}
         </span>
         <button
           v-if="hasInsights"
           type="button"
-          class="-m-2 p-2 focus:outline-none focus:ring-2 focus:ring-brand-500 rounded-lg"
+          class="-m-2 p-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60 rounded-lg"
           :aria-expanded="insightsExpanded"
           :aria-controls="insightListId"
           @click="insightsExpanded = !insightsExpanded"
@@ -148,7 +148,7 @@ function onToggleStar(): void {
         </button>
       </div>
 
-      <div v-if="hasInsights && insightsExpanded" :id="insightListId" class="mt-3 space-y-2 border-t border-zinc-100 dark:border-zinc-800 pt-3">
+      <div v-if="hasInsights && insightsExpanded" :id="insightListId" class="mt-3 space-y-2 border-t border-zinc-200/70 dark:border-white/5 pt-3">
         <div
           v-for="(insight, i) in insights"
           :key="i"

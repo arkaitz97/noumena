@@ -55,8 +55,8 @@ const pendingEmail = computed(() => account.profile?.pending_email ?? null)
 
 const verificationBadgeClass = computed(() =>
   account.isVerified
-    ? 'bg-emerald-50 text-emerald-700 ring-emerald-600/20'
-    : 'bg-amber-50 text-amber-700 ring-amber-600/20', // unslop-ignore: semantic pending state
+    ? 'bg-emerald-50 text-emerald-700 ring-emerald-600/20 dark:bg-emerald-400/10 dark:text-emerald-300 dark:ring-emerald-400/20'
+    : 'bg-amber-50 text-amber-700 ring-amber-600/20 dark:bg-amber-400/10 dark:text-amber-300 dark:ring-amber-400/20', // unslop-ignore: semantic pending state
 )
 
 const resendingChange = ref(false)
@@ -289,15 +289,15 @@ function downloadRecent(j: ExportJob): void {
 <template>
   <div class="max-w-5xl mx-auto py-8 px-4 sm:px-6 lg:px-8 space-y-8">
     <div>
-      <h1 class="text-2xl font-semibold leading-7 text-zinc-900 dark:text-zinc-100 tracking-tight">Account</h1>
+      <h1 class="text-2xl font-semibold leading-7 text-zinc-900 dark:text-white tracking-tight">Account</h1>
       <p class="mt-2 text-sm text-zinc-500 dark:text-zinc-400 dark:text-zinc-400">Manage your profile, preferences, and account lifecycle.</p>
     </div>
 
     <!-- Profile / email -->
-    <section class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl p-6 sm:p-8">
+    <section class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-6 sm:p-8">
       <div class="md:grid md:grid-cols-3 md:gap-8">
         <div class="md:col-span-1">
-          <h2 class="text-base font-semibold text-zinc-900 dark:text-zinc-100">Profile</h2>
+          <h2 class="text-base font-semibold text-zinc-900 dark:text-white">Profile</h2>
           <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400 pr-4">Your sign-in email and verification status.</p>
         </div>
         <div class="mt-5 md:mt-0 md:col-span-2 space-y-6">
@@ -305,7 +305,7 @@ function downloadRecent(j: ExportJob): void {
             <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Current email</p>
             <div class="mt-1 flex items-center gap-2">
               <Mail class="w-4 h-4 text-zinc-400 dark:text-zinc-500" />
-              <p class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{{ auth.user?.email ?? '—' }}</p>
+              <p class="text-sm font-semibold text-zinc-900 dark:text-white">{{ auth.user?.email ?? '—' }}</p>
               <span
                 v-if="account.profile"
                 :class="[
@@ -320,19 +320,19 @@ function downloadRecent(j: ExportJob): void {
             </div>
           </div>
 
-          <div v-if="pendingEmail" class="rounded-xl bg-amber-50 ring-1 ring-amber-600/20 p-4"> <!-- unslop-ignore -->
-            <p class="text-sm font-medium text-amber-800">
+          <div v-if="pendingEmail" class="rounded-xl bg-amber-50 dark:bg-amber-400/10 ring-1 ring-amber-600/20 dark:ring-amber-400/20 p-4"> <!-- unslop-ignore -->
+            <p class="text-sm font-medium text-amber-800 dark:text-amber-200">
               Verification pending for
               <span class="font-semibold">{{ pendingEmail }}</span>
             </p>
-            <p class="text-xs text-amber-700 mt-1">
+            <p class="text-xs text-amber-700 dark:text-amber-300 mt-1">
               Check your inbox (and spam) for the verification link. Your current email stays active until the new one is confirmed.
             </p>
             <button
               type="button"
               :disabled="resendingChange"
               @click="resendEmailChange"
-              class="mt-2 inline-flex items-center px-3 py-1.5 rounded-lg text-xs font-semibold text-amber-800 bg-amber-100 hover:bg-amber-200 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-amber-500" data-unslop-ignore
+              class="mt-2 inline-flex items-center px-3 py-1.5 rounded-lg text-xs font-semibold text-amber-800 dark:text-amber-200 bg-amber-100 dark:bg-amber-400/15 hover:bg-amber-200 dark:hover:bg-amber-400/25 disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500" data-unslop-ignore
             >
               {{ resendingChange ? 'Sending…' : 'Resend verification' }}
             </button>
@@ -355,10 +355,10 @@ function downloadRecent(j: ExportJob): void {
             </div>
           </form>
 
-          <div class="border-t border-zinc-100 dark:border-zinc-800 pt-4">
+          <div class="border-t border-zinc-200/70 dark:border-white/5 pt-4">
             <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider mb-3">Password</p>
             <form class="space-y-3" @submit.prevent="submitPasswordChange">
-              <div v-if="passwordError" role="alert" class="bg-rose-50 p-4 rounded-xl text-rose-700 text-sm border border-rose-100">
+              <div v-if="passwordError" role="alert" class="bg-rose-50 dark:bg-rose-500/10 p-4 rounded-xl text-rose-700 dark:text-rose-300 text-sm border border-rose-100 dark:border-rose-500/20">
                 {{ passwordError }}
               </div>
 
@@ -393,7 +393,7 @@ function downloadRecent(j: ExportJob): void {
                   type="button"
                   :disabled="sendingReset"
                   @click="sendPasswordReset"
-                  class="inline-flex items-center px-3 py-2 rounded-xl text-sm font-medium text-zinc-700 dark:text-zinc-300 bg-white border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900 disabled:opacity-50 transition-colors"
+                  class="inline-flex items-center px-3 py-2 rounded-xl text-sm font-medium text-zinc-700 dark:text-zinc-200 bg-white dark:bg-zinc-800/60 border border-zinc-200 dark:border-white/10 hover:border-zinc-300 hover:bg-zinc-50 dark:hover:border-white/20 dark:hover:bg-zinc-800 transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {{ sendingReset ? 'Sending…' : 'Send password reset email' }}
                 </button>
@@ -408,22 +408,22 @@ function downloadRecent(j: ExportJob): void {
     </section>
 
     <!-- Preferences -->
-    <section class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl p-6 sm:p-8">
+    <section class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-6 sm:p-8">
       <div class="md:grid md:grid-cols-3 md:gap-8">
         <div class="md:col-span-1">
-          <h2 class="text-base font-semibold text-zinc-900 dark:text-zinc-100">Preferences</h2>
+          <h2 class="text-base font-semibold text-zinc-900 dark:text-white">Preferences</h2>
           <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400 pr-4">Notification and digest options.</p>
         </div>
         <div class="mt-5 md:mt-0 md:col-span-2">
           <label class="flex items-start justify-between gap-4">
             <span class="flex-1">
-              <span class="block text-sm font-medium text-zinc-900 dark:text-zinc-100">Weekly digest email</span>
+              <span class="block text-sm font-medium text-zinc-900 dark:text-white">Weekly digest email</span>
               <span class="block text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">
                 Get a Monday summary of your top ideas, questions, and actionable insights.
               </span>
               <span
                 v-if="!account.supportsDigestOptIn"
-                class="inline-block mt-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400 bg-zinc-100 px-1.5 py-0.5 rounded-md"
+                class="inline-block mt-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400 bg-zinc-100 dark:bg-zinc-800 px-1.5 py-0.5 rounded-md"
               >
                 Coming soon
               </span>
@@ -433,7 +433,7 @@ function downloadRecent(j: ExportJob): void {
               :disabled="!account.supportsDigestOptIn"
               :checked="!!account.profile?.weekly_digest_opt_in"
               @change="onDigestToggle"
-              class="h-5 w-5 rounded border-zinc-300 text-zinc-900 dark:text-zinc-100 focus:ring-zinc-900 disabled:opacity-40 cursor-pointer"
+              class="h-5 w-5 rounded border-zinc-300 dark:border-zinc-600 text-zinc-900 dark:text-zinc-100 focus-visible:ring-2 focus-visible:ring-brand-500/60 focus-visible:border-brand-500/70 disabled:opacity-40 cursor-pointer"
               aria-label="Weekly digest opt-in"
             />
           </label>
@@ -442,10 +442,10 @@ function downloadRecent(j: ExportJob): void {
     </section>
 
     <!-- GDPR data export -->
-    <section class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl p-6 sm:p-8">
+    <section class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-6 sm:p-8">
       <div class="md:grid md:grid-cols-3 md:gap-8">
         <div class="md:col-span-1">
-          <h2 class="text-base font-semibold text-zinc-900 dark:text-zinc-100">Your data</h2>
+          <h2 class="text-base font-semibold text-zinc-900 dark:text-white">Your data</h2>
           <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400 pr-4">Download a portable copy of everything we hold for you.</p>
         </div>
         <div class="mt-5 md:mt-0 md:col-span-2 space-y-3">
@@ -454,7 +454,7 @@ function downloadRecent(j: ExportJob): void {
               type="button"
               :disabled="account.exportLoading"
               @click="onRequestExport"
-              class="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-medium text-zinc-700 dark:text-zinc-300 bg-white border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900 disabled:opacity-50"
+              class="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-medium text-zinc-700 dark:text-zinc-200 bg-white dark:bg-zinc-800/60 border border-zinc-200 dark:border-white/10 hover:border-zinc-300 hover:bg-zinc-50 dark:hover:border-white/20 dark:hover:bg-zinc-800 transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <Download class="w-4 h-4" />
               {{ account.exportLoading ? 'Requesting…' : 'Export my data (GDPR)' }}
@@ -464,12 +464,12 @@ function downloadRecent(j: ExportJob): void {
             </p>
           </div>
 
-          <div v-else class="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-700 p-4 bg-zinc-50/40 dark:bg-zinc-800/50">
-            <p class="text-sm font-medium text-zinc-900 dark:text-zinc-100">
+          <div v-else class="rounded-xl ring-1 ring-zinc-200/70 dark:ring-white/5 p-4 bg-zinc-50/40 dark:bg-zinc-800/50">
+            <p class="text-sm font-medium text-zinc-900 dark:text-white">
               Status:
               <span class="capitalize">{{ account.exportJob.status }}</span>
             </p>
-            <p v-if="account.exportJob.error" class="text-xs text-rose-600 mt-1">
+            <p v-if="account.exportJob.error" class="text-xs text-rose-600 dark:text-rose-400 mt-1">
               {{ account.exportJob.error }}
             </p>
 
@@ -477,7 +477,7 @@ function downloadRecent(j: ExportJob): void {
               <button
                 type="button"
                 @click="downloadExport"
-                class="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-medium text-white bg-zinc-900 hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900"
+                class="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-medium text-white bg-zinc-900 hover:bg-zinc-700 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 shadow-card dark:shadow-none transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900"
               >
                 <Download class="w-4 h-4" /> Download (.zip)
               </button>
@@ -490,7 +490,7 @@ function downloadRecent(j: ExportJob): void {
               <button
                 type="button"
                 @click="onRequestExport"
-                class="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-medium text-zinc-700 dark:text-zinc-300 bg-white border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900"
+                class="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-medium text-zinc-700 dark:text-zinc-200 bg-white dark:bg-zinc-800/60 border border-zinc-200 dark:border-white/10 hover:border-zinc-300 hover:bg-zinc-50 dark:hover:border-white/20 dark:hover:bg-zinc-800 transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900"
               >
                 Retry
               </button>
@@ -513,33 +513,33 @@ function downloadRecent(j: ExportJob): void {
     </section>
 
     <!-- Recent comment exports -->
-    <section class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl p-6 sm:p-8">
+    <section class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-6 sm:p-8">
       <div class="md:grid md:grid-cols-3 md:gap-8">
         <div class="md:col-span-1">
-          <h2 class="text-base font-semibold text-zinc-900 dark:text-zinc-100">Recent exports</h2>
+          <h2 class="text-base font-semibold text-zinc-900 dark:text-white">Recent exports</h2>
           <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400 pr-4">Comment exports you've requested from the feed.</p>
         </div>
         <div class="mt-5 md:mt-0 md:col-span-2">
           <p v-if="recentLoading" class="text-sm text-zinc-500 dark:text-zinc-400">Loading…</p>
-          <ul v-else-if="recent.length > 0" class="divide-y divide-zinc-100 dark:divide-zinc-800">
+          <ul v-else-if="recent.length > 0" class="divide-y divide-zinc-200/70 dark:divide-white/5">
             <li
               v-for="j in recent"
               :key="j.job_id"
               class="py-2.5 flex items-center gap-3"
             >
               <div class="flex-1 min-w-0">
-                <p class="text-sm text-zinc-900 dark:text-zinc-100">
+                <p class="text-sm text-zinc-900 dark:text-white">
                   {{ (j.format ?? 'comments').toUpperCase() }} export
                   <span class="capitalize text-xs text-zinc-500 dark:text-zinc-400">· {{ j.status }}</span>
                 </p>
                 <p v-if="j.created_at" class="text-[11px] text-zinc-400 dark:text-zinc-500">{{ j.created_at }}</p>
-                <p v-if="j.status === 'failed' && j.error" class="text-[11px] text-rose-600">{{ j.error }}</p>
+                <p v-if="j.status === 'failed' && j.error" class="text-[11px] text-rose-600 dark:text-rose-400">{{ j.error }}</p>
               </div>
               <button
                 v-if="j.status === 'completed' && recentDownloadUrl(j)"
                 type="button"
                 @click="downloadRecent(j)"
-                class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-zinc-700 dark:text-zinc-300 bg-white border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 focus:outline-none focus:ring-2 focus:ring-zinc-900"
+                class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-zinc-700 dark:text-zinc-200 bg-white dark:bg-zinc-800/60 border border-zinc-200 dark:border-white/10 hover:border-zinc-300 hover:bg-zinc-50 dark:hover:border-white/20 dark:hover:bg-zinc-800 transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900"
               >
                 <Download class="w-3.5 h-3.5" /> Download
               </button>
@@ -551,20 +551,20 @@ function downloadRecent(j: ExportJob): void {
     </section>
 
     <!-- Danger zone -->
-    <section class="bg-rose-50/50 dark:bg-rose-950/20 ring-1 ring-rose-950/10 dark:ring-rose-500/20 rounded-xl p-6 sm:p-8">
+    <section class="bg-rose-50/50 dark:bg-rose-500/[0.06] ring-1 ring-rose-200 dark:ring-rose-500/30 rounded-xl p-6 sm:p-8">
       <div class="md:grid md:grid-cols-3 md:gap-8">
         <div class="md:col-span-1">
-          <h2 class="text-base font-semibold text-rose-700">Danger zone</h2>
-          <p class="mt-1 text-sm text-rose-600/80 pr-4">Irreversible account actions.</p>
+          <h2 class="text-base font-semibold text-rose-700 dark:text-rose-300">Danger zone</h2>
+          <p class="mt-1 text-sm text-rose-600/80 dark:text-rose-400 pr-4">Irreversible account actions.</p>
         </div>
         <div class="mt-5 md:mt-0 md:col-span-2">
-          <p class="text-sm text-rose-700/80 mb-4">
+          <p class="text-sm text-rose-700/80 dark:text-rose-300 mb-4">
             Deleting your account schedules permanent removal of your channels, saved comments, and personal data.
           </p>
           <button
             type="button"
             @click="openDelete"
-            class="inline-flex items-center px-4 py-2.5 rounded-xl text-sm font-medium text-rose-600 bg-white shadow-sm ring-1 ring-rose-200 hover:bg-rose-50 hover:ring-rose-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-rose-500 transition-colors"
+            class="inline-flex items-center px-4 py-2.5 rounded-xl text-sm font-medium text-rose-600 dark:text-rose-400 bg-white dark:bg-zinc-900 shadow-card ring-1 ring-rose-200 dark:ring-rose-500/30 hover:bg-rose-50 dark:hover:bg-rose-500/10 hover:ring-rose-300 dark:hover:ring-rose-400/40 transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-rose-500 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900"
           >
             Delete account
           </button>
@@ -597,14 +597,14 @@ function downloadRecent(j: ExportJob): void {
       <template v-else>
         <p class="text-sm text-zinc-700 dark:text-zinc-300">
           Type your email
-          <strong class="text-zinc-900 dark:text-zinc-100 font-semibold">{{ auth.user?.email }}</strong>
+          <strong class="text-zinc-900 dark:text-white font-semibold">{{ auth.user?.email }}</strong>
           to confirm.
         </p>
         <input
           v-model="deleteEmailInput"
           type="email"
           autocomplete="off"
-          class="mt-3 appearance-none block w-full px-4 py-3 border border-zinc-200 dark:border-zinc-700 rounded-xl shadow-sm text-sm focus:outline-none focus:ring-2 focus:ring-rose-500 focus:border-rose-500 bg-zinc-50/50 focus:bg-white dark:bg-zinc-800 dark:focus:bg-zinc-800 dark:text-zinc-100"
+          class="mt-3 appearance-none block w-full px-4 py-3 border border-zinc-200/70 dark:border-white/5 rounded-xl shadow-sm text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-rose-500 focus-visible:border-rose-500 bg-zinc-50/50 focus:bg-white dark:bg-zinc-800 dark:focus:bg-zinc-800 dark:text-white"
           placeholder="Enter your email"
         />
         <p v-if="deleteError" role="alert" class="mt-2 text-xs text-rose-600 dark:text-rose-400 font-medium">{{ deleteError }}</p>
@@ -616,7 +616,7 @@ function downloadRecent(j: ExportJob): void {
             v-if="deleteStep === 1"
             type="button"
             @click="deleteStep = 2"
-            class="w-full sm:w-auto inline-flex justify-center items-center py-2.5 px-5 rounded-xl text-sm font-medium text-white bg-rose-600 hover:bg-rose-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-rose-500 transition-colors"
+            class="w-full sm:w-auto inline-flex justify-center items-center py-2.5 px-5 rounded-xl text-sm font-medium text-white bg-rose-600 hover:bg-rose-700 transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-rose-500"
           >
             I understand, continue
           </button>
@@ -625,7 +625,7 @@ function downloadRecent(j: ExportJob): void {
             type="button"
             :disabled="!deleteEmailMatches || deleteSubmitting"
             @click="submitDelete"
-            class="w-full sm:w-auto inline-flex justify-center items-center py-2.5 px-5 rounded-xl text-sm font-medium text-white bg-rose-600 hover:bg-rose-700 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-rose-500 transition-colors"
+            class="w-full sm:w-auto inline-flex justify-center items-center py-2.5 px-5 rounded-xl text-sm font-medium text-white bg-rose-600 hover:bg-rose-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-rose-500"
           >
             {{ deleteSubmitting ? 'Deleting…' : 'Permanently delete my account' }}
           </button>
@@ -633,7 +633,7 @@ function downloadRecent(j: ExportJob): void {
             type="button"
             data-modal-cancel="true"
             @click="closeDelete"
-            class="w-full sm:w-auto inline-flex justify-center items-center py-2.5 px-5 rounded-xl text-sm font-medium text-zinc-700 dark:text-zinc-300 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900"
+            class="w-full sm:w-auto inline-flex justify-center items-center py-2.5 px-5 rounded-xl text-sm font-medium text-zinc-700 dark:text-zinc-200 bg-white dark:bg-zinc-800/60 border border-zinc-200 dark:border-white/10 hover:border-zinc-300 hover:bg-zinc-50 dark:hover:border-white/20 dark:hover:bg-zinc-800 transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900"
           >
             Cancel
           </button>

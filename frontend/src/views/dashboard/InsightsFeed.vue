@@ -123,34 +123,36 @@ function onResetFilters(): void {
   void feed.fetchFeed({ reset: true })
 }
 
-const insightsWindow = ref<WindowKey>('7d')
+// Widgets follow the FilterBar: one channel (first selected), the screen
+// range, and — for the actionable panel — the insight-type filter.
+const widgetChannelId = computed(() => feed.filters.channels[0] ?? null)
+const range = ref<WindowKey>('7d')
+const rangeDays = computed(() => ({ '7d': 7, '30d': 30, '90d': 90 })[range.value])
+// Backend toxicity-shield only supports 7d/30d (insights_handlers.go) — clamp.
+const toxicityWindow = computed<'7d' | '30d'>(() => (range.value === '90d' ? '30d' : range.value))
 
 async function refreshInsights(force = false): Promise<void> {
-  await insights.fetchActionableInsights(undefined, insightsWindow.value, { force })
-}
-
-function onInsightsWindowChange(w: WindowKey): void {
-  insightsWindow.value = w
-  void refreshInsights(false)
+  await insights.fetchActionableInsights(widgetChannelId.value ?? undefined, range.value, { force })
 }
 
 // Sentiment trend — the backend accepts an optional channel_id: with a
 // channel filter selected the chart is scoped to that channel, without one
 // it aggregates across every tracked channel (global trend).
 // `fetchSentiment` is guarded for test doubles that predate the action.
-const sentimentDays = ref(7)
-const sentimentChannelId = computed(() => feed.filters.channels[0] ?? null)
-
 async function refreshSentiment(force = false): Promise<void> {
-  await insights.fetchSentiment?.(sentimentChannelId.value ?? undefined, sentimentDays.value, { force })
+  await insights.fetchSentiment?.(widgetChannelId.value ?? undefined, rangeDays.value, { force })
 }
 
-function onSentimentDaysChange(days: number): void {
-  sentimentDays.value = days
-  void refreshSentiment(false)
+function refreshRangeWidgets(force: boolean): void {
+  void refreshInsights(force)
+  void insights.fetchToxicity(widgetChannelId.value ?? undefined, toxicityWindow.value, { force })
+  void insights.fetchTrends(widgetChannelId.value ?? undefined, rangeDays.value, { force })
 }
 
-watch(sentimentChannelId, () => {
+watch(range, () => refreshRangeWidgets(false))
+
+watch(widgetChannelId, () => {
+  refreshRangeWidgets(true)
   void refreshSentiment(true)
 })
 
@@ -234,9 +236,7 @@ onMounted(async () => {
   void channels.fetchAll()
   void billing.fetchStatus()
   void feed.fetchFeed({ reset: true })
-  void refreshInsights(true)
-  void insights.fetchToxicity(undefined, '7d', { force: true })
-  void insights.fetchTrends(undefined, 7, { force: true })
+  refreshRangeWidgets(true)
   void insights.fetchLatestDigest({ force: true })
   void refreshSentiment(true)
 
@@ -252,9 +252,9 @@ onBeforeUnmount(() => {
 usePolling(() => feed.fetchFeed({ reset: true }), 60_000)
 usePolling(async () => {
   await Promise.all([
-    insights.fetchActionableInsights(undefined, insightsWindow.value, { force: true }),
-    insights.fetchToxicity(undefined, '7d', { force: true }),
-    insights.fetchTrends(undefined, 7, { force: true }),
+    insights.fetchActionableInsights(widgetChannelId.value ?? undefined, range.value, { force: true }),
+    insights.fetchToxicity(widgetChannelId.value ?? undefined, toxicityWindow.value, { force: true }),
+    insights.fetchTrends(widgetChannelId.value ?? undefined, rangeDays.value, { force: true }),
     refreshSentiment(true),
   ])
 }, 5 * 60_000)
@@ -262,21 +262,21 @@ usePolling(async () => {
 
 <template>
   <div class="max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8">
-    <div class="md:flex md:items-center md:justify-between mb-6">
+    <div class="md:flex md:items-end md:justify-between mb-6">
       <div class="flex-1 min-w-0">
-        <h1 class="text-2xl font-semibold leading-7 text-zinc-900 dark:text-zinc-100 sm:text-3xl sm:tracking-tight">
+        <h1 class="text-2xl sm:text-3xl font-bold tracking-tight text-zinc-900 dark:text-white">
           Insights feed
         </h1>
-        <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
+        <p class="mt-1.5 text-sm text-zinc-500 dark:text-zinc-400">
           Real-time signals across your channels.
         </p>
       </div>
       <button
         type="button"
         @click="helpVisible = true"
-        class="mt-4 md:mt-0 inline-flex items-center gap-1.5 text-xs font-medium text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 px-2.5 py-1.5 rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
+        class="mt-4 md:mt-0 inline-flex items-center gap-2 text-xs font-semibold text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white px-3 py-2 rounded-lg hover:bg-zinc-100/80 dark:hover:bg-white/5 transition-all duration-200 active:scale-95"
       >
-        <kbd class="inline-flex items-center justify-center min-w-[1.25rem] px-1 py-0.5 text-[10px] font-mono font-semibold bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded">?</kbd>
+        <kbd class="inline-flex items-center justify-center min-w-[1.4rem] h-5 px-1 py-0.5 text-[10px] font-mono font-semibold bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-white/10 rounded-md shadow-card dark:shadow-none">?</kbd>
         Keyboard shortcuts
       </button>
     </div>
@@ -284,15 +284,15 @@ usePolling(async () => {
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
       <Card>
         <div class="flex items-center gap-2 text-zinc-500 dark:text-zinc-400 text-xs font-medium uppercase tracking-wider">
-          <MessageSquare class="w-3.5 h-3.5" /> Insights ({{ insightsWindow }})
+          <MessageSquare class="w-3.5 h-3.5" /> Insights ({{ range }})
         </div>
-        <p class="mt-2 text-2xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-100 font-mono tabular-nums">
+        <p class="mt-2 text-2xl font-bold tracking-tight text-zinc-900 dark:text-white font-mono tabular-nums">
           {{ totalCommentsCount !== null ? totalCommentsCount.toLocaleString() : '—' }}
         </p>
       </Card>
 
-      <Card class="flex items-center gap-3">
-        <ToxicityShield :data="insights.toxicity" window-key="7d" compact />
+      <Card class="flex items-center gap-4">
+        <ToxicityShield :data="insights.toxicity" :window-key="toxicityWindow" compact />
         <div>
           <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Toxicity shield</p>
           <p class="text-[11px] text-zinc-500 dark:text-zinc-400 mt-1">
@@ -315,7 +315,7 @@ usePolling(async () => {
         <RouterLink
           v-if="billing.nearLimit && billing.status?.plan === 'free'"
           to="/settings/billing"
-          class="mt-2 inline-flex items-center text-xs font-semibold text-brand-600 dark:text-brand-400 hover:underline"
+          class="mt-2 inline-flex items-center text-xs font-semibold text-brand-600 dark:text-brand-400 hover:text-brand-700 dark:hover:text-brand-300 hover:underline underline-offset-2"
         >
           Upgrade plan →
         </RouterLink>
@@ -325,7 +325,7 @@ usePolling(async () => {
         <div class="flex items-center gap-2 text-zinc-500 dark:text-zinc-400 text-xs font-medium uppercase tracking-wider">
           <TrendingUp class="w-3.5 h-3.5" /> Top insight type
         </div>
-        <p class="mt-2 text-lg font-semibold tracking-tight text-zinc-900 dark:text-zinc-100">
+        <p class="mt-2 text-lg font-bold tracking-tight text-zinc-900 dark:text-white">
           {{
             insights.actionableInsights?.distribution?.length
               ? insights.actionableInsights.distribution.sort((a, b) => b.count - a.count)[0].type.replace(/_/g, ' ')
@@ -336,7 +336,7 @@ usePolling(async () => {
           {{
             insights.actionableInsights?.distribution?.length
               ? `${insights.actionableInsights.distribution.sort((a, b) => b.count - a.count)[0].count} mentions`
-              : 'vs prior ' + insightsWindow
+              : 'vs prior ' + range
           }}
         </p>
       </Card>
@@ -349,8 +349,10 @@ usePolling(async () => {
             ref="filterBarRef"
             :filters="feed.filters"
             :channels="channels.channels"
+            :range="range"
             variant="feed"
             @update:filters="onUpdateFilters"
+            @update:range="range = $event"
             @export="canExport && (exportOpen = true)"
             @reset="onResetFilters"
           />
@@ -359,20 +361,20 @@ usePolling(async () => {
         <!-- Export result surface (fix-frontend-plumbing) -->
         <div
           v-if="feed.exportJob"
-          class="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-700 p-4 bg-white dark:bg-zinc-900 shadow-sm"
+          class="rounded-xl ring-1 ring-zinc-950/5 dark:ring-white/10 p-4 bg-white dark:bg-zinc-900 shadow-card"
         >
           <div class="flex items-center gap-3">
             <span
-              class="inline-block h-2 w-2 rounded-full"
+              class="inline-block h-2 w-2 rounded-full ring-4 ring-transparent"
               :class="
                 feed.exportJob.status === 'completed'
-                  ? 'bg-emerald-500'
+                  ? 'bg-emerald-500 ring-emerald-500/20'
                   : feed.exportJob.status === 'failed'
-                    ? 'bg-rose-500'
-                    : 'bg-amber-500 animate-pulse'
+                    ? 'bg-rose-500 ring-rose-500/20'
+                    : 'bg-amber-400 ring-amber-400/20 animate-pulse'
               "
             ></span>
-            <p class="text-sm font-medium text-zinc-900 dark:text-zinc-100">
+            <p class="text-sm font-medium text-zinc-900 dark:text-white">
               Export
               <span class="capitalize">{{ feed.exportJob.status }}</span>
             </p>
@@ -380,20 +382,20 @@ usePolling(async () => {
               <a
                 v-if="feed.exportJob.status === 'completed' && (feed.exportJob.download_url || feed.exportJob.export_url)"
                 :href="feed.exportJob.download_url ?? feed.exportJob.export_url!"
-                class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-white bg-zinc-900 dark:bg-zinc-100 dark:text-zinc-900 hover:bg-zinc-800"
+                class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-white bg-zinc-900 dark:bg-white dark:text-zinc-900 hover:bg-zinc-700 dark:hover:bg-zinc-200 transition-all duration-200 active:scale-95"
               >
                 <Download class="w-3.5 h-3.5" /> Download
               </a>
               <button
                 type="button"
                 @click="feed.clearExportJob()"
-                class="text-xs text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300"
+                class="text-xs font-medium text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300 transition-colors"
               >
                 Dismiss
               </button>
             </div>
           </div>
-          <p v-if="feed.exportJob.status === 'failed' && feed.exportJob.error" class="mt-1 text-xs text-rose-600">
+          <p v-if="feed.exportJob.status === 'failed' && feed.exportJob.error" class="mt-1 text-xs text-rose-600 dark:text-rose-400">
             {{ feed.exportJob.error }}
           </p>
           <p v-else-if="feed.exportJob.expires_at" class="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
@@ -401,26 +403,22 @@ usePolling(async () => {
           </p>
         </div>
 
-        <ActionableInsightsPanel
-          :data="insights.actionableInsights"
-          :window-key="insightsWindow"
-          @update:window-key="onInsightsWindowChange"
-        />
+        <ActionableInsightsPanel :data="insights.actionableInsights" :type-filter="feed.filters.insight_type" />
 
-        <SentimentChart :data="insights.sentiment" @update:days="onSentimentDaysChange" />
+        <SentimentChart :data="insights.sentiment" />
 
         <div v-if="feed.isInitialLoad" class="space-y-3" role="status" aria-label="Loading comments">
           <div
             v-for="i in 4"
             :key="i"
-            class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl h-28 animate-pulse"
+            class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl h-28 animate-pulse"
           ></div>
         </div>
 
         <div v-else-if="feed.comments.length === 0">
-          <Card padding="none" class="p-10 text-center">
-            <p class="text-sm font-medium text-zinc-900 dark:text-zinc-100">No comments match these filters.</p>
-            <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-1">Try resetting filters or widening the date range.</p>
+          <Card padding="none" class="p-12 text-center">
+            <p class="text-sm font-semibold text-zinc-900 dark:text-white">No comments match these filters.</p>
+            <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-1.5">Try resetting filters or widening the date range.</p>
           </Card>
         </div>
 
@@ -450,15 +448,15 @@ usePolling(async () => {
           class="space-y-0"
         >
           <Card padding="none" class="p-5">
-            <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider mb-2">Top topics</p>
+            <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider mb-3">Top topics</p>
             <div class="flex flex-wrap gap-1.5">
               <span
                 v-for="t in insights.trends.top_topics.slice(0, 12)"
                 :key="t.topic"
-                class="inline-flex items-center px-2 py-0.5 rounded-md text-xs bg-zinc-50 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 ring-1 ring-inset ring-zinc-500/10 dark:ring-zinc-400/10"
+                class="inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium bg-zinc-50 dark:bg-white/5 text-zinc-700 dark:text-zinc-300 ring-1 ring-inset ring-zinc-500/10 dark:ring-white/10 transition-colors hover:bg-brand-50 dark:hover:bg-brand-400/10 hover:text-brand-700 dark:hover:text-brand-300"
               >
                 {{ t.topic }}
-                <span class="ml-1 text-zinc-500 dark:text-zinc-400 font-mono tabular-nums">{{ t.count }}</span>
+                <span class="ml-1.5 text-zinc-400 dark:text-zinc-500 font-mono tabular-nums">{{ t.count }}</span>
               </span>
             </div>
           </Card>
@@ -476,19 +474,19 @@ usePolling(async () => {
     <Teleport to="body">
       <div v-if="exportOpen" class="fixed z-50 inset-0 overflow-y-auto" role="dialog" aria-modal="true">
         <div class="flex items-end justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:block sm:p-0">
-          <div class="fixed inset-0 bg-zinc-900/60 backdrop-blur-sm" aria-hidden="true" @click="exportOpen = false"></div>
+          <div class="fixed inset-0 bg-zinc-950/50 backdrop-blur-sm dark:bg-black/60" aria-hidden="true" @click="exportOpen = false"></div>
           <span class="hidden sm:inline-block sm:align-middle sm:h-screen" aria-hidden="true">&#8203;</span>
-          <div class="relative z-10 inline-block align-bottom bg-white dark:bg-zinc-900 rounded-xl px-4 pt-5 pb-6 text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-md sm:w-full sm:p-8">
+          <div class="relative z-10 inline-block align-bottom bg-white dark:bg-zinc-900 rounded-2xl px-4 pt-5 pb-6 text-left overflow-hidden shadow-pop ring-1 ring-zinc-950/5 dark:ring-white/10 transform transition-all sm:my-8 sm:align-middle sm:max-w-md sm:w-full sm:p-8">
             <div class="flex items-start justify-between">
               <div>
-                <h3 class="text-xl font-semibold text-zinc-900 dark:text-zinc-100">Export comments</h3>
+                <h3 class="text-xl font-bold tracking-tight text-zinc-900 dark:text-white">Export comments</h3>
                 <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400">Exports your current filtered view.</p>
               </div>
               <button
                 type="button"
                 aria-label="Close"
                 @click="exportOpen = false"
-                class="p-1.5 rounded-lg text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-zinc-900"
+                class="p-2 rounded-lg text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-white/5 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60 transition-colors"
               >
                 <X class="w-4 h-4" />
               </button>
@@ -498,7 +496,7 @@ usePolling(async () => {
               <select
                 id="export-format"
                 v-model="exportFormat"
-                class="block w-full px-3 py-2.5 border border-zinc-200 dark:border-zinc-700 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900 bg-zinc-50/50 dark:bg-zinc-800 dark:text-zinc-100"
+                class="appearance-none block w-full px-4 py-2.5 border border-zinc-200 dark:border-white/10 rounded-xl bg-white dark:bg-zinc-800/60 text-sm text-zinc-900 dark:text-zinc-100 shadow-sm transition-all duration-200 hover:border-zinc-300 dark:hover:border-white/20 focus:outline-none focus:ring-2 focus:ring-brand-500/30 focus:border-brand-500/70"
               >
                 <option value="csv">CSV</option>
                 <option value="json">JSON</option>
@@ -509,7 +507,7 @@ usePolling(async () => {
                 type="button"
                 :disabled="exportSubmitting"
                 @click="submitExport"
-                class="inline-flex justify-center items-center gap-1.5 py-2.5 px-5 rounded-xl text-sm font-medium text-white bg-zinc-900 dark:bg-zinc-100 dark:text-zinc-900 hover:bg-zinc-800 dark:hover:bg-zinc-200 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900"
+                class="inline-flex justify-center items-center gap-1.5 py-2.5 px-5 rounded-xl text-sm font-semibold text-white bg-zinc-900 dark:bg-white dark:text-zinc-900 hover:bg-zinc-700 dark:hover:bg-zinc-200 shadow-card dark:shadow-none transition-all duration-200 ease-snappy active:scale-[0.98] disabled:opacity-50 disabled:pointer-events-none focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900"
               >
                 <Download class="w-4 h-4" />
                 {{ exportSubmitting ? 'Working…' : 'Start export' }}
@@ -517,7 +515,7 @@ usePolling(async () => {
               <button
                 type="button"
                 @click="exportOpen = false"
-                class="inline-flex justify-center items-center py-2.5 px-5 rounded-xl text-sm font-medium text-zinc-700 dark:text-zinc-300 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900"
+                class="inline-flex justify-center items-center py-2.5 px-5 rounded-xl text-sm font-semibold text-zinc-700 dark:text-zinc-200 bg-white dark:bg-zinc-800/60 border border-zinc-200 dark:border-white/10 hover:border-zinc-300 hover:bg-zinc-50 dark:hover:border-white/20 dark:hover:bg-zinc-800 transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900"
               >
                 Cancel
               </button>
@@ -535,12 +533,12 @@ usePolling(async () => {
 .comment-list-enter-active,
 .comment-list-leave-active,
 .comment-list-move {
-  transition: opacity 0.2s ease, transform 0.2s ease;
+  transition: opacity 0.25s cubic-bezier(0.16, 1, 0.3, 1), transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
 }
 .comment-list-enter-from,
 .comment-list-leave-to {
   opacity: 0;
-  transform: translateY(8px);
+  transform: translateY(10px) scale(0.995);
 }
 .comment-list-leave-active {
   position: absolute;

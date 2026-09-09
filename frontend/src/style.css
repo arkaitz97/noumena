@@ -1,10 +1,32 @@
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800&family=Geist+Mono:wght@400;500;600&display=swap');
 @import "tailwindcss";
 
+/* Dark mode is class-driven: useDarkMode() toggles `dark` on <html>.
+   Tailwind v4 defaults dark: to the OS media query, so the class strategy
+   must be declared explicitly or the in-app toggle stops working. */
+@custom-variant dark (&:where(.dark, .dark *));
+
 @theme {
-  /* Brand: electric cyan — "analytics engine" identity for a comment-insights
+  /* Neutrals: cool blue-charcoal instead of raw gray — a "studio
+     instrument" temperature that makes white cards and cyan accents read
+     crisper in light mode and gives dark mode layered depth (slate-charcoal,
+     never pure #000). Keeps the zinc-* names so every existing utility
+     resolves to the new ramp. */
+  --color-zinc-50: #f6f7f9;
+  --color-zinc-100: #eceef2;
+  --color-zinc-200: #dce0e7;
+  --color-zinc-300: #c2c9d3;
+  --color-zinc-400: #99a3b2;
+  --color-zinc-500: #6d7787;
+  --color-zinc-600: #525b6b;
+  --color-zinc-700: #414a59;
+  --color-zinc-800: #28303e;
+  --color-zinc-900: #191e28;
+  --color-zinc-950: #12161f;
+
+  /* Brand: arctic cyan — "analytics engine" identity for a comment-insights
      product. Chosen deliberately over framework indigo; 600 tuned for text
-     contrast (5.4:1 on white), 500 is the vivid accent. */
+     contrast on white, 500 is the vivid accent, 400 for dark surfaces. */
   --color-brand-50: #ecfeff;
   --color-brand-100: #cffafe;
   --color-brand-200: #a5f3fc;
@@ -17,14 +39,42 @@
   --color-brand-900: #0c4557;
   --color-brand-950: #072f3d;
 
-  /* Type: IBM Plex Sans body + IBM Plex Mono for data/numeric accents.
-     A coherent technical pair (information-systems heritage) instead of
-     the Inter default. */
-  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, sans-serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  /* Type: Geist Sans (UI + display, 800 for dramatic headlines) with
+     Geist Mono for data/numerics. Same-foundry pairing, no Inter default. */
+  --font-sans: "Geist", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Signature motion curve: fast start, expo settle — physics, not linear. */
+  --ease-snappy: cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* Elevation tinted to the neutral hue (blue-charcoal), never pure black. */
+  --shadow-card: 0 1px 2px rgb(18 22 31 / 0.04), 0 8px 24px -16px rgb(18 22 31 / 0.12);
+  --shadow-pop: 0 2px 4px rgb(18 22 31 / 0.05), 0 12px 32px -12px rgb(18 22 31 / 0.18);
+  --shadow-glow: 0 0 0 1px rgb(6 182 212 / 0.2), 0 8px 30px -8px rgb(6 182 212 / 0.35);
 }
 
-button:not(:disabled), [role="button"]:not(:disabled) {
+@layer base {
+  html {
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body {
+    @apply bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100;
+  }
+
+  ::selection {
+    @apply bg-brand-500/20 text-brand-900 dark:text-brand-100;
+  }
+
+  /* Numeric data everywhere should align on the same tabular rhythm. */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+button:not(:disabled),
+[role="button"]:not(:disabled) {
   cursor: pointer;
 }
 

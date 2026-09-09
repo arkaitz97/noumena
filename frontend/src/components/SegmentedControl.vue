@@ -23,7 +23,7 @@ const emit = defineEmits<{ (e: 'update:modelValue', value: string | number): voi
 
 <template>
   <div
-    class="inline-flex rounded-lg bg-zinc-100 dark:bg-zinc-800 p-0.5"
+    class="inline-flex rounded-lg bg-zinc-100 dark:bg-zinc-800 p-1 gap-1 shadow-inner shadow-zinc-950/5 dark:shadow-black/20 ring-1 ring-zinc-950/5 dark:ring-white/5"
     role="tablist"
     :aria-label="label"
     @keydown="onRovingTablistKeydown"
@@ -37,10 +37,10 @@ const emit = defineEmits<{ (e: 'update:modelValue', value: string | number): voi
       :tabindex="modelValue === opt.value ? 0 : -1"
       @click="emit('update:modelValue', opt.value)"
       :class="[
-        'px-2.5 py-1 text-xs font-medium rounded-md transition-colors',
+        'px-3 py-1.5 text-xs font-semibold rounded-md transition-all duration-200 ease-snappy focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60',
         modelValue === opt.value
-          ? 'bg-white dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100 shadow-sm'
-          : 'text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100',
+          ? 'bg-white dark:bg-zinc-600 text-zinc-900 dark:text-white shadow-card dark:shadow-none'
+          : 'text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 hover:bg-white/60 dark:hover:bg-zinc-700/40',
       ]"
     >
       {{ opt.label }}

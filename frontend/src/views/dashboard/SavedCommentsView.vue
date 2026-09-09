@@ -102,7 +102,7 @@ onBeforeUnmount(() => {
 <template>
   <div class="max-w-5xl mx-auto py-8 px-4 sm:px-6 lg:px-8">
     <div class="mb-6">
-      <h1 class="text-2xl font-semibold leading-7 text-zinc-900 dark:text-zinc-100 sm:text-3xl sm:tracking-tight">
+      <h1 class="text-2xl font-semibold leading-7 text-zinc-900 dark:text-white sm:text-3xl sm:tracking-tight">
         Saved comments
       </h1>
       <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
@@ -123,19 +123,19 @@ onBeforeUnmount(() => {
       <div
         v-for="i in 3"
         :key="i"
-        class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl h-28 animate-pulse"
+        class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl h-28 animate-pulse"
       ></div>
     </div>
 
     <div
       v-else-if="feed.savedComments.length === 0"
-      class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl p-10 text-center"
+      class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-10 text-center"
     >
-      <p class="text-sm font-medium text-zinc-900 dark:text-zinc-100">No saved comments yet.</p>
+      <p class="text-sm font-medium text-zinc-900 dark:text-white">No saved comments yet.</p>
       <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-1">Star comments from your feed to keep track of them here.</p>
       <RouterLink
         to="/dashboard"
-        class="mt-4 inline-flex items-center px-3 py-2 border border-zinc-200 dark:border-zinc-700 shadow-sm text-sm font-medium rounded-xl text-zinc-700 dark:text-zinc-300 bg-white dark:bg-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-700"
+        class="mt-4 inline-flex items-center px-3 py-2 border border-zinc-200 dark:border-white/10 shadow-card text-sm font-medium rounded-xl text-zinc-700 dark:text-zinc-200 bg-white dark:bg-zinc-800/60 hover:border-zinc-300 hover:bg-zinc-50 dark:hover:border-white/20 dark:hover:bg-zinc-800 transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900"
       >
         Go to feed
       </RouterLink>
@@ -164,7 +164,9 @@ onBeforeUnmount(() => {
 .saved-list-enter-active,
 .saved-list-leave-active,
 .saved-list-move {
-  transition: opacity 0.2s ease, transform 0.2s ease;
+  transition:
+    opacity 0.3s cubic-bezier(0.16, 1, 0.3, 1),
+    transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
 }
 .saved-list-enter-from,
 .saved-list-leave-to {

@@ -44,8 +44,12 @@ const onInput = (e: Event) => {
       :aria-invalid="error ? 'true' : undefined"
       :aria-describedby="error ? `${inputId}-error` : hint ? `${inputId}-hint` : undefined"
       @input="onInput"
-      class="appearance-none block w-full px-4 py-3 border border-zinc-200 dark:border-zinc-700 rounded-xl shadow-sm placeholder-zinc-400 dark:placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900 sm:text-sm transition-colors bg-zinc-50/50 focus:bg-white dark:bg-zinc-800 dark:focus:bg-zinc-800 dark:text-zinc-100 text-zinc-900 disabled:opacity-60"
-      :class="error ? 'border-rose-300 focus:ring-rose-500 focus:border-rose-500' : ''"
+      class="appearance-none block w-full px-4 py-3 border border-zinc-200 dark:border-white/10 rounded-xl bg-white dark:bg-zinc-800/60 shadow-sm placeholder-zinc-400 dark:placeholder-zinc-500 sm:text-sm transition-all duration-200 ease-snappy focus:outline-none focus:ring-2 disabled:opacity-60 disabled:cursor-not-allowed text-zinc-900 dark:text-zinc-100 hover:border-zinc-300 dark:hover:border-white/20"
+      :class="
+        error
+          ? 'border-rose-400/70 focus:border-rose-500 focus:ring-rose-500/40'
+          : 'focus:border-brand-500/70 focus:ring-brand-500/30'
+      "
     />
     <p v-if="error" :id="`${inputId}-error`" role="alert" class="mt-1.5 text-xs text-rose-600 dark:text-rose-400 font-medium">{{ error }}</p>
     <p v-else-if="hint" :id="`${inputId}-hint`" class="mt-1.5 text-xs text-zinc-500 dark:text-zinc-400">{{ hint }}</p>

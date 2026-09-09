@@ -86,7 +86,9 @@ export interface Insight {
 export interface Comment {
   id: string
   channel_id: string
+  channel_name?: string | null
   channel_display_name?: string | null
+  platform_id?: string | null
   platform_channel_id?: string | null
   video_id?: string | null
   video_title?: string | null

@@ -40,7 +40,7 @@ async function handleSubmit() {
 
     <div class="sm:mx-auto sm:w-full sm:max-w-md relative z-10">
       <div class="flex items-center justify-center gap-2 mb-8">
-        <div class="w-8 h-8 rounded-lg bg-zinc-900 flex items-center justify-center shadow-md">
+        <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-brand-400 to-brand-700 flex items-center justify-center shadow-card ring-1 ring-white/20">
           <svg class="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
           </svg>
@@ -48,18 +48,18 @@ async function handleSubmit() {
         <span class="text-xl font-bold tracking-tight text-zinc-900">Noumena</span>
       </div>
 
-      <div class="bg-white py-10 px-8 shadow-sm ring-1 ring-zinc-950/5 rounded-xl">
+      <div class="bg-white py-10 px-8 shadow-card ring-1 ring-zinc-950/5 rounded-xl">
         <h2 class="text-2xl font-semibold tracking-tight text-zinc-900 mb-2">Reset your password</h2>
         <p class="text-zinc-500 text-sm mb-8">
           Enter the email associated with your account and we'll send you a link to reset your password.
         </p>
 
-        <div v-if="submitted" class="bg-emerald-50 text-emerald-800 ring-1 ring-emerald-600/20 rounded-xl p-4 text-sm">
+        <div v-if="submitted" class="bg-emerald-50 text-emerald-800 dark:bg-emerald-400/10 dark:text-emerald-300 ring-1 ring-emerald-600/20 rounded-xl p-4 text-sm">
           {{ genericMessage }}
         </div>
 
         <form v-else class="space-y-5" @submit.prevent="handleSubmit">
-          <div v-if="error" class="bg-rose-50 p-4 rounded-xl text-rose-700 text-sm border border-rose-100">
+          <div v-if="error" class="bg-rose-50 p-4 rounded-xl text-rose-700 dark:bg-rose-400/10 dark:text-rose-300 text-sm border border-rose-100">
             {{ error }}
           </div>
 

@@ -211,14 +211,16 @@ function dismissTokenExpiry() {
   <div class="min-h-screen bg-zinc-50 dark:bg-zinc-950 flex">
     <!-- Sidebar -->
     <aside class="hidden lg:flex flex-col w-64 bg-white dark:bg-zinc-900 border-r border-zinc-200 dark:border-zinc-800 sticky top-0 h-screen">
-      <div class="px-6 py-5 border-b border-zinc-100 dark:border-zinc-800">
-        <RouterLink to="/dashboard" class="flex items-center gap-2 group">
-          <div class="w-8 h-8 rounded-lg bg-zinc-900 dark:bg-zinc-100 flex items-center justify-center shadow-md">
-            <svg class="w-4 h-4 text-white dark:text-zinc-900" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <div class="px-5 py-5 border-b border-zinc-100 dark:border-white/5">
+        <RouterLink to="/dashboard" class="flex items-center gap-2.5 group">
+          <div
+            class="w-9 h-9 rounded-xl bg-gradient-to-br from-brand-400 to-brand-700 dark:from-brand-400 dark:to-brand-600 flex items-center justify-center shadow-card ring-1 ring-white/20 transition-transform duration-200 ease-snappy group-hover:scale-105"
+          >
+            <svg class="w-[18px] h-[18px] text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
             </svg>
           </div>
-          <span class="font-bold text-lg tracking-tight text-zinc-900 dark:text-zinc-100">Noumena</span>
+          <span class="font-bold text-lg tracking-tight text-zinc-900 dark:text-white">Noumena</span>
         </RouterLink>
       </div>
 
@@ -229,12 +231,16 @@ function dismissTokenExpiry() {
           :to="item.to"
           :class="[
             isActive(item.to, item.exact)
-              ? 'bg-zinc-100 dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100'
-              : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 hover:bg-zinc-50 dark:hover:bg-zinc-800/50',
-            'flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors',
+              ? 'bg-white dark:bg-zinc-800 text-zinc-900 dark:text-white shadow-card dark:shadow-none ring-1 ring-zinc-950/5 dark:ring-white/5'
+              : 'text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 hover:bg-zinc-100/80 dark:hover:bg-white/5',
+            'flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-all duration-200 ease-snappy focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500/50',
           ]"
         >
-          <component :is="item.icon" class="w-4 h-4" />
+          <component
+            :is="item.icon"
+            class="w-4 h-4 shrink-0"
+            :class="isActive(item.to, item.exact) ? 'text-brand-600 dark:text-brand-400' : 'text-zinc-400 dark:text-zinc-500 group-hover:text-zinc-600'"
+          />
           {{ item.label }}
         </RouterLink>
       </nav>
@@ -247,7 +253,7 @@ function dismissTokenExpiry() {
     <!-- Main column -->
     <div class="flex-1 flex flex-col min-w-0">
       <!-- Top bar -->
-      <header class="bg-white/80 dark:bg-zinc-900/80 backdrop-blur-md border-b border-zinc-200 dark:border-zinc-800 sticky top-0 z-30">
+      <header class="bg-white/70 dark:bg-zinc-950/70 backdrop-blur-xl border-b border-zinc-200/60 dark:border-white/5 sticky top-0 z-30 supports-[backdrop-filter]:bg-white/60 dark:supports-[backdrop-filter]:bg-zinc-900/60">
         <div class="px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">
           <!-- Mobile brand + hamburger -->
           <div class="lg:hidden flex items-center gap-2 min-w-0">
@@ -258,17 +264,17 @@ function dismissTokenExpiry() {
               :aria-expanded="drawerOpen"
               aria-controls="mobile-nav-drawer"
               @click="openDrawer"
-              class="flex items-center justify-center h-11 w-11 rounded-lg text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
+              class="flex items-center justify-center h-10 w-10 -ml-1.5 rounded-lg text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100/80 dark:hover:bg-white/5 transition-colors duration-200"
             >
               <Menu class="w-5 h-5" />
             </button>
             <RouterLink to="/dashboard" class="flex items-center gap-2 min-w-0">
-              <div class="w-7 h-7 rounded-lg bg-zinc-900 dark:bg-zinc-100 flex items-center justify-center">
-                <svg class="w-4 h-4 text-white dark:text-zinc-900" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-brand-400 to-brand-700 flex items-center justify-center ring-1 ring-white/20">
+                <svg class="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
                 </svg>
               </div>
-              <span class="font-bold tracking-tight text-zinc-900 dark:text-zinc-100 truncate">Noumena</span>
+              <span class="font-bold tracking-tight text-zinc-900 dark:text-white truncate">Noumena</span>
             </RouterLink>
           </div>
 
@@ -279,7 +285,7 @@ function dismissTokenExpiry() {
           <div class="flex items-center gap-2">
             <button
               @click="toggleDarkMode"
-              class="flex items-center justify-center h-11 w-11 rounded-lg text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
+              class="flex items-center justify-center h-10 w-10 rounded-lg text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100/80 dark:hover:bg-white/5 hover:text-zinc-900 dark:hover:text-white transition-all duration-200 active:scale-95"
               :aria-label="isDark ? 'Switch to light mode' : 'Switch to dark mode'"
             >
               <Sun v-if="isDark" class="w-4 h-4" />
@@ -290,11 +296,11 @@ function dismissTokenExpiry() {
               <button
                 ref="menuTriggerRef"
                 @click.stop="toggleMenu"
-                class="flex items-center gap-2 pl-2.5 pr-3 py-1.5 min-h-11 rounded-full border border-zinc-200 dark:border-zinc-700 hover:border-zinc-300 dark:hover:border-zinc-600 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors"
+                class="flex items-center gap-2 pl-1.5 pr-2.5 py-1.5 min-h-10 rounded-full border border-zinc-200 dark:border-white/10 hover:border-zinc-300 dark:hover:border-white/20 hover:bg-zinc-50 dark:hover:bg-zinc-800/60 transition-all duration-200 ease-snappy active:scale-[0.98] shadow-card dark:shadow-none"
                 :aria-expanded="menuOpen"
                 aria-haspopup="menu"
               >
-                <span class="h-7 w-7 rounded-full bg-brand-600 text-white font-semibold text-xs flex items-center justify-center">
+                <span class="h-7 w-7 rounded-full bg-gradient-to-br from-brand-400 to-brand-600 text-white font-bold text-xs flex items-center justify-center shadow-card ring-1 ring-white/20">
                   {{ userInitial }}
                 </span>
                 <span class="hidden sm:inline text-sm font-medium text-zinc-700 dark:text-zinc-300 max-w-[12rem] truncate">
@@ -308,7 +314,7 @@ function dismissTokenExpiry() {
                   v-if="menuOpen"
                   role="menu"
                   aria-label="User menu"
-                  class="absolute right-0 mt-2 w-64 bg-white dark:bg-zinc-900 shadow-lg ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl py-2 origin-top-right"
+                  class="absolute right-0 mt-2 w-64 bg-white dark:bg-zinc-900 shadow-pop ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl py-2 origin-top-right"
                 >
                   <div class="px-4 py-3 border-b border-zinc-100 dark:border-zinc-800">
                     <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400">Signed in as</p>
@@ -396,18 +402,18 @@ function dismissTokenExpiry() {
       >
         <div class="flex items-center justify-between px-4 h-16 border-b border-zinc-100 dark:border-zinc-800">
           <RouterLink to="/dashboard" class="flex items-center gap-2" @click="closeDrawer">
-            <div class="w-7 h-7 rounded-lg bg-zinc-900 dark:bg-zinc-100 flex items-center justify-center">
-              <svg class="w-4 h-4 text-white dark:text-zinc-900" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-brand-400 to-brand-700 flex items-center justify-center ring-1 ring-white/20">
+              <svg class="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
               </svg>
             </div>
-            <span class="font-bold tracking-tight text-zinc-900 dark:text-zinc-100">Noumena</span>
+            <span class="font-bold tracking-tight text-zinc-900 dark:text-white">Noumena</span>
           </RouterLink>
           <button
             type="button"
             aria-label="Close navigation menu"
             @click="closeDrawer"
-            class="flex items-center justify-center h-11 w-11 rounded-lg text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+            class="flex items-center justify-center h-10 w-10 rounded-lg text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100/80 dark:hover:bg-white/5"
           >
             <X class="w-5 h-5" />
           </button>
@@ -421,12 +427,16 @@ function dismissTokenExpiry() {
             @click="closeDrawer"
             :class="[
               isActive(item.to, item.exact)
-                ? 'bg-zinc-100 dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100'
-                : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 hover:bg-zinc-50 dark:hover:bg-zinc-800/50',
-              'flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors',
+                ? 'bg-white dark:bg-zinc-800 text-zinc-900 dark:text-white shadow-card dark:shadow-none ring-1 ring-zinc-950/5 dark:ring-white/5'
+                : 'text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 hover:bg-zinc-100/80 dark:hover:bg-white/5',
+              'flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all duration-200 ease-snappy focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500/50',
             ]"
           >
-            <component :is="item.icon" class="w-4 h-4" />
+            <component
+              :is="item.icon"
+              class="w-4 h-4 shrink-0"
+              :class="isActive(item.to, item.exact) ? 'text-brand-600 dark:text-brand-400' : 'text-zinc-400 dark:text-zinc-500'"
+            />
             {{ item.label }}
           </RouterLink>
         </nav>
@@ -469,7 +479,7 @@ function dismissTokenExpiry() {
 <style scoped>
 .drawer-fade-enter-active,
 .drawer-fade-leave-active {
-  transition: opacity 0.2s ease;
+  transition: opacity 0.25s cubic-bezier(0.16, 1, 0.3, 1);
 }
 .drawer-fade-enter-from,
 .drawer-fade-leave-to {
@@ -477,7 +487,7 @@ function dismissTokenExpiry() {
 }
 .drawer-slide-enter-active,
 .drawer-slide-leave-active {
-  transition: transform 0.25s ease;
+  transition: transform 0.35s cubic-bezier(0.16, 1, 0.3, 1);
 }
 .drawer-slide-enter-from,
 .drawer-slide-leave-to {
@@ -485,11 +495,11 @@ function dismissTokenExpiry() {
 }
 .menu-enter-active,
 .menu-leave-active {
-  transition: opacity 0.15s ease, transform 0.15s ease;
+  transition: opacity 0.18s cubic-bezier(0.16, 1, 0.3, 1), transform 0.18s cubic-bezier(0.16, 1, 0.3, 1);
 }
 .menu-enter-from,
 .menu-leave-to {
   opacity: 0;
-  transform: translateY(-4px) scale(0.98);
+  transform: translateY(-6px) scale(0.97);
 }
 </style>

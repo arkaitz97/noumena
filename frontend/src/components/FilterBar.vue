@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { Search, X, Download, RefreshCw } from 'lucide-vue-next'
-import type { Channel, FeedFilters, InsightType } from '../services/types'
+import type { Channel, FeedFilters, InsightType, WindowKey } from '../services/types'
 import {
   CATEGORY_COLORS,
   CATEGORY_LABELS,
@@ -16,10 +16,14 @@ const props = defineProps<{
   filters: FeedFilters
   channels: Channel[]
   variant?: 'feed' | 'saved'
+  // When set (feed view), the 7d/30d/90d date presets also drive the
+  // screen-wide insights range — one selector for every widget.
+  range?: WindowKey
 }>()
 
 const emit = defineEmits<{
   (e: 'update:filters', partial: Partial<FeedFilters>): void
+  (e: 'update:range', range: WindowKey): void
   (e: 'export'): void
   (e: 'reset'): void
 }>()
@@ -90,6 +94,12 @@ const datePreset = computed<DatePreset>(() => {
   if (!props.filters.date_from && !props.filters.date_to) return null
   return 'custom'
 })
+// With a bound `range` the preset highlight follows it (the insights
+// range), since preset clicks also materialise date_from/date_to.
+function isPresetActive(p: DatePreset): boolean {
+  if (props.range) return p !== 'custom' && p !== null && props.range === p
+  return datePreset.value === p
+}
 function setDatePreset(p: DatePreset): void {
   const today = new Date()
   // Local-timezone YYYY-MM-DD. `toISOString()` shifts by UTC offset and
@@ -100,6 +110,7 @@ function setDatePreset(p: DatePreset): void {
     return `${d.getFullYear()}-${m}-${day}`
   }
   if (p === '7d' || p === '30d' || p === '90d') {
+    emit('update:range', p)
     const days = p === '7d' ? 7 : p === '30d' ? 30 : 90
     const from = new Date(today)
     from.setDate(from.getDate() - days)
@@ -145,21 +156,21 @@ function doReset(): void {
           @input="onSearchInput"
           placeholder="Search comments…"
           aria-label="Search comments"
-          class="appearance-none block w-full pl-9 pr-4 py-2.5 border border-zinc-200 dark:border-zinc-700 rounded-xl shadow-sm placeholder-zinc-400 text-sm focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900 transition-colors bg-zinc-50/50 focus:bg-white dark:bg-zinc-800 dark:focus:bg-zinc-800 text-zinc-900 dark:text-zinc-100"
+          class="appearance-none block w-full pl-9 pr-4 py-2.5 border border-zinc-200 dark:border-white/10 rounded-xl shadow-sm placeholder-zinc-400 dark:placeholder-zinc-500 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500/30 focus:border-brand-500/70 transition-all duration-200 ease-snappy bg-zinc-50/50 focus:bg-white dark:bg-zinc-800 dark:focus:bg-zinc-800 text-zinc-900 dark:text-zinc-100"
         />
       </div>
       <div class="flex items-center gap-2">
-        <div v-if="isFeed" class="flex rounded-xl border border-zinc-200 dark:border-zinc-700 overflow-hidden" role="group" aria-label="Sort order">
+        <div v-if="isFeed" class="flex rounded-xl border border-zinc-200/70 dark:border-white/5 overflow-hidden" role="group" aria-label="Sort order">
           <button
             v-for="s in (['newest', 'oldest'] as const)"
             :key="s"
             type="button"
             @click="setSort(s)"
             :aria-pressed="filters.sort === s"
-            class="px-3 py-2.5 text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-zinc-900 dark:focus:ring-zinc-100"
+            class="px-3 py-2.5 text-sm font-medium transition-all duration-200 ease-snappy focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60"
             :class="filters.sort === s
               ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900'
-              : 'bg-white text-zinc-600 hover:bg-zinc-50 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700/50'"
+              : 'bg-white text-zinc-600 hover:bg-zinc-100/70 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-white/5'"
           >
             {{ s === 'newest' ? 'Newest' : 'Oldest' }}
           </button>
@@ -167,7 +178,7 @@ function doReset(): void {
         <button
           type="button"
           @click="doReset"
-          class="inline-flex items-center gap-1.5 px-3 py-2.5 rounded-xl text-sm font-medium text-zinc-600 dark:text-zinc-300 border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors focus:outline-none focus:ring-2 focus:ring-zinc-900"
+          class="inline-flex items-center gap-1.5 px-3 py-2.5 rounded-xl text-sm font-medium text-zinc-700 dark:text-zinc-200 bg-white dark:bg-zinc-800/60 border border-zinc-200 dark:border-white/10 hover:border-zinc-300 hover:bg-zinc-50 dark:hover:border-white/20 dark:hover:bg-zinc-800 transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900 shadow-card dark:shadow-none"
           aria-label="Reset filters"
         >
           <RefreshCw class="w-4 h-4" /> Reset
@@ -177,20 +188,20 @@ function doReset(): void {
             type="button"
             @click="toggleExportMenu"
             :aria-expanded="exportOpen"
-            class="inline-flex items-center gap-1.5 px-3 py-2.5 rounded-xl text-sm font-medium text-white bg-zinc-900 hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-200 transition-colors focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:ring-offset-2"
+            class="inline-flex items-center gap-1.5 px-3 py-2.5 rounded-xl text-sm font-medium text-white bg-zinc-900 hover:bg-zinc-700 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 shadow-card dark:shadow-none transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900"
           >
             <Download class="w-4 h-4" /> Export
           </button>
           <div
             v-if="exportOpen"
-            class="absolute right-0 mt-2 w-40 bg-white dark:bg-zinc-900 shadow-lg ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl py-1 z-20"
+            class="absolute right-0 mt-2 w-40 bg-white dark:bg-zinc-900 shadow-pop ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl py-1 z-20 origin-top-right"
             role="menu"
           >
             <button
               type="button"
               role="menuitem"
               @click="exportOpen = false; emit('export')"
-              class="w-full text-left px-3 py-2 text-sm text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+              class="w-full text-left px-3 py-2 text-sm text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100/70 dark:hover:bg-white/5 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60"
             >
               Open export…
             </button>
@@ -209,10 +220,10 @@ function doReset(): void {
           @click="toggleChannel(c.id)"
           :aria-pressed="filters.channels.includes(c.id)"
           :class="[
-            'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium ring-1 ring-inset transition-colors',
+            'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium ring-1 ring-inset transition-all duration-200 ease-snappy',
             filters.channels.includes(c.id)
               ? 'bg-zinc-900 text-white ring-zinc-900 dark:bg-zinc-100 dark:text-zinc-900 dark:ring-zinc-100'
-              : 'bg-white text-zinc-700 ring-zinc-200 hover:bg-zinc-50 dark:bg-zinc-800 dark:text-zinc-300 dark:ring-zinc-700 dark:hover:bg-zinc-700/50',
+              : 'bg-white text-zinc-700 ring-zinc-200 hover:bg-zinc-100/70 dark:bg-zinc-800 dark:text-zinc-300 dark:ring-white/10 dark:hover:bg-white/5',
           ]"
         >
           {{ c.display_name || c.platform_channel_id }}
@@ -228,7 +239,7 @@ function doReset(): void {
             type="checkbox"
             :checked="filters.include_toxic"
             @change="toggleIncludeToxic"
-            class="h-3.5 w-3.5 rounded border-zinc-300 text-zinc-900 focus:ring-zinc-900 dark:border-zinc-600"
+            class="h-3.5 w-3.5 rounded border-zinc-300 text-brand-600 dark:border-white/10 focus-visible:ring-2 focus-visible:ring-brand-500/60"
           />
           Include toxic / spam
         </label>
@@ -241,8 +252,8 @@ function doReset(): void {
           @click="toggleCategory(c)"
           :aria-pressed="isCategoryActive(c)"
           :class="[
-            'inline-flex items-center px-2.5 py-1 rounded-md text-xs font-semibold tracking-wide ring-1 ring-inset transition-colors',
-            isCategoryActive(c) ? CATEGORY_COLORS[c] : 'bg-white text-zinc-500 ring-zinc-200 hover:bg-zinc-50 dark:bg-zinc-800 dark:text-zinc-400 dark:ring-zinc-700 dark:hover:bg-zinc-700/50',
+            'inline-flex items-center px-2.5 py-1 rounded-md text-xs font-semibold tracking-wide ring-1 ring-inset transition-all duration-200 ease-snappy',
+            isCategoryActive(c) ? CATEGORY_COLORS[c] : 'bg-white text-zinc-500 ring-zinc-200 hover:bg-zinc-100/70 dark:bg-zinc-800 dark:text-zinc-400 dark:ring-white/10 dark:hover:bg-white/5',
           ]"
         >
           {{ CATEGORY_LABELS[c] }}
@@ -258,10 +269,10 @@ function doReset(): void {
           @click="setInsightType(null)"
           :aria-pressed="filters.insight_type === null"
           :class="[
-            'inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium ring-1 ring-inset transition-colors',
+            'inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium ring-1 ring-inset transition-all duration-200 ease-snappy',
             filters.insight_type === null
               ? 'bg-zinc-900 text-white ring-zinc-900 dark:bg-zinc-100 dark:text-zinc-900 dark:ring-zinc-100'
-              : 'bg-white text-zinc-700 ring-zinc-200 hover:bg-zinc-50 dark:bg-zinc-800 dark:text-zinc-300 dark:ring-zinc-700 dark:hover:bg-zinc-700/50',
+              : 'bg-white text-zinc-700 ring-zinc-200 hover:bg-zinc-100/70 dark:bg-zinc-800 dark:text-zinc-300 dark:ring-white/10 dark:hover:bg-white/5',
           ]"
         >
           All
@@ -273,10 +284,10 @@ function doReset(): void {
           @click="setInsightType(t)"
           :aria-pressed="filters.insight_type === t"
           :class="[
-            'inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium ring-1 ring-inset transition-colors',
+            'inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium ring-1 ring-inset transition-all duration-200 ease-snappy',
             filters.insight_type === t
               ? 'bg-brand-600 text-white ring-brand-600'
-              : 'bg-white text-zinc-700 ring-zinc-200 hover:bg-zinc-50 dark:bg-zinc-800 dark:text-zinc-300 dark:ring-zinc-700 dark:hover:bg-zinc-700/50',
+              : 'bg-white text-zinc-700 ring-zinc-200 hover:bg-zinc-100/70 dark:bg-zinc-800 dark:text-zinc-300 dark:ring-white/10 dark:hover:bg-white/5',
           ]"
         >
           {{ INSIGHT_TYPE_LABELS[t] }}
@@ -292,12 +303,12 @@ function doReset(): void {
           :key="p ?? 'all'"
           type="button"
           @click="setDatePreset(p)"
-          :aria-pressed="datePreset === p"
+          :aria-pressed="isPresetActive(p)"
           :class="[
-            'inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium ring-1 ring-inset transition-colors',
-            datePreset === p
+            'inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium ring-1 ring-inset transition-all duration-200 ease-snappy',
+            isPresetActive(p)
               ? 'bg-zinc-900 text-white ring-zinc-900 dark:bg-zinc-100 dark:text-zinc-900 dark:ring-zinc-100'
-              : 'bg-white text-zinc-700 ring-zinc-200 hover:bg-zinc-50 dark:bg-zinc-800 dark:text-zinc-300 dark:ring-zinc-700 dark:hover:bg-zinc-700/50',
+              : 'bg-white text-zinc-700 ring-zinc-200 hover:bg-zinc-100/70 dark:bg-zinc-800 dark:text-zinc-300 dark:ring-white/10 dark:hover:bg-white/5',
           ]"
         >
           {{ p === 'custom' ? 'Custom' : p?.toUpperCase() }}
@@ -306,7 +317,7 @@ function doReset(): void {
           v-if="filters.date_from || filters.date_to"
           type="button"
           @click="setDatePreset(null)"
-          class="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors"
+          class="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 hover:bg-zinc-100/80 dark:hover:bg-white/5 transition-all duration-200 active:scale-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60"
         >
           <X class="w-3 h-3" /> clear
         </button>
@@ -317,7 +328,7 @@ function doReset(): void {
           :value="filters.date_from ?? ''"
           @change="emit('update:filters', { date_from: ($event.target as HTMLInputElement).value || null })"
           aria-label="Date from"
-          class="appearance-none px-3 py-2 text-sm border border-zinc-200 dark:border-zinc-700 rounded-xl bg-zinc-50/50 focus:bg-white dark:bg-zinc-800 dark:focus:bg-zinc-800 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900"
+          class="appearance-none px-3 py-2 text-sm border border-zinc-200 dark:border-white/10 rounded-xl bg-zinc-50/50 focus:bg-white dark:bg-zinc-800 dark:focus:bg-zinc-800 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-brand-500/30 focus:border-brand-500/70"
         />
         <span class="text-xs text-zinc-400 dark:text-zinc-500">to</span>
         <input
@@ -325,7 +336,7 @@ function doReset(): void {
           :value="filters.date_to ?? ''"
           @change="emit('update:filters', { date_to: ($event.target as HTMLInputElement).value || null })"
           aria-label="Date to"
-          class="appearance-none px-3 py-2 text-sm border border-zinc-200 dark:border-zinc-700 rounded-xl bg-zinc-50/50 focus:bg-white dark:bg-zinc-800 dark:focus:bg-zinc-800 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900"
+          class="appearance-none px-3 py-2 text-sm border border-zinc-200 dark:border-white/10 rounded-xl bg-zinc-50/50 focus:bg-white dark:bg-zinc-800 dark:focus:bg-zinc-800 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-brand-500/30 focus:border-brand-500/70"
         />
       </div>
     </div>

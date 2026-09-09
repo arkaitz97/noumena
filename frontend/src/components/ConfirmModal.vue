@@ -119,20 +119,20 @@ onBeforeUnmount(() => {
       >
         <div class="flex items-end justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:block sm:p-0">
           <div
-            class="fixed inset-0 bg-zinc-900/60 backdrop-blur-sm transition-opacity"
+            class="fixed inset-0 bg-zinc-950/50 backdrop-blur-sm transition-opacity dark:bg-black/60"
             aria-hidden="true"
             @click="closeModal"
           ></div>
           <span class="hidden sm:inline-block sm:align-middle sm:h-screen" aria-hidden="true">&#8203;</span>
           <div
             ref="dialogRef"
-            class="relative z-10 inline-block align-bottom bg-white dark:bg-zinc-900 rounded-xl px-4 pt-5 pb-6 text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-lg sm:w-full sm:p-8"
+            class="relative z-10 inline-block align-bottom bg-white dark:bg-zinc-900 rounded-2xl px-4 pt-5 pb-6 text-left overflow-hidden shadow-pop ring-1 ring-zinc-950/5 dark:ring-white/10 transform transition-all sm:my-8 sm:align-middle sm:max-w-lg sm:w-full sm:p-8"
           >
             <div class="sm:flex sm:items-start">
               <div
                 :class="[
                   'mx-auto flex-shrink-0 flex items-center justify-center h-12 w-12 rounded-full sm:mx-0 sm:h-10 sm:w-10',
-                  destructive ? 'bg-rose-100 dark:bg-rose-950/40' : 'bg-zinc-100 dark:bg-zinc-800',
+                  destructive ? 'bg-rose-100 dark:bg-rose-950/40' : 'bg-zinc-100 dark:bg-white/5',
                 ]"
               >
                 <svg
@@ -162,7 +162,7 @@ onBeforeUnmount(() => {
                 </svg>
               </div>
               <div class="mt-3 text-center sm:mt-0 sm:ml-4 sm:text-left w-full">
-                <h3 :id="titleId" class="text-xl leading-6 font-semibold text-zinc-900 dark:text-zinc-100 mb-2">{{ title }}</h3>
+                <h3 :id="titleId" class="text-xl leading-6 font-bold tracking-tight text-zinc-900 dark:text-white mb-2">{{ title }}</h3>
                 <div class="mt-2 text-sm text-zinc-500 dark:text-zinc-400 leading-relaxed">
                   <p v-if="description">{{ description }}</p>
                   <slot name="step" />
@@ -178,10 +178,10 @@ onBeforeUnmount(() => {
                   @click="confirm"
                   :disabled="confirmDisabled"
                   :class="[
-                    'w-full inline-flex justify-center rounded-xl border border-transparent shadow-sm px-5 py-2.5 text-sm font-medium text-white sm:w-auto disabled:opacity-50 disabled:cursor-not-allowed transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2',
+                    'w-full inline-flex justify-center rounded-xl border border-transparent px-5 py-2.5 text-sm font-medium text-white sm:w-auto disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 ease-snappy active:scale-[0.98] shadow-card dark:shadow-none focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2',
                     destructive
-                      ? 'bg-rose-600 hover:bg-rose-700 focus:ring-rose-500'
-                      : 'bg-zinc-900 hover:bg-zinc-800 focus:ring-zinc-900 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-200 dark:focus:ring-zinc-300',
+                      ? 'bg-rose-600 hover:bg-rose-700 focus-visible:ring-rose-500'
+                      : 'bg-zinc-900 hover:bg-zinc-700 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200 focus-visible:ring-brand-500/80 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900',
                   ]"
                 >
                   {{ confirmLabel }}
@@ -191,7 +191,7 @@ onBeforeUnmount(() => {
                   type="button"
                   data-modal-cancel="true"
                   @click="closeModal"
-                  class="mt-3 sm:mt-0 w-full inline-flex justify-center rounded-xl border border-zinc-200 dark:border-zinc-700 shadow-sm px-5 py-2.5 bg-white dark:bg-zinc-800 text-sm font-medium text-zinc-700 dark:text-zinc-200 hover:bg-zinc-50 dark:hover:bg-zinc-700 sm:w-auto transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900"
+                  class="mt-3 sm:mt-0 w-full inline-flex justify-center rounded-xl border border-zinc-200 dark:border-white/10 shadow-card dark:shadow-none px-5 py-2.5 bg-white dark:bg-zinc-800/60 text-sm font-medium text-zinc-700 dark:text-zinc-200 hover:border-zinc-300 hover:bg-zinc-50 dark:hover:border-white/20 dark:hover:bg-zinc-800 sm:w-auto transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900"
                 >
                   {{ cancelLabel }}
                 </button>
@@ -207,11 +207,11 @@ onBeforeUnmount(() => {
 <style scoped>
 .modal-enter-active,
 .modal-leave-active {
-  transition: opacity 0.15s ease;
+  transition: opacity 0.25s cubic-bezier(0.16, 1, 0.3, 1);
 }
 .modal-enter-active .inline-block,
 .modal-leave-active .inline-block {
-  transition: transform 0.15s ease, opacity 0.15s ease;
+  transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.25s cubic-bezier(0.16, 1, 0.3, 1);
 }
 .modal-enter-from,
 .modal-leave-to {

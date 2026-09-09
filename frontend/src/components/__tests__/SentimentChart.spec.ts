@@ -1,7 +1,8 @@
 // SentimentChart.spec.ts — prop/data mapping (implement-missing-product-
 // features §1.6): empty series renders the empty state, populated series
 // maps per-day negative/neutral/positive counts + net score into the
-// rendered output, and the window toggle emits `update:days`.
+// rendered output. The chart is display-only; the range selector lives
+// in InsightsFeed.
 
 import { describe, it, expect } from 'vitest'
 import { mount } from '@vue/test-utils'
@@ -63,21 +64,6 @@ describe('SentimentChart', () => {
     expect(wrapper.find('svg polyline').attributes('points')).not.toContain('NaN')
     expect(wrapper.text()).toContain('0 negative')
     expect(wrapper.text()).toContain('1 neutral')
-  })
-
-  it('shows the window toggle with the active option reflecting data.days', () => {
-    const wrapper = mount(SentimentChart, { props: { data: makeData({ days: 30 }) } })
-    const buttons = wrapper.findAll('button')
-    expect(buttons.map((b) => b.text())).toEqual(['7d', '30d', '90d'])
-    const active = buttons.filter((b) => b.attributes('aria-selected') === 'true')
-    expect(active).toHaveLength(1)
-    expect(active[0].text()).toBe('30d')
-  })
-
-  it('emits update:days when a different window is selected', async () => {
-    const wrapper = mount(SentimentChart, { props: { data: makeData() } })
-    await wrapper.findAll('button')[2].trigger('click')
-    expect(wrapper.emitted('update:days')).toEqual([[90]])
   })
 
   it('caps the per-day table at the last 14 rows with a note for long windows', () => {

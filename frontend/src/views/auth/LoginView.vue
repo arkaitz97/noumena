@@ -118,7 +118,7 @@ async function handleGoogle() {
     <div class="flex-1 flex flex-col justify-center px-6 sm:px-12 lg:flex-none lg:w-1/2 xl:w-5/12 mx-auto lg:mx-0 relative z-10">
       <div class="mx-auto w-full max-w-sm lg:max-w-md">
         <div class="flex items-center gap-2 mb-10">
-          <div class="w-8 h-8 rounded-lg bg-zinc-900 flex items-center justify-center shadow-md">
+          <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-brand-400 to-brand-700 flex items-center justify-center shadow-card ring-1 ring-white/20">
             <svg class="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
             </svg>
@@ -130,7 +130,7 @@ async function handleGoogle() {
         <p class="text-zinc-500 text-base mb-8">Welcome back! Please enter your details.</p>
 
         <form class="space-y-5" @submit.prevent="handleLogin">
-          <div v-if="error" class="bg-rose-50 p-4 rounded-xl text-rose-700 text-sm border border-rose-100">
+          <div v-if="error" class="bg-rose-50 p-4 rounded-xl text-rose-700 dark:bg-rose-400/10 dark:text-rose-300 text-sm border border-rose-100">
             {{ error }}
           </div>
 
@@ -144,21 +144,21 @@ async function handleGoogle() {
           />
 
           <div>
-            <label for="login-password" class="block text-sm font-medium text-zinc-700 mb-1.5">Password</label>
+            <label for="login-password" class="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1.5">Password</label>
             <input
               id="login-password"
               type="password"
               autocomplete="current-password"
               required
               v-model="password"
-              class="appearance-none block w-full px-4 py-3 border border-zinc-200 rounded-xl shadow-sm placeholder-zinc-400 focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900 sm:text-sm transition-colors bg-zinc-50/50 focus:bg-white"
+              class="appearance-none block w-full px-4 py-3 border border-zinc-200 rounded-xl shadow-sm placeholder-zinc-400 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60 focus-visible:border-brand-500/70 sm:text-sm transition-colors bg-zinc-50/50 focus:bg-white"
               placeholder="••••••••"
             />
           </div>
 
           <div class="flex items-center justify-between pt-1">
             <label class="flex items-center cursor-pointer">
-              <input type="checkbox" v-model="rememberMe" class="h-4 w-4 text-zinc-900 focus:ring-zinc-900 border-zinc-300 rounded" />
+              <input type="checkbox" v-model="rememberMe" class="h-4 w-4 text-zinc-900 border-zinc-300 dark:border-zinc-600 rounded focus-visible:ring-2 focus-visible:ring-brand-500/60 focus-visible:border-brand-500/70" />
               <span class="ml-2 block text-sm text-zinc-600">Remember me for 30 days</span>
             </label>
             <RouterLink to="/forgot-password" class="text-sm font-medium text-zinc-900 hover:text-zinc-700 transition-colors">
@@ -183,7 +183,7 @@ async function handleGoogle() {
             type="button"
             @click="handleGoogle"
             :disabled="googleLoading"
-            class="mt-8 w-full flex justify-center items-center py-3.5 px-4 rounded-xl border border-zinc-200 bg-white text-sm font-medium text-zinc-700 shadow-sm hover:border-zinc-300 hover:bg-zinc-50 focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:ring-offset-2 transition-all duration-200 disabled:opacity-60"
+            class="mt-8 w-full flex justify-center items-center py-3.5 px-4 rounded-xl border border-zinc-200 bg-white text-sm font-medium text-zinc-700 dark:text-zinc-200 dark:bg-zinc-800/60 dark:border-white/10 shadow-card dark:shadow-none hover:border-zinc-300 hover:bg-zinc-50 dark:hover:border-white/20 dark:hover:bg-zinc-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900 transition-all duration-200 ease-snappy active:scale-[0.98] disabled:opacity-60"
           >
             <svg class="w-5 h-5 mr-3" viewBox="0 0 488 512" aria-hidden="true">
               <path fill="currentColor" d="M488 261.8C488 403.3 391.1 504 248 504 110.8 504 0 393.2 0 256S110.8 8 248 8c66.8 0 123 24.5 166.3 64.9l-67.5 64.9C258.5 52.6 94.3 116.6 94.3 256c0 86.5 69.1 156.6 153.7 156.6 98.2 0 135-70.4 140.8-106.9H248v-85.3h236.1c2.3 12.7 3.9 24.9 3.9 41.4z" />

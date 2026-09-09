@@ -64,24 +64,24 @@ onMounted(() => {
 
 <template>
   <div class="min-h-screen bg-zinc-50 dark:bg-zinc-950 flex items-center justify-center px-4">
-    <div class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl p-8 max-w-md w-full text-center">
+    <div class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-8 max-w-md w-full text-center">
       <template v-if="error">
-        <div class="mx-auto h-12 w-12 rounded-full bg-rose-50 flex items-center justify-center text-rose-600 mb-4 ring-1 ring-rose-600/20">
+        <div class="mx-auto h-12 w-12 rounded-full bg-rose-50 dark:bg-rose-400/10 flex items-center justify-center text-rose-600 dark:text-rose-400 mb-4 ring-1 ring-rose-600/20">
           <svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
           </svg>
         </div>
-        <h2 class="text-lg font-semibold text-zinc-900 mb-2 tracking-tight">Sign-in error</h2>
-        <p class="text-sm text-zinc-500 leading-relaxed">{{ error }}</p>
+        <h2 class="text-lg font-semibold text-zinc-900 dark:text-white mb-2 tracking-tight">Sign-in error</h2>
+        <p class="text-sm text-zinc-500 dark:text-zinc-400 leading-relaxed">{{ error }}</p>
       </template>
       <template v-else>
-        <div class="mx-auto h-12 w-12 rounded-full bg-emerald-50 flex items-center justify-center text-emerald-600 mb-4 ring-1 ring-emerald-600/20">
+        <div class="mx-auto h-12 w-12 rounded-full bg-emerald-50 dark:bg-emerald-400/10 flex items-center justify-center text-emerald-600 dark:text-emerald-400 mb-4 ring-1 ring-emerald-600/20">
           <svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
           </svg>
         </div>
-        <h2 class="text-lg font-semibold text-zinc-900 mb-2 tracking-tight">Almost there…</h2>
-        <p class="text-sm text-zinc-500">{{ closing ? 'Closing window…' : 'Finalizing authorization…' }}</p>
+        <h2 class="text-lg font-semibold text-zinc-900 dark:text-white mb-2 tracking-tight">Almost there…</h2>
+        <p class="text-sm text-zinc-500 dark:text-zinc-400">{{ closing ? 'Closing window…' : 'Finalizing authorization…' }}</p>
       </template>
     </div>
   </div>

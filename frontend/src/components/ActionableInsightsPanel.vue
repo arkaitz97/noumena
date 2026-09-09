@@ -1,21 +1,24 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { RouterLink } from 'vue-router'
-import type { InsightAggregatesResponse, WindowKey } from '../services/types'
+import type { InsightAggregatesResponse, InsightType } from '../services/types'
 import { insightTypeLabel } from '../lib/insightTypes'
 import Card from './Card.vue'
-import SegmentedControl from './SegmentedControl.vue'
 
 const props = defineProps<{
   data: InsightAggregatesResponse | null
-  windowKey: WindowKey
   loading?: boolean
+  // Mirrors the feed's insight-type filter — narrows the visible list
+  // (aggregates come from a type-agnostic endpoint).
+  typeFilter?: InsightType | null
 }>()
 
-const emit = defineEmits<{ (e: 'update:windowKey', w: WindowKey): void }>()
-
 const totalInsights = computed(() => props.data?.total_insights ?? 0)
-const topInsights = computed(() => props.data?.top_insights ?? [])
+const topInsights = computed(() => {
+  const list = props.data?.top_insights ?? []
+  if (!props.typeFilter) return list
+  return list.filter((i) => i.type === props.typeFilter)
+})
 
 function drillQuery(type: string): Record<string, string> {
   const q: Record<string, string> = { insight_type: type }
@@ -33,12 +36,6 @@ function drillQuery(type: string): Record<string, string> {
         <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Actionable insights</p>
         <p class="text-sm font-semibold text-zinc-900 dark:text-zinc-100 mt-0.5">{{ totalInsights }} total</p>
       </div>
-      <SegmentedControl
-        :model-value="windowKey"
-        :options="(['7d', '30d', '90d'] as WindowKey[]).map((w) => ({ value: w, label: w }))"
-        label="Insights window"
-        @update:model-value="(w) => emit('update:windowKey', w as WindowKey)"
-      />
     </div>
 
     <div v-if="loading" class="space-y-2">
@@ -47,7 +44,7 @@ function drillQuery(type: string): Record<string, string> {
     </div>
 
     <div v-else-if="topInsights.length === 0" class="h-24 flex items-center justify-center text-xs text-zinc-500 dark:text-zinc-400">
-      No insights yet
+      {{ typeFilter ? 'No insights of this type in range' : 'No insights yet' }}
     </div>
 
     <ul v-else class="space-y-2">

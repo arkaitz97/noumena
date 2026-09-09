@@ -25,7 +25,7 @@ const padClass = computed(() =>
 <template>
   <component
     :is="Tag"
-    class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl"
+    class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl"
     :class="padClass"
   >    <slot />
   </component>

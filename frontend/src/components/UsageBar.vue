@@ -37,7 +37,7 @@ function fmt(n: number): string {
       <span class="text-zinc-500 font-mono tabular-nums">{{ fmt(used) }} / {{ unlimited ? 'Unlimited' : fmt(limit) }}{{ unit ? ' ' + unit : '' }}</span>
     </div>
     <div
-      class="w-full bg-zinc-100 rounded-full h-2.5 overflow-hidden border border-zinc-200/50"
+      class="w-full bg-zinc-100 dark:bg-white/5 rounded-full h-2.5 overflow-hidden border border-zinc-200/50"
       role="progressbar"
       :aria-valuenow="used"
       :aria-valuemin="0"

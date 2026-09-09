@@ -40,7 +40,7 @@ const display = computed(() => `${pct.value.toFixed(1)}%`)
         :cy="SIZE / 2"
         :r="radius"
         fill="none"
-        stroke="#e4e4e7"
+        class="stroke-zinc-200 dark:stroke-white/5"
         :stroke-width="STROKE"
       />
       <circle
@@ -60,7 +60,7 @@ const display = computed(() => `${pct.value.toFixed(1)}%`)
         :y="SIZE / 2"
         text-anchor="middle"
         dominant-baseline="central"
-        :class="compact ? 'fill-zinc-900 text-sm font-semibold' : 'fill-zinc-900 text-lg font-semibold'"
+        :class="compact ? 'fill-zinc-900 dark:fill-white text-sm font-semibold' : 'fill-zinc-900 dark:fill-white text-lg font-semibold'"
       >
         {{ display }}
       </text>

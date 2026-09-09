@@ -56,7 +56,7 @@ async function handleResend() {
 
     <div class="sm:mx-auto sm:w-full sm:max-w-md relative z-10 text-center">
       <div class="flex items-center justify-center gap-2 mb-10">
-        <div class="w-8 h-8 rounded-lg bg-zinc-900 flex items-center justify-center shadow-md">
+        <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-brand-400 to-brand-700 flex items-center justify-center shadow-card ring-1 ring-white/20">
           <svg class="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
           </svg>
@@ -73,8 +73,8 @@ async function handleResend() {
       <!-- Success -->
       <template v-else-if="phase === 'success'">
         <div class="flex justify-center mb-6">
-          <div class="h-20 w-20 bg-emerald-50 rounded-xl flex items-center justify-center ring-1 ring-emerald-600/20">
-            <svg class="h-10 w-10 text-emerald-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <div class="h-20 w-20 bg-emerald-50 dark:bg-emerald-400/10 rounded-xl flex items-center justify-center ring-1 ring-emerald-600/20">
+            <svg class="h-10 w-10 text-emerald-600 dark:text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
             </svg>
           </div>
@@ -86,8 +86,8 @@ async function handleResend() {
       <!-- Invalid token -->
       <template v-else-if="phase === 'invalid'">
         <div class="flex justify-center mb-6">
-          <div class="h-20 w-20 bg-rose-50 rounded-xl flex items-center justify-center ring-1 ring-rose-600/20">
-            <svg class="h-10 w-10 text-rose-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <div class="h-20 w-20 bg-rose-50 dark:bg-rose-400/10 rounded-xl flex items-center justify-center ring-1 ring-rose-600/20">
+            <svg class="h-10 w-10 text-rose-600 dark:text-rose-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
             </svg>
           </div>
@@ -99,7 +99,7 @@ async function handleResend() {
       <!-- Idle (no ?token) — show inbox prompt + resend -->
       <template v-else>
         <div class="flex justify-center mb-6">
-          <div class="h-20 w-20 bg-white rounded-xl flex items-center justify-center shadow-sm border border-zinc-100 ring-4 ring-zinc-50">
+          <div class="h-20 w-20 bg-white rounded-xl flex items-center justify-center shadow-card border border-zinc-100 ring-4 ring-zinc-50">
             <svg class="h-10 w-10 text-brand-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
             </svg>
@@ -112,8 +112,8 @@ async function handleResend() {
       </template>
 
       <!-- Resend card (always visible except during success) -->
-      <div v-if="phase !== 'success'" class="bg-white py-8 px-6 shadow-[0_4px_20px_-4px_rgba(0,0,0,0.05)] rounded-[2rem] border border-zinc-100/80 mx-4 sm:mx-0">
-        <p v-if="resendError" class="text-sm text-rose-600 mb-4 font-medium">{{ resendError }}</p>
+      <div v-if="phase !== 'success'" class="bg-white py-8 px-6 shadow-card rounded-[2rem] border border-zinc-100/80 mx-4 sm:mx-0">
+        <p v-if="resendError" class="text-sm text-rose-600 dark:text-rose-400 mb-4 font-medium">{{ resendError }}</p>
         <p v-else class="text-sm text-zinc-500 mb-6 font-medium">
           Didn't receive the email? Check your spam folder or request a new one.
         </p>
