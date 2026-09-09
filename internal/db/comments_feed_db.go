@@ -210,7 +210,7 @@ func (q *SQLiteQuery) GetInsightDistribution(ctx context.Context, userID string,
 		WHERE uct.user_id = ?
 		  AND uct.tracking_status IN ('active','paused')
 		  AND c.processed_at IS NOT NULL
-		  AND c.processed_at >= ?
+		  AND c.posted_at >= ?
 		  AND c.category NOT IN ('toxic_criticism','spam')
 		  AND c.actionable_insights != '[]'` + channelClause + `
 		GROUP BY json_extract(elem.value, '$.type')
@@ -249,7 +249,7 @@ func (q *SQLiteQuery) GetTopInsights(ctx context.Context, userID string, channel
 		WHERE uct.user_id = ?
 		  AND uct.tracking_status IN ('active','paused')
 		  AND c.processed_at IS NOT NULL
-		  AND c.processed_at >= ?
+		  AND c.posted_at >= ?
 		  AND c.category NOT IN ('toxic_criticism','spam')
 		  AND c.actionable_insights != '[]'` + channelClause + `
 		GROUP BY json_extract(elem.value, '$.type'), json_extract(elem.value, '$.description')
@@ -288,7 +288,7 @@ func (q *SQLiteQuery) GetToxicityShield(ctx context.Context, userID string, chan
 		WHERE uct.user_id = ?
 		  AND uct.tracking_status IN ('active','paused')
 		  AND c.processed_at IS NOT NULL
-		  AND c.processed_at >= ?` + channelClause
+		  AND c.posted_at >= ?` + channelClause
 	var b ToxicityBucket
 	if err := q.db.QueryRowContext(ctx, sqlStr, args...).Scan(&b.TotalComments, &b.FilteredCount); err != nil {
 		return ToxicityBucket{}, err

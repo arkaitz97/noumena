@@ -6,7 +6,7 @@ import (
 )
 
 // SentimentDay is one per-day aggregate row for the sentiment trend
-// endpoint. Date is the UTC day (YYYY-MM-DD) the comments were created on;
+// endpoint. Date is the UTC day (YYYY-MM-DD) the comments were posted on YouTube;
 // Score is the sum of sentiment_score (-1/0/1) across that day.
 type SentimentDay struct {
 	Date     string `json:"date"`
@@ -39,7 +39,7 @@ func (q *SQLiteQuery) GetSentimentSeries(ctx context.Context, userID, channelID 
 	}
 	args = append(args, cutoff)
 	query := `
-		SELECT date(c.created_at),
+		SELECT date(c.posted_at),
 		       COALESCE(SUM(CASE WHEN c.sentiment_score = -1 THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN c.sentiment_score = 0 THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN c.sentiment_score = 1 THEN 1 ELSE 0 END), 0),
@@ -50,9 +50,9 @@ func (q *SQLiteQuery) GetSentimentSeries(ctx context.Context, userID, channelID 
 		  AND uct.tracking_status IN ('active','paused')
 		` + channelClause + `
 		  AND c.sentiment_score IS NOT NULL
-		  AND c.created_at >= ?
-		GROUP BY date(c.created_at)
-		ORDER BY date(c.created_at) ASC
+		  AND c.posted_at >= ?
+		GROUP BY date(c.posted_at)
+		ORDER BY date(c.posted_at) ASC
 	`
 	rows, err := q.db.QueryContext(ctx, query, args...)
 	if err != nil {

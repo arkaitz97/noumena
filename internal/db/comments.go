@@ -54,7 +54,9 @@ func (q *SQLiteQuery) InsertCommentRowsAffected(ctx context.Context, c *Comment)
 	query := `
 		INSERT INTO comments (id, platform_channel_id, platform_comment_id, parent_comment_id, reply_depth, author_handle, body, posted_at, video_id, video_title, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-		ON CONFLICT (platform_channel_id, platform_comment_id) DO NOTHING
+		ON CONFLICT (platform_channel_id, platform_comment_id) DO UPDATE SET
+			video_id = COALESCE(excluded.video_id, comments.video_id),
+			video_title = COALESCE(excluded.video_title, comments.video_title)
 	`
 	result, err := q.db.ExecContext(ctx, query,
 		generateUUID(), c.PlatformChannelID, c.PlatformCommentID, c.ParentCommentID, c.ReplyDepth, c.AuthorHandle, c.Body, formatTime(c.PostedAt), c.VideoID, c.VideoTitle,

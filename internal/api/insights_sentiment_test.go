@@ -52,12 +52,12 @@ func setupSentimentDB(t *testing.T) (*db.SQLiteQuery, string) {
 	return q, userID
 }
 
-func insertSentimentComment(t *testing.T, q *db.SQLiteQuery, id, platformCommentID string, score int, createdAt time.Time) {
+func insertSentimentComment(t *testing.T, q *db.SQLiteQuery, id, platformCommentID string, score int, postedAt time.Time) {
 	t.Helper()
 	_, err := q.DB().ExecContext(context.Background(),
 		`INSERT INTO comments (id, platform_channel_id, platform_comment_id, body, posted_at, created_at, sentiment_score)
 		 VALUES (?, ?, ?, 'body', ?, ?, ?)`,
-		id, sentimentChannelUUID, platformCommentID, createdAt.Format(time.RFC3339), createdAt.Format(time.RFC3339), score)
+		id, sentimentChannelUUID, platformCommentID, postedAt.Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339), score)
 	if err != nil {
 		t.Fatalf("insert sentiment comment: %v", err)
 	}
