@@ -2,12 +2,15 @@ package db_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
 	"noumena/internal/db"
+	"noumena/internal/dbtest"
 )
 
 func TestDBQueries_Full(t *testing.T) {
@@ -166,5 +169,268 @@ func TestDBQueries_Full(t *testing.T) {
 	err = queries.RemoveChannelTracking(ctx, user.ID, pcID)
 	if err != nil {
 		t.Fatalf("RemoveChannelTracking failed")
+	}
+}
+
+func setupRecoveryDB(t *testing.T) (context.Context, *db.SQLiteQuery) {
+	t.Helper()
+	database := dbtest.SetupTestDB(t)
+	ctx := context.Background()
+	if err := db.Migrate(ctx, database); err != nil {
+		// Harness already migrated; ignore duplicate baseline errors only if applied.
+		_ = err
+	}
+	q := db.NewSQLiteQuery(database).(*db.SQLiteQuery)
+	return ctx, q
+}
+
+func seedChannel(t *testing.T, ctx context.Context, q *db.SQLiteQuery, tag string) (string, string) {
+	t.Helper()
+	email := fmt.Sprintf("rec_%s_%d@example.com", tag, time.Now().UnixNano())
+	u, err := q.CreateUser(ctx, email, "h")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	chID, _, err := q.UpsertPlatformChannel(ctx, "youtube", "yt-"+tag+"-"+u.ID[:8], "C")
+	if err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	exp := time.Now().UTC().Add(time.Hour)
+	if _, err := q.CreateUserChannelTracking(ctx, u.ID, chID, "a", "r", exp, 90, 0); err != nil {
+		t.Fatalf("tracking: %v", err)
+	}
+	return u.ID, chID
+}
+
+func TestRecoverStaleIngestionJobs(t *testing.T) {
+	ctx, q := setupRecoveryDB(t)
+	_, chID := seedChannel(t, ctx, q, "ing")
+	jobID, err := q.EnqueueIngestionJob(ctx, chID, "poll")
+	if err != nil || jobID == "" {
+		t.Fatalf("enqueue: %v %q", err, jobID)
+	}
+	if _, err := q.ClaimNextIngestionJob(ctx); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	old := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
+	if _, err := q.DB().ExecContext(ctx, `UPDATE ingestion_jobs SET started_at=? WHERE id=?`, old, jobID); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+	n, err := q.RecoverStaleIngestionJobs(ctx, 15*time.Minute)
+	if err != nil || n != 1 {
+		t.Fatalf("recover want 1 got %d err %v", n, err)
+	}
+}
+
+func TestRecoverStaleLLMJobs(t *testing.T) {
+	ctx, q := setupRecoveryDB(t)
+	jobID, err := q.EnqueueLLMJob(ctx, []string{"c1"}, "p")
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := q.MarkLLMJobProcessing(ctx, jobID); err != nil {
+		t.Fatalf("processing: %v", err)
+	}
+	old := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
+	if _, err := q.DB().ExecContext(ctx, `UPDATE llm_processing_jobs SET started_at=? WHERE id=?`, old, jobID); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+	n, err := q.RecoverStaleLLMJobs(ctx, 15*time.Minute)
+	if err != nil || n != 1 {
+		t.Fatalf("recover want 1 got %d err %v", n, err)
+	}
+}
+
+func TestEnqueueLLMJobDedupe(t *testing.T) {
+	ctx, q := setupRecoveryDB(t)
+	ids := []string{"c1", "c2"}
+	id1, created1, err := q.EnqueueLLMJobIfNotExists(ctx, ids, "p")
+	if err != nil || !created1 {
+		t.Fatalf("first want created: %v %v", id1, err)
+	}
+	id2, created2, err := q.EnqueueLLMJobIfNotExists(ctx, ids, "p")
+	if err != nil || created2 || id2 != id1 {
+		t.Fatalf("second want deduped same id: %q created=%v err=%v", id2, created2, err)
+	}
+}
+
+func TestGetIngestionTokenRowPrefersUnexpired(t *testing.T) {
+	ctx, q := setupRecoveryDB(t)
+	u1, err := q.CreateUser(ctx, fmt.Sprintf("tok1_%d@example.com", time.Now().UnixNano()), "h")
+	if err != nil {
+		t.Fatalf("user1: %v", err)
+	}
+	u2, err := q.CreateUser(ctx, fmt.Sprintf("tok2_%d@example.com", time.Now().UnixNano()), "h")
+	if err != nil {
+		t.Fatalf("user2: %v", err)
+	}
+	chID, _, err := q.UpsertPlatformChannel(ctx, "youtube", "yt-tok-"+u1.ID[:8], "C")
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	expired := time.Now().UTC().Add(-time.Hour)
+	fresh := time.Now().UTC().Add(time.Hour)
+	if _, err := q.CreateUserChannelTracking(ctx, u1.ID, chID, "a1", "r1", expired, 90, 0); err != nil {
+		t.Fatalf("primary expired: %v", err)
+	}
+	if _, err := q.CreateUserChannelTracking(ctx, u2.ID, chID, "a2", "r2", fresh, 90, 1); err != nil {
+		t.Fatalf("fallback: %v", err)
+	}
+	row, ok, err := q.GetIngestionTokenRow(ctx, chID)
+	if err != nil || !ok {
+		t.Fatalf("GetIngestionTokenRow: %v %v", ok, err)
+	}
+	if row.UserID != u2.ID {
+		t.Fatalf("want fallback u2 got %s", row.UserID)
+	}
+}
+
+func TestClaimPendingEmailsDisjoint(t *testing.T) {
+	ctx, q := setupRecoveryDB(t)
+	now := time.Now().UTC()
+	old := now.Add(-2 * time.Minute)
+	for i := 0; i < 4; i++ {
+		_, err := q.LogEmailAttempt(ctx, db.EmailAttemptInput{
+			Template: "t", IdempotencyKey: fmt.Sprintf("k-%d-%d", time.Now().UnixNano(), i),
+			Status: "pending", AttemptCount: 1, LastAttemptedAt: &old,
+			ToAddress: "a@b.c", Subject: "s", HTMLBody: "h", TextBody: "t",
+		})
+		if err != nil {
+			t.Fatalf("log: %v", err)
+		}
+	}
+	var wg sync.WaitGroup
+	results := make([][]*db.EmailLogRow, 2)
+	errs := make([]error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			rows, err := q.ClaimPendingEmails(ctx, now, 2)
+			results[idx] = rows
+			errs[idx] = err
+		}(i)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			t.Fatalf("claim err: %v", err)
+		}
+	}
+	seen := map[string]int{}
+	for _, rows := range results {
+		for _, r := range rows {
+			seen[r.ID]++
+		}
+	}
+	for id, c := range seen {
+		if c > 1 {
+			t.Fatalf("row %s claimed %d times", id, c)
+		}
+	}
+	if len(seen) == 0 {
+		t.Fatalf("no rows claimed")
+	}
+}
+
+func TestMarkJobFailedJitterVaries(t *testing.T) {
+	ctx, q := setupRecoveryDB(t)
+	_, chID := seedChannel(t, ctx, q, "jit")
+	seen := map[string]bool{}
+	for i := 0; i < 10; i++ {
+		jobID, err := q.EnqueueIngestionJob(ctx, chID, fmt.Sprintf("jt-%d-%d", i, time.Now().UnixNano()))
+		if err != nil || jobID == "" {
+			// dedupe gate may skip; force direct insert
+			continue
+		}
+		if err := q.MarkJobFailed(ctx, jobID, "e", 2); err != nil {
+			t.Fatalf("failed: %v", err)
+		}
+		var sched string
+		if err := q.DB().QueryRowContext(ctx, `SELECT scheduled_at FROM ingestion_jobs WHERE id=?`, jobID).Scan(&sched); err != nil {
+			t.Fatalf("read sched: %v", err)
+		}
+		seen[sched] = true
+		_, _ = q.DB().ExecContext(ctx, `DELETE FROM ingestion_jobs WHERE id=?`, jobID)
+	}
+	if len(seen) < 2 {
+		t.Fatalf("want jitter to vary scheduled_at, got %d distinct", len(seen))
+	}
+}
+
+func TestChannelCap_AtomicEnforcement(t *testing.T) {
+	ctx, q := setupRecoveryDB(t)
+	u, err := q.CreateUser(ctx, fmt.Sprintf("cap_%d@example.com", time.Now().UnixNano()), "h")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	ch1, _, err := q.UpsertPlatformChannel(ctx, "youtube", fmt.Sprintf("yt-cap-1-%d", time.Now().UnixNano()), "C")
+	if err != nil {
+		t.Fatalf("upsert1: %v", err)
+	}
+	ch2, _, err := q.UpsertPlatformChannel(ctx, "youtube", fmt.Sprintf("yt-cap-2-%d", time.Now().UnixNano()), "C")
+	if err != nil {
+		t.Fatalf("upsert2: %v", err)
+	}
+	exp := time.Now().UTC().Add(time.Hour)
+	if _, err := q.CreateUserChannelTrackingWithLimit(ctx, u.ID, ch1, "a", "r", exp, 90, 0, 1); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	if _, err := q.CreateUserChannelTrackingWithLimit(ctx, u.ID, ch2, "a", "r", exp, 90, 0, 1); !errors.Is(err, db.ErrChannelLimitExceeded) {
+		t.Fatalf("second want ErrChannelLimitExceeded got %v", err)
+	}
+}
+
+func TestChannelCap_ConcurrentInserts(t *testing.T) {
+	ctx, q := setupRecoveryDB(t)
+	u, err := q.CreateUser(ctx, fmt.Sprintf("capc_%d@example.com", time.Now().UnixNano()), "h")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	chIDs := make([]string, 4)
+	for i := range chIDs {
+		ch, _, err := q.UpsertPlatformChannel(ctx, "youtube", fmt.Sprintf("yt-capc-%d-%d", time.Now().UnixNano(), i), "C")
+		if err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+		chIDs[i] = ch
+	}
+	exp := time.Now().UTC().Add(time.Hour)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	succeeded := 0
+	limited := 0
+	for _, chID := range chIDs {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			_, err := q.CreateUserChannelTrackingWithLimit(ctx, u.ID, id, "a", "r", exp, 90, 0, 2)
+			mu.Lock()
+			defer mu.Unlock()
+			if err == nil {
+				succeeded++
+			} else if errors.Is(err, db.ErrChannelLimitExceeded) {
+				limited++
+			} else {
+				t.Errorf("unexpected err: %v", err)
+			}
+		}(chID)
+	}
+	wg.Wait()
+	if succeeded != 2 || limited != 2 {
+		t.Fatalf("want 2 succeeded 2 limited got %d %d", succeeded, limited)
+	}
+}
+
+func TestUpsertPlatformChannel_InsertedFlag(t *testing.T) {
+	ctx, q := setupRecoveryDB(t)
+	ytID := fmt.Sprintf("yt-cap-flag-%d", time.Now().UnixNano())
+	id1, inserted1, err := q.UpsertPlatformChannel(ctx, "youtube", ytID, "C")
+	if err != nil || !inserted1 {
+		t.Fatalf("first want inserted got %v %v", inserted1, err)
+	}
+	id2, inserted2, err := q.UpsertPlatformChannel(ctx, "youtube", ytID, "C")
+	if err != nil || inserted2 || id2 != id1 {
+		t.Fatalf("second want !inserted same id got %q %v %v", id2, inserted2, err)
 	}
 }

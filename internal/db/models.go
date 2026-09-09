@@ -1,6 +1,7 @@
 package db
 
 import (
+	"encoding/json"
 	"time"
 )
 
@@ -37,8 +38,8 @@ type User struct {
 	StripeSubscriptionID *string    `json:"stripe_subscription_id,omitempty"`
 	PastDueSince         *time.Time `json:"-"`
 	ActiveWorkspaceID    *string    `json:"active_workspace_id,omitempty"`
-	CreatedAt          time.Time  `json:"created_at"`
-	UpdatedAt          time.Time  `json:"updated_at"`
+	CreatedAt            time.Time  `json:"created_at"`
+	UpdatedAt            time.Time  `json:"updated_at"`
 }
 
 type PlatformChannel struct {
@@ -117,20 +118,22 @@ type ChannelListItem struct {
 }
 
 type Comment struct {
-	ID                string     `json:"id"`
-	PlatformChannelID string     `json:"platform_channel_id"`
-	PlatformCommentID string     `json:"platform_comment_id"`
-	ParentCommentID   *string    `json:"parent_comment_id,omitempty"`
-	ReplyDepth        int        `json:"reply_depth"`
-	AuthorHandle      *string    `json:"author_handle,omitempty"`
-	Body              string     `json:"body"`
-	PostedAt          time.Time  `json:"posted_at"`
-	Category          *string    `json:"category,omitempty"`
-	ActionableInsights []byte    `json:"actionable_insights,omitempty"`
-	Topic             *string    `json:"topic,omitempty"`
-	Confidence        *float64   `json:"confidence,omitempty"`
-	ProcessedAt       *time.Time `json:"processed_at,omitempty"`
-	CreatedAt         time.Time  `json:"created_at"`
+	ID                 string     `json:"id"`
+	PlatformChannelID  string     `json:"platform_channel_id"`
+	PlatformCommentID  string     `json:"platform_comment_id"`
+	ParentCommentID    *string    `json:"parent_comment_id,omitempty"`
+	ReplyDepth         int        `json:"reply_depth"`
+	AuthorHandle       *string    `json:"author_handle,omitempty"`
+	Body               string     `json:"body"`
+	PostedAt           time.Time  `json:"posted_at"`
+	Category           *string    `json:"category,omitempty"`
+	ActionableInsights json.RawMessage `json:"actionable_insights,omitempty"`
+	Topic              *string    `json:"topic,omitempty"`
+	Confidence         *float64   `json:"confidence,omitempty"`
+	VideoID            *string    `json:"video_id,omitempty"`
+	VideoTitle         *string    `json:"video_title,omitempty"`
+	ProcessedAt        *time.Time `json:"processed_at,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
 }
 
 type UserCommentStar struct {

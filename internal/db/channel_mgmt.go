@@ -41,21 +41,17 @@ func (q *SQLiteQuery) CleanupExpiredOAuthStates(ctx context.Context) (int64, err
 
 func (q *SQLiteQuery) UpsertPlatformChannel(ctx context.Context, platform, platformChannelID, displayName string) (string, bool, error) {
 	id := generateUUID()
-	var inserted bool
+	var returnedID string
 	err := q.db.QueryRowContext(ctx,
 		`INSERT INTO platform_channels (id, platform, platform_channel_id, display_name, created_at)
 		 VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-		 ON CONFLICT (platform, platform_channel_id)
-		 DO UPDATE SET display_name = excluded.display_name,
-		               deletion_scheduled_at = NULL
-		 RETURNING id, changes()`,
-		id, platform, platformChannelID, displayName).Scan(&id, &inserted)
+		 ON CONFLICT(platform, platform_channel_id) DO UPDATE SET display_name = excluded.display_name, deletion_scheduled_at = NULL
+		 RETURNING id`,
+		id, platform, platformChannelID, displayName).Scan(&returnedID)
 	if err != nil {
 		return "", false, err
 	}
-	// changes() returns 1 for INSERT, 1 for UPDATE in SQLite, so we use a different approach
-	// Check if it was an insert by querying the created_at
-	return id, inserted, nil
+	return returnedID, returnedID == id, nil
 }
 
 func (q *SQLiteQuery) GetChannelByPlatformID(ctx context.Context, platform, platformChannelID string) (*PlatformChannel, error) {
@@ -132,6 +128,16 @@ func (q *SQLiteQuery) PurgeChannelData(ctx context.Context, platformChannelID st
 	}
 
 	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM user_comment_stars
+		 WHERE comment_id IN (SELECT id FROM comments WHERE platform_channel_id = ?)`,
+		platformChannelID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM ingestion_jobs WHERE platform_channel_id = ?`, platformChannelID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM comments WHERE platform_channel_id = ?`, platformChannelID); err != nil {
 		return err
 	}
@@ -191,20 +197,41 @@ func scanTrackingRows(rows *sql.Rows) (*UserChannelTracking, error) {
 	return t, nil
 }
 
+// ErrChannelLimitExceeded is returned by CreateUserChannelTrackingWithLimit
+// when the user already tracks limit active+paused channels.
+var ErrChannelLimitExceeded = errors.New("channel limit exceeded")
+
 func (q *SQLiteQuery) CreateUserChannelTracking(ctx context.Context, userID, platformChannelID, encryptedAccess, encryptedRefresh string, expiresAt time.Time, backfillDays, tokenPriority int) (*UserChannelTracking, error) {
+	return q.CreateUserChannelTrackingWithLimit(ctx, userID, platformChannelID, encryptedAccess, encryptedRefresh, expiresAt, backfillDays, tokenPriority, 1<<62)
+}
+
+func (q *SQLiteQuery) CreateUserChannelTrackingWithLimit(ctx context.Context, userID, platformChannelID, encryptedAccess, encryptedRefresh string, expiresAt time.Time, backfillDays, tokenPriority, limit int) (*UserChannelTracking, error) {
 	if !validBackfillDays(backfillDays) {
 		return nil, fmt.Errorf("invalid backfill_days %d", backfillDays)
 	}
+	var activeWorkspaceID sql.NullString
+	_ = q.db.QueryRowContext(ctx, `SELECT active_workspace_id FROM users WHERE id = ?`, userID).Scan(&activeWorkspaceID)
+	// Zero expiry (tokenless public-channel rows) persists as NULL so
+	// expiry scans and the frontend never treat them as expired.
+	tokenExpiresAt := sql.NullString{}
+	if !expiresAt.IsZero() {
+		tokenExpiresAt = sql.NullString{String: expiresAt.Format(time.RFC3339), Valid: true}
+	}
 	row := q.db.QueryRowContext(ctx,
 		`INSERT INTO user_channel_tracking
-		   (id, user_id, platform_channel_id, access_token_enc, refresh_token_enc,
+		   (id, user_id, platform_channel_id, workspace_id, access_token_enc, refresh_token_enc,
 		    token_expires_at, token_priority, tracking_status, backfill_days,
 		    token_expiry_notified_at, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, NULL, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+		 SELECT ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, NULL, strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+		 WHERE (SELECT COUNT(*) FROM user_channel_tracking WHERE user_id = ? AND tracking_status IN ('active','paused')) < ?
 		 RETURNING `+trackingColumns,
-		generateUUID(), userID, platformChannelID, encryptedAccess, encryptedRefresh,
-		expiresAt.Format(time.RFC3339), tokenPriority, backfillDays)
-	return scanTracking(row)
+		generateUUID(), userID, platformChannelID, activeWorkspaceID, encryptedAccess, encryptedRefresh,
+		tokenExpiresAt, tokenPriority, backfillDays, userID, limit)
+	t, err := scanTracking(row)
+	if errors.Is(err, ErrNotFound) {
+		return nil, ErrChannelLimitExceeded
+	}
+	return t, err
 }
 
 func (q *SQLiteQuery) GetUserTracking(ctx context.Context, userID, platformChannelID string) (*UserChannelTracking, error) {
@@ -383,7 +410,8 @@ func (q *SQLiteQuery) GetIngestionTokenRow(ctx context.Context, platformChannelI
 	row := q.db.QueryRowContext(ctx,
 		`SELECT `+trackingColumns+` FROM user_channel_tracking
 		 WHERE platform_channel_id = ? AND tracking_status = 'active'
-		 ORDER BY token_priority ASC, created_at ASC
+		 ORDER BY CASE WHEN token_expires_at IS NULL OR token_expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now') THEN 0 ELSE 1 END,
+		          token_priority ASC, created_at ASC
 		 LIMIT 1`,
 		platformChannelID)
 	t, err := scanTracking(row)

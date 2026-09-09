@@ -14,13 +14,21 @@ import (
 // computes the correct delay until the next 08:00 UTC anchor.
 
 type fakeQuotaStore struct {
-	resetCalls    int
-	expireCalls   int
-	resetErr      error
-	expireErr     error
-	resetRows     int64
-	expireRows    int64
-	lastGraceHrs  int
+	recordCalls  int
+	resetCalls   int
+	expireCalls  int
+	resetErr     error
+	expireErr    error
+	recordErr    error
+	resetRows    int64
+	expireRows   int64
+	recordRows   int64
+	lastGraceHrs int
+}
+
+func (f *fakeQuotaStore) RecordCurrentPeriodUsage(ctx context.Context) (int64, error) {
+	f.recordCalls++
+	return f.recordRows, f.recordErr
 }
 
 func (f *fakeQuotaStore) ResetFreeTierQuotas(ctx context.Context) (int64, error) {
@@ -35,8 +43,11 @@ func (f *fakeQuotaStore) ExpirePastDueGrace(ctx context.Context, graceHours int)
 }
 
 func TestRunQuotaCronOnceCallsBothPrimitives(t *testing.T) {
-	store := &fakeQuotaStore{resetRows: 5, expireRows: 2}
+	store := &fakeQuotaStore{recordRows: 7, resetRows: 5, expireRows: 2}
 	runQuotaCronOnce(context.Background(), store, 72, nil)
+	if store.recordCalls != 1 {
+		t.Errorf("RecordCurrentPeriodUsage calls: want 1 got %d", store.recordCalls)
+	}
 	if store.resetCalls != 1 {
 		t.Errorf("ResetFreeTierQuotas calls: want 1 got %d", store.resetCalls)
 	}
@@ -51,8 +62,22 @@ func TestRunQuotaCronOnceCallsBothPrimitives(t *testing.T) {
 func TestRunQuotaCronOnceContinuesAfterResetError(t *testing.T) {
 	store := &fakeQuotaStore{resetErr: errors.New("boom")}
 	runQuotaCronOnce(context.Background(), store, 72, nil)
+	if store.recordCalls != 1 {
+		t.Errorf("RecordCurrentPeriodUsage must run before reset; calls=%d", store.recordCalls)
+	}
 	if store.expireCalls != 1 {
 		t.Errorf("ExpirePastDueGrace must run even after reset error; calls=%d", store.expireCalls)
+	}
+}
+
+func TestRunQuotaCronOnceContinuesAfterRecordError(t *testing.T) {
+	store := &fakeQuotaStore{recordErr: errors.New("snapshot boom")}
+	runQuotaCronOnce(context.Background(), store, 72, nil)
+	if store.resetCalls != 1 {
+		t.Errorf("ResetFreeTierQuotas must run even after record error; calls=%d", store.resetCalls)
+	}
+	if store.expireCalls != 1 {
+		t.Errorf("ExpirePastDueGrace must run even after record error; calls=%d", store.expireCalls)
 	}
 }
 

@@ -33,9 +33,30 @@ var (
 )
 
 func RateLimitMiddleware(queries db.DBQuery, cfg *config.Config) func(http.Handler) http.Handler {
+	return rateLimitMiddleware(queries, cfg, false)
+}
+
+// AuthRateLimitMiddleware rate-limits endpoints that must always be
+// protected regardless of the global RATE_LIMIT_ENABLED flag (login,
+// register, verify, reset, google flows, invite accept). Unauthenticated
+// requests are keyed by the trusted client IP at the unauth rate;
+// authenticated requests (middleware installed after auth) get a per-user
+// bucket. When queries is nil (degraded mock mode) it passes through.
+func AuthRateLimitMiddleware(queries db.DBQuery, cfg *config.Config) func(http.Handler) http.Handler {
+	return rateLimitMiddleware(queries, cfg, true)
+}
+
+// rateLimitMiddleware implements the shared limiter. forceEnabled makes
+// the limiter run even when cfg.RateLimitEnabled is false — used for auth
+// endpoints where protection must be on by default.
+func rateLimitMiddleware(queries db.DBQuery, cfg *config.Config, forceEnabled bool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !cfg.RateLimitEnabled {
+			if queries == nil {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if !forceEnabled && !cfg.RateLimitEnabled {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -45,7 +66,7 @@ func RateLimitMiddleware(queries db.DBQuery, cfg *config.Config) func(http.Handl
 				return
 			}
 
-			userKey := extractRateLimitKey(r)
+			userKey := extractRateLimitKey(r, cfg)
 			if userKey == "" {
 				next.ServeHTTP(w, r)
 				return
@@ -95,13 +116,13 @@ func RateLimitMiddleware(queries db.DBQuery, cfg *config.Config) func(http.Handl
 	}
 }
 
-func extractRateLimitKey(r *http.Request) string {
+func extractRateLimitKey(r *http.Request, cfg *config.Config) string {
 	userID, ok := r.Context().Value(UserIDKey).(string)
 	if ok && userID != "" {
 		return "u:" + userID
 	}
 
-	ip := extractIP(r)
+	ip := trustedClientIP(r, cfg.TrustProxyHeader)
 	if ip == "" {
 		return ""
 	}
@@ -109,19 +130,32 @@ func extractRateLimitKey(r *http.Request) string {
 	return "ip:" + hex.EncodeToString(hash[:])
 }
 
-func extractIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		if len(parts) > 0 {
-			return strings.TrimSpace(parts[0])
+// trustedClientIP derives the client IP from a source the client cannot
+// spoof. When a TRUST_PROXY_HEADER is configured the value of that single
+// header (set by the reverse proxy) is used: the right-most comma-separated
+// entry is the peer the proxy observed, and it must parse as a valid IP.
+// Client-supplied X-Forwarded-For / X-Real-IP are ignored entirely unless
+// explicitly configured. With no trusted header configured, RemoteAddr is
+// used. Returns "" when no trustworthy source can be resolved (the caller
+// treats that as "do not rate limit").
+func trustedClientIP(r *http.Request, headerName string) string {
+	if headerName != "" {
+		if v := r.Header.Get(headerName); v != "" {
+			parts := strings.Split(v, ",")
+			candidate := strings.TrimSpace(parts[len(parts)-1])
+			if net.ParseIP(candidate) != nil {
+				return candidate
+			}
+			return ""
 		}
 	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
-	}
+
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
+	}
+	if net.ParseIP(host) == nil {
+		return ""
 	}
 	return host
 }
@@ -132,11 +166,11 @@ func isAuthenticated(r *http.Request) bool {
 }
 
 type RateLimitCleaner struct {
-	Queries    db.DBQuery
-	Tick       time.Duration
-	StopC      chan struct{}
-	running    bool
-	mu         sync.Mutex
+	Queries db.DBQuery
+	Tick    time.Duration
+	StopC   chan struct{}
+	running bool
+	mu      sync.Mutex
 }
 
 func (c *RateLimitCleaner) Start(ctx context.Context) {

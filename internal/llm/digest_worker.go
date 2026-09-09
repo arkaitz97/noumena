@@ -1,17 +1,17 @@
 // Package llm: digest_worker.go houses the weekly-digest cron pipeline.
 //
 // Lifecycle:
-//   1. Worker.Start spins a 60-second ticker; every tick, shouldTrigger
-//      evaluates the wall clock against (Monday, 08:00 UTC).
-//   2. dispatch fans per-user jobs into a bounded worker pool of size
-//      min(8, GOMAXPROCS) (Spec 06: digest worker concurrency bounds).
-//   3. runUserDigest is the per-user pipeline:
-//        InsertWeeklyDigestPending  →  fetch comments  →
-//        skip-if-<10  →  compute aggregates  →  retry-chained LLM call →
-//        UpdateDigestContent (completed) | UpdateDigestStatus (deferred)
-//   4. On Start, recoverStalePending sweeps any pending row older than 2 h
-//      and promotes it to deferred (recovery from a process restart that
-//      left an in-flight retry chain orphaned).
+//  1. Worker.Start spins a 60-second ticker; every tick, shouldTrigger
+//     evaluates the wall clock against (Monday, 08:00 UTC).
+//  2. dispatch fans per-user jobs into a bounded worker pool of size
+//     min(8, GOMAXPROCS) (Spec 06: digest worker concurrency bounds).
+//  3. runUserDigest is the per-user pipeline:
+//     InsertWeeklyDigestPending  →  fetch comments  →
+//     skip-if-<10  →  compute aggregates  →  retry-chained LLM call →
+//     UpdateDigestContent (completed) | UpdateDigestStatus (deferred)
+//  4. On Start, recoverStalePending sweeps any pending row older than 2 h
+//     and promotes it to deferred (recovery from a process restart that
+//     left an in-flight retry chain orphaned).
 //
 // The whole pipeline is gated by DIGEST_WORKER_ENABLED=true so deployments
 // can roll out the schema change first without firing the worker.
@@ -22,11 +22,14 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"net/url"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
+	"noumena/internal/config"
 	"noumena/internal/db"
 	"noumena/internal/email"
 )
@@ -61,6 +64,12 @@ const digestSkipThreshold = 10
 // row older than this is promoted to deferred (Spec 06 EC: recovery of
 // stale pending rows on startup).
 const digestStaleAge = 2 * time.Hour
+
+// dispatchDeadline bounds one user's synchronous pipeline so a stuck user
+// can't stall the run loop; failures become deferred rows retried async.
+const dispatchDeadline = 60 * time.Second
+
+const deferredRedispatchLimit = 50
 
 // Worker owns the digest pipeline state. A single instance per process is
 // the expected deployment; the Postgres unique index on
@@ -126,6 +135,8 @@ func (w *Worker) Start(parent context.Context) {
 	// Startup recovery sweep runs synchronously before the loop so the
 	// first trigger after a restart sees a clean table.
 	w.recoverStalePending(ctx)
+	w.catchUpMissedWeeks(ctx)
+	w.redispatchDeferred(ctx)
 
 	w.wg.Add(1)
 	go func() {
@@ -151,7 +162,7 @@ func digestEnabled() bool {
 }
 
 // run is the minute-granularity ticker. shouldTrigger gates dispatch on the
-// Mon-08:00-UTC window; everything else is a no-op tick.
+// Mon-08:00-UTC window; deferred re-dispatch runs every tick (due filter is cheap).
 func (w *Worker) run(ctx context.Context) {
 	t := time.NewTicker(w.TickInterval)
 	defer t.Stop()
@@ -161,6 +172,7 @@ func (w *Worker) run(ctx context.Context) {
 			w.Logger.Println("digest worker: stopping")
 			return
 		case <-t.C:
+			w.redispatchDeferred(ctx)
 			now := w.Now()
 			if !shouldTrigger(now) {
 				continue
@@ -299,7 +311,11 @@ func (w *Worker) runUserDigest(ctx context.Context, user *db.User, weekStart, we
 		SampleComments: selectSampleComments(comments, digestSampleLimit),
 	})
 
-	parsed, attemptErr := w.callWithRetry(ctx, prompt, truth)
+	// Per-user deadline so one stuck LLM chain can't stall the run loop.
+	// Retries beyond the deadline become deferred rows handled async.
+	userCtx, cancel := context.WithTimeout(ctx, dispatchDeadline)
+	defer cancel()
+	parsed, attemptErr := w.callWithRetry(userCtx, prompt, truth)
 	if attemptErr != nil {
 		w.Logger.Printf("digest worker: deferred user=%s week=%s: %v",
 			user.ID, weekStart.Format("2006-01-02"), attemptErr)
@@ -313,8 +329,10 @@ func (w *Worker) runUserDigest(ctx context.Context, user *db.User, weekStart, we
 				Template:       "digest_delayed",
 				IdempotencyKey: "digest_delayed:" + digestID,
 				Variables: map[string]any{
-					"WeekRange": weekStart.Format("Jan 2") + " – " + weekStart.AddDate(0, 0, 6).Format("Jan 2, 2006"),
+					"WeekRange":      weekStart.Format("Jan 2") + " – " + weekStart.AddDate(0, 0, 6).Format("Jan 2, 2006"),
+					"UnsubscribeURL": digestUnsubscribeURL(user.ID, digestID),
 				},
+				ListUnsubscribe: digestUnsubscribeURL(user.ID, digestID),
 			}
 			if err := w.Pipeline.Send(ctx, msg); err != nil {
 				w.Logger.Printf("digest worker: digest_delayed email failed user=%s: %v", user.ID, err)
@@ -343,16 +361,20 @@ func (w *Worker) runUserDigest(ctx context.Context, user *db.User, weekStart, we
 	if w.Pipeline != nil && user.DigestEmailOptIn {
 		weekRange := weekStart.Format("Jan 2") + " – " +
 			weekStart.AddDate(0, 0, 6).Format("Jan 2, 2006")
+		unsubURL := digestUnsubscribeURL(user.ID, digestID)
 		msg := email.Message{
 			ToUserID:       user.ID,
 			ToAddress:      user.Email,
 			Template:       email.TemplateWeeklyDigest,
 			IdempotencyKey: "weekly_digest:" + digestID,
 			Variables: map[string]any{
-				"WeekRange":   weekRange,
-				"DigestURL":   "",
-				"ContentJSON": string(contentJSON),
+				"WeekRange":      weekRange,
+				"DigestURL":      strings.TrimRight(config.Default.AppBaseURL, "/") + "/dashboard",
+				"TopIdeas":       digestIdeaStrings(parsed.TopIdeas),
+				"TopQuestions":   digestQuestionStrings(parsed.TopQuestions),
+				"UnsubscribeURL": unsubURL,
 			},
+			ListUnsubscribe: unsubURL,
 		}
 		if err := w.Pipeline.Send(ctx, msg); err != nil {
 			w.Logger.Printf("digest worker: weekly_digest email enqueue failed user=%s id=%s: %v",
@@ -364,6 +386,45 @@ func (w *Worker) runUserDigest(ctx context.Context, user *db.User, weekStart, we
 				user.ID, digestID, err)
 		}
 	}
+}
+
+// digestIdeaStrings flattens LLM-synthesised ideas into the template's
+// string list. Evidence is appended when present so the email carries the
+// reasoning, not just the headline.
+func digestIdeaStrings(ideas []DigestIdea) []string {
+	out := make([]string, 0, len(ideas))
+	for _, i := range ideas {
+		line := strings.TrimSpace(i.Idea)
+		if e := strings.TrimSpace(i.Evidence); e != "" {
+			line += " — " + e
+		}
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+func digestQuestionStrings(questions []DigestQuestion) []string {
+	out := make([]string, 0, len(questions))
+	for _, q := range questions {
+		if s := strings.TrimSpace(q.Question); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// digestUnsubscribeURL builds a self-authenticating unsubscribe link
+// (HMAC-signed, reusing email/signer.go) that flips the user's digest
+// opt-in off without any login. The digest ID plays the canonical
+// "jobID" slot in the signature.
+func digestUnsubscribeURL(userID, digestID string) string {
+	exp := time.Now().UTC().AddDate(1, 0, 0)
+	q := email.SignURL(config.Default.ExportSignedURLSecret, userID, digestID, exp)
+	return strings.TrimRight(config.Default.AppBaseURL, "/") +
+		"/unsubscribe?user_id=" + url.QueryEscape(userID) +
+		"&job=" + url.QueryEscape(digestID) + "&" + q
 }
 
 // computeTruth builds the authoritative numeric DigestContent fields. This
@@ -433,5 +494,81 @@ func (w *Worker) recoverStalePending(ctx context.Context) {
 		}
 		w.Logger.Printf("digest worker: promoted stale pending id=%s user=%s week=%s → deferred",
 			d.ID, d.UserID, d.WeekStartDate)
+	}
+}
+
+// catchUpMissedWeeks dispatches the most recent weeks whose Monday 08:00
+// trigger passed while the process was down. Idempotent via pending insert gate.
+func (w *Worker) catchUpMissedWeeks(ctx context.Context) {
+	now := w.Now()
+	base := computeWeekStart(now)
+	for k := 0; k < 3; k++ {
+		ws := base.AddDate(0, 0, -7*k)
+		trigger := ws.AddDate(0, 0, 7).Add(8 * time.Hour)
+		if now.Before(trigger) {
+			continue
+		}
+		if shouldTrigger(now) && k == 0 {
+			continue
+		}
+		w.Logger.Printf("digest worker: catch-up week_start=%s", ws.Format("2006-01-02"))
+		w.dispatch(ctx, ws)
+	}
+}
+
+// redispatchDeferred retries deferred rows due per backoff schedule.
+func (w *Worker) redispatchDeferred(ctx context.Context) {
+	due, err := w.Queries.GetDeferredDigestsDue(ctx, w.Now(), deferredRedispatchLimit)
+	if err != nil {
+		w.Logger.Printf("digest worker: deferred query failed: %v", err)
+		return
+	}
+	for _, d := range due {
+		if ctx.Err() != nil {
+			return
+		}
+		w.retryDeferred(ctx, d)
+	}
+}
+
+func (w *Worker) retryDeferred(ctx context.Context, d *db.WeeklyDigest) {
+	user, err := w.Queries.GetUserByID(ctx, d.UserID)
+	if err != nil || user == nil {
+		w.Logger.Printf("digest worker: deferred retry skip id=%s: user lookup failed", d.ID)
+		return
+	}
+	weekStart, err := time.Parse("2006-01-02", d.WeekStartDate)
+	if err != nil {
+		return
+	}
+	weekStart = weekStart.UTC()
+	weekEnd := weekStart.AddDate(0, 0, 7)
+	comments, err := w.Queries.GetEligibleCommentsForUser(ctx, user.ID, weekStart, weekEnd)
+	if err != nil || len(comments) < digestSkipThreshold {
+		if err == nil {
+			_ = w.Queries.UpdateDigestContent(ctx, d.ID, nil, "skipped_insufficient_data")
+		}
+		return
+	}
+	truth := w.computeTruth(ctx, user, weekStart, comments)
+	prompt := BuildDigestPrompt(DigestPromptInputs{
+		Aggregates:     truth,
+		TopTopics:      computeTopTopics(comments, 10),
+		CategoryCounts: computeCategoryDistribution(comments),
+		SampleComments: selectSampleComments(comments, digestSampleLimit),
+	})
+	retryCtx, cancel := context.WithTimeout(ctx, dispatchDeadline)
+	defer cancel()
+	parsed, err := w.callWithRetry(retryCtx, prompt, truth)
+	if err != nil {
+		w.Logger.Printf("digest worker: deferred retry failed id=%s: %v", d.ID, err)
+		return
+	}
+	contentJSON, err := json.Marshal(parsed)
+	if err != nil {
+		return
+	}
+	if err := w.Queries.UpdateDigestContent(ctx, d.ID, contentJSON, "completed"); err != nil {
+		w.Logger.Printf("digest worker: deferred completed-update failed id=%s: %v", d.ID, err)
 	}
 }

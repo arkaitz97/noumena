@@ -34,8 +34,8 @@ func (h *ChannelHandler) ExchangeInstagram(w http.ResponseWriter, r *http.Reques
 
 func PlatformValidationMiddleware(next http.Handler) http.Handler {
 	supportedPlatforms := map[string]bool{
-		"youtube": true,
-		"tiktok":  true,
+		"youtube":   true,
+		"tiktok":    true,
 		"instagram": true,
 	}
 

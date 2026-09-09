@@ -75,8 +75,8 @@ func StartTrialReminder(ctx context.Context, store TrialReminderStore, p *email.
 
 func runTrialReminderOnce(ctx context.Context, store TrialReminderStore, p *email.Pipeline, lead time.Duration) {
 	now := time.Now().UTC()
-	hi := now.Add(lead)              // upper bound: trial_ends_at <= NOW + 3d
-	lo := hi.Add(-24 * time.Hour)    // lower bound: 24h earlier (1-day window)
+	hi := now.Add(lead)           // upper bound: trial_ends_at <= NOW + 3d
+	lo := hi.Add(-24 * time.Hour) // lower bound: 24h earlier (1-day window)
 
 	users, err := store.ListUsersForTrialExpiryReminder(ctx, lo, hi)
 	if err != nil {

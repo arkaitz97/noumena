@@ -19,17 +19,17 @@ func makeRow(id, body string) *db.FeedRow {
 	processed := posted.Add(time.Minute)
 	return &db.FeedRow{
 		Comment: db.Comment{
-			ID:                id,
-			PlatformChannelID: "ch1",
-			PlatformCommentID: "yt-" + id,
-			Body:              body,
-			PostedAt:          posted,
-			Category:          &cat,
+			ID:                 id,
+			PlatformChannelID:  "ch1",
+			PlatformCommentID:  "yt-" + id,
+			Body:               body,
+			PostedAt:           posted,
+			Category:           &cat,
 			ActionableInsights: []byte(`[]`),
-			Topic:             &topic,
-			Confidence:        &conf,
-			ProcessedAt:       &processed,
-			CreatedAt:         posted,
+			Topic:              &topic,
+			Confidence:         &conf,
+			ProcessedAt:        &processed,
+			CreatedAt:          posted,
 		},
 		ChannelName: "My Channel",
 	}
@@ -54,7 +54,7 @@ func TestEncodeCSV_HeaderOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read header: %v", err)
 	}
-	want := []string{"id", "channel_name", "author_handle", "body", "posted_at", "category", "actionable_insights", "topic", "confidence", "processed_at"}
+	want := []string{"id", "channel_name", "author_handle", "body", "posted_at", "category", "actionable_insights", "topic", "confidence", "processed_at", "video_id", "video_title"}
 	if len(header) != len(want) {
 		t.Fatalf("header length: got %d want %d", len(header), len(want))
 	}

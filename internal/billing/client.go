@@ -9,6 +9,7 @@ import (
 	"github.com/stripe/stripe-go/v76"
 	billingportal "github.com/stripe/stripe-go/v76/billingportal/session"
 	"github.com/stripe/stripe-go/v76/checkout/session"
+	"github.com/stripe/stripe-go/v76/customerbalancetransaction"
 	stripesub "github.com/stripe/stripe-go/v76/subscription"
 	"github.com/stripe/stripe-go/v76/webhook"
 )
@@ -117,6 +118,14 @@ type Client interface {
 	// so callers (including handlers and tests) can resolve plan from a
 	// Stripe price-id.
 	PriceMap() PriceMap
+
+	// CreateCustomerBalanceCharge applies a positive amount to the
+	// customer's Stripe balance (they owe the overage; the debit lands on
+	// their next finalized invoice). Used by the overage-invoicing job
+	// (implement-missing-product-features 8.x). Callers pass an
+	// idempotency key derived from (user, period) so Stripe collapses
+	// retries into one transaction. Returns the balance transaction id.
+	CreateCustomerBalanceCharge(ctx context.Context, customerID string, amountCents int64, description, idempotencyKey string, metadata map[string]string) (string, error)
 }
 
 // StripeClient is the real implementation backed by stripe-go.
@@ -129,11 +138,11 @@ type StripeClient struct {
 
 // Config carries the construction parameters for a real StripeClient.
 type Config struct {
-	SecretKey         string
-	WebhookSecret     string
-	Prices            PriceMap
-	SuccessURL        string
-	CancelURL         string
+	SecretKey     string
+	WebhookSecret string
+	Prices        PriceMap
+	SuccessURL    string
+	CancelURL     string
 }
 
 // NewStripeClient configures the global stripe-go key and returns a Client.
@@ -151,6 +160,38 @@ func NewStripeClient(cfg Config) *StripeClient {
 }
 
 func (c *StripeClient) PriceMap() PriceMap { return c.prices }
+
+// CreateCustomerBalanceCharge posts a debit to the customer's balance via
+// the /customers/{id}/balance_transactions API. amountCents must be
+// positive (a negative value would be a credit). The Idempotency-Key
+// header makes retries collapse server-side.
+func (c *StripeClient) CreateCustomerBalanceCharge(ctx context.Context, customerID string, amountCents int64, description, idempotencyKey string, metadata map[string]string) (string, error) {
+	if customerID == "" {
+		return "", errors.New("customerID is required")
+	}
+	if amountCents <= 0 {
+		return "", fmt.Errorf("amountCents must be positive, got %d", amountCents)
+	}
+	params := &stripe.CustomerBalanceTransactionParams{
+		Customer:    stripe.String(customerID),
+		Amount:      stripe.Int64(amountCents),
+		Currency:    stripe.String(string(stripe.CurrencyUSD)),
+		Description: stripe.String(description),
+	}
+	if idempotencyKey != "" {
+		params.IdempotencyKey = stripe.String(idempotencyKey)
+	}
+	for k, v := range metadata {
+		params.AddMetadata(k, v)
+	}
+	params.Context = ctx
+	txn, err := customerbalancetransaction.New(params)
+	if err != nil {
+		log.Printf("billing: stripe balance transaction failed customer=%s amount=%d err=%v", customerID, amountCents, err)
+		return "", err
+	}
+	return txn.ID, nil
+}
 
 func (c *StripeClient) CreateCheckoutSession(ctx context.Context, userID, plan, interval, customerEmail string) (*stripe.CheckoutSession, error) {
 	priceID, err := c.prices.Lookup(plan, interval)
@@ -217,11 +258,11 @@ func (c *StripeClient) GetSubscription(ctx context.Context, subID string) (*stri
 // and proceeds.
 //
 // We use the immediate-cancel form (not at_period_end=true) because:
-//   1. The user has asked to delete the account; continuing to bill
-//      them through the period would be hostile.
-//   2. Stripe's webhook will still fire `customer.subscription.deleted`
-//      which our existing webhook handler already processes — that's
-//      the source of truth for the local subscription_status flip.
+//  1. The user has asked to delete the account; continuing to bill
+//     them through the period would be hostile.
+//  2. Stripe's webhook will still fire `customer.subscription.deleted`
+//     which our existing webhook handler already processes — that's
+//     the source of truth for the local subscription_status flip.
 //
 // Stripe errors with code `resource_missing` (the subscription is
 // already canceled or never existed) are treated as success and
@@ -277,6 +318,21 @@ type MockClient struct {
 	// Cancellations records the subscription IDs passed to
 	// CancelSubscription so deletion-flow tests can assert behaviour.
 	Cancellations []string
+	// BalanceCharges records customer-balance debit attempts (overage
+	// invoicing): customerID -> charges in call order.
+	BalanceCharges map[string][]MockBalanceCharge
+	// BalanceChargeErr, when non-nil, is returned by
+	// CreateCustomerBalanceCharge.
+	BalanceChargeErr error
+}
+
+// MockBalanceCharge is one recorded CreateCustomerBalanceCharge call.
+type MockBalanceCharge struct {
+	AmountCents    int64
+	Description    string
+	IdempotencyKey string
+	Metadata       map[string]string
+	ID             string
 }
 
 func NewMockClient() *MockClient { return &MockClient{} }
@@ -329,4 +385,26 @@ func (m *MockClient) CancelSubscription(_ context.Context, subID string) error {
 func (m *MockClient) CancelSubscriptionAtPeriodEnd(_ context.Context, subID string) error {
 	m.Cancellations = append(m.Cancellations, subID+":at_period_end")
 	return nil
+}
+
+// CreateCustomerBalanceCharge on the mock records the charge and returns a
+// deterministic transaction id. It never hits Stripe; tests assert against
+// BalanceCharges.
+func (m *MockClient) CreateCustomerBalanceCharge(_ context.Context, customerID string, amountCents int64, description, idempotencyKey string, metadata map[string]string) (string, error) {
+	if m.BalanceChargeErr != nil {
+		return "", m.BalanceChargeErr
+	}
+	if m.BalanceCharges == nil {
+		m.BalanceCharges = map[string][]MockBalanceCharge{}
+	}
+	charges := m.BalanceCharges[customerID]
+	id := fmt.Sprintf("cbtxn_%d", len(charges)+1)
+	m.BalanceCharges[customerID] = append(charges, MockBalanceCharge{
+		AmountCents:    amountCents,
+		Description:    description,
+		IdempotencyKey: idempotencyKey,
+		Metadata:       metadata,
+		ID:             id,
+	})
+	return id, nil
 }

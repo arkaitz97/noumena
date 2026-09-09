@@ -16,6 +16,10 @@ type EmailAttemptInput struct {
 	LastAttemptedAt *time.Time
 	LastError       *string
 	SentAt          *time.Time
+	ToAddress       string
+	Subject         string
+	HTMLBody        string
+	TextBody        string
 }
 
 type EmailLogRow struct {
@@ -28,6 +32,10 @@ type EmailLogRow struct {
 	LastAttemptedAt *time.Time
 	LastError       *string
 	SentAt          *time.Time
+	ToAddress       string
+	Subject         string
+	HTMLBody        string
+	TextBody        string
 	CreatedAt       time.Time
 }
 
@@ -39,6 +47,7 @@ type EmailLogStore interface {
 	MarkEmailFailed(ctx context.Context, id string, lastErr string) error
 	MarkEmailAttemptError(ctx context.Context, id string, errMsg string) error
 	ClaimPendingEmails(ctx context.Context, now time.Time, max int) ([]*EmailLogRow, error)
+	GetEmailRowByIdempotencyKey(ctx context.Context, key string) (*EmailLogRow, error)
 }
 
 func (q *SQLiteQuery) IsEmailIdempotencyKeyUsed(ctx context.Context, key string) (bool, error) {
@@ -58,8 +67,9 @@ func (q *SQLiteQuery) LogEmailAttempt(ctx context.Context, in EmailAttemptInput)
 	const sqlStr = `
 		INSERT INTO email_send_log
 			(id, user_id, template, idempotency_key, status, attempt_count,
-			 last_attempted_at, last_error, sent_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 last_attempted_at, last_error, sent_at, to_address, subject,
+			 html_body, text_body)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		RETURNING id
 	`
 	var lastAttemptedAt, lastError, sentAt string
@@ -80,6 +90,7 @@ func (q *SQLiteQuery) LogEmailAttempt(ctx context.Context, in EmailAttemptInput)
 	err := q.db.QueryRowContext(ctx, sqlStr,
 		generateUUID(), userID, in.Template, in.IdempotencyKey, in.Status, in.AttemptCount,
 		lastAttemptedAt, lastError, sentAt,
+		in.ToAddress, in.Subject, in.HTMLBody, in.TextBody,
 	).Scan(&id)
 	return id, err
 }
@@ -118,28 +129,36 @@ func (q *SQLiteQuery) ClaimPendingEmails(ctx context.Context, now time.Time, max
 	if max <= 0 {
 		max = 50
 	}
-	// Compute backoff deadlines in Go
 	deadline1 := now.Add(-1 * time.Minute)
 	deadline2 := now.Add(-5 * time.Minute)
 	deadline3 := now.Add(-30 * time.Minute)
+	nowStr := now.UTC().Format(time.RFC3339)
 
 	const sqlStr = `
-		SELECT id, user_id, template, idempotency_key, status,
-		       attempt_count, last_attempted_at, last_error, sent_at, created_at
-		FROM email_send_log
-		WHERE status = 'pending'
-		  AND attempt_count < 3
-		  AND (
-		      (attempt_count = 1 AND COALESCE(last_attempted_at, '1970-01-01T00:00:00Z') <= ?)
-		   OR (attempt_count = 2 AND COALESCE(last_attempted_at, '1970-01-01T00:00:00Z') <= ?)
-		   OR (attempt_count >= 3 AND COALESCE(last_attempted_at, '1970-01-01T00:00:00Z') <= ?)
-		  )
-		ORDER BY last_attempted_at ASC
-		LIMIT ?
+		UPDATE email_send_log
+		   SET last_attempted_at = ?
+		 WHERE id IN (
+			SELECT id FROM email_send_log
+			WHERE status = 'pending'
+			  AND attempt_count < 3
+			  AND (
+			      (attempt_count = 1 AND COALESCE(last_attempted_at, '1970-01-01T00:00:00Z') <= ?)
+			   OR (attempt_count = 2 AND COALESCE(last_attempted_at, '1970-01-01T00:00:00Z') <= ?)
+			   OR (attempt_count = 0 AND COALESCE(last_attempted_at, '1970-01-01T00:00:00Z') <= ?)
+			   OR (attempt_count >= 3 AND COALESCE(last_attempted_at, '1970-01-01T00:00:00Z') <= ?)
+			  )
+			ORDER BY last_attempted_at ASC
+			LIMIT ?
+		)
+		RETURNING id, user_id, template, idempotency_key, status,
+		       attempt_count, last_attempted_at, last_error, sent_at,
+		       to_address, subject, html_body, text_body, created_at
 	`
 	rows, err := q.db.QueryContext(ctx, sqlStr,
+		nowStr,
 		deadline1.Format(time.RFC3339),
 		deadline2.Format(time.RFC3339),
+		deadline1.Format(time.RFC3339),
 		deadline3.Format(time.RFC3339),
 		max)
 	if err != nil {
@@ -148,29 +167,65 @@ func (q *SQLiteQuery) ClaimPendingEmails(ctx context.Context, now time.Time, max
 	defer rows.Close()
 	var out []*EmailLogRow
 	for rows.Next() {
-		var r EmailLogRow
-		var userID, lastAttemptedAt, lastError, sentAt, createdAt string
-		if err := rows.Scan(&r.ID, &userID, &r.Template, &r.IdempotencyKey, &r.Status,
-			&r.AttemptCount, &lastAttemptedAt, &lastError, &sentAt, &createdAt,
-		); err != nil {
+		r, err := scanEmailLogRow(rows)
+		if err != nil {
 			return nil, err
 		}
-		if userID != "" {
-			r.UserID = &userID
-		}
-		if lastAttemptedAt != "" {
-			t, _ := time.Parse(time.RFC3339, lastAttemptedAt)
-			r.LastAttemptedAt = &t
-		}
-		if lastError != "" {
-			r.LastError = &lastError
-		}
-		if sentAt != "" {
-			t, _ := time.Parse(time.RFC3339, sentAt)
-			r.SentAt = &t
-		}
-		r.CreatedAt = parseTime(createdAt)
-		out = append(out, &r)
+		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+func (q *SQLiteQuery) GetEmailRowByIdempotencyKey(ctx context.Context, key string) (*EmailLogRow, error) {
+	const sqlStr = `
+		SELECT id, user_id, template, idempotency_key, status,
+		       attempt_count, last_attempted_at, last_error, sent_at,
+		       to_address, subject, html_body, text_body, created_at
+		FROM email_send_log
+		WHERE idempotency_key = ?
+		LIMIT 1
+	`
+	row := q.db.QueryRowContext(ctx, sqlStr, key)
+	r, err := scanEmailLogRow(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return r, nil
+}
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanEmailLogRow(row rowScanner) (*EmailLogRow, error) {
+	var r EmailLogRow
+	var userID, lastAttemptedAt, lastError, sentAt sql.NullString
+	var createdAt string
+	if err := row.Scan(&r.ID, &userID, &r.Template, &r.IdempotencyKey, &r.Status,
+		&r.AttemptCount, &lastAttemptedAt, &lastError, &sentAt,
+		&r.ToAddress, &r.Subject, &r.HTMLBody, &r.TextBody, &createdAt,
+	); err != nil {
+		return nil, err
+	}
+	if userID.Valid && userID.String != "" {
+		v := userID.String
+		r.UserID = &v
+	}
+	if lastAttemptedAt.Valid && lastAttemptedAt.String != "" {
+		t, _ := time.Parse(time.RFC3339, lastAttemptedAt.String)
+		r.LastAttemptedAt = &t
+	}
+	if lastError.Valid && lastError.String != "" {
+		v := lastError.String
+		r.LastError = &v
+	}
+	if sentAt.Valid && sentAt.String != "" {
+		t, _ := time.Parse(time.RFC3339, sentAt.String)
+		r.SentAt = &t
+	}
+	r.CreatedAt = parseTime(createdAt)
+	return &r, nil
 }

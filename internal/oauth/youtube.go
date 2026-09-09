@@ -3,6 +3,10 @@ package oauth
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 
 	"golang.org/x/oauth2"
@@ -105,4 +109,26 @@ func ExchangeAndFetchChannel(ctx context.Context, code string) (*oauth2.Token, *
 		return nil, nil, err
 	}
 	return token, info, nil
+}
+
+// RevokeToken invalidates a Google OAuth access token. Best-effort by
+// design: callers log-and-continue on failure (revocation is a hygiene
+// step, not a correctness gate).
+func RevokeToken(ctx context.Context, accessToken string) error {
+	form := url.Values{"token": {accessToken}}
+	req, err := http.NewRequestWithContext(
+		ctx, http.MethodPost, "https://oauth2.googleapis.com/revoke", strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("revoke returned %d", resp.StatusCode)
+	}
+	return nil
 }

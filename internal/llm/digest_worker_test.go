@@ -22,10 +22,11 @@ type fakeDigestQuery struct {
 	db.DBQuery
 	mu sync.Mutex
 
-	users    []*db.User
-	comments map[string][]*db.Comment // keyed by userID
-	prevWeek map[string]*db.WeeklyDigest
-	stale    []*db.WeeklyDigest
+	users       []*db.User
+	comments    map[string][]*db.Comment // keyed by userID
+	prevWeek    map[string]*db.WeeklyDigest
+	stale       []*db.WeeklyDigest
+	deferredDue []*db.WeeklyDigest
 
 	// effects observed by the test
 	insertedPending []string // digestIDs returned
@@ -105,6 +106,27 @@ func (f *fakeDigestQuery) GetPreviousWeekDigest(ctx context.Context, userID stri
 
 func (f *fakeDigestQuery) GetStalePendingDigests(ctx context.Context, olderThan time.Time) ([]*db.WeeklyDigest, error) {
 	return f.stale, nil
+}
+
+func (f *fakeDigestQuery) GetDeferredDigestsDue(ctx context.Context, now time.Time, limit int) ([]*db.WeeklyDigest, error) {
+	return f.deferredDue, nil
+}
+
+func (f *fakeDigestQuery) GetUserByID(ctx context.Context, id string) (*db.User, error) {
+	for _, u := range f.users {
+		if u.ID == id {
+			return u, nil
+		}
+	}
+	return nil, nil
+}
+
+func (f *fakeDigestQuery) GetWeeklyDigestByID(ctx context.Context, digestID string) (*db.WeeklyDigest, error) {
+	return nil, db.ErrNotFound
+}
+
+func (f *fakeDigestQuery) GetMissingDigestWeeks(ctx context.Context, userID string, weeks []time.Time) ([]time.Time, error) {
+	return weeks, nil
 }
 
 func (f *fakeDigestQuery) MarkDigestEmailed(ctx context.Context, digestID, userID string, at time.Time) error {
@@ -263,7 +285,7 @@ func TestRecoverStalePending(t *testing.T) {
 // fakeSMTPSender implements email.SMTPSender for tests.
 type fakeSMTPSender struct{}
 
-func (f *fakeSMTPSender) Send(ctx context.Context, from, to, subject, htmlBody, textBody string) error {
+func (f *fakeSMTPSender) Send(ctx context.Context, from, to, subject, htmlBody, textBody string, headers []string) error {
 	return nil
 }
 
@@ -289,6 +311,9 @@ func (f *fakeEmailLogStore) MarkEmailFailed(ctx context.Context, id string, last
 	return nil
 }
 func (f *fakeEmailLogStore) ClaimPendingEmails(ctx context.Context, now time.Time, max int) ([]*db.EmailLogRow, error) {
+	return nil, nil
+}
+func (f *fakeEmailLogStore) GetEmailRowByIdempotencyKey(ctx context.Context, key string) (*db.EmailLogRow, error) {
 	return nil, nil
 }
 
@@ -370,7 +395,7 @@ func TestRunUserDigest_EmailNotSentWhenOptInFalse(t *testing.T) {
 // panicSMTPSender panics if Send is called, used to verify email path is skipped.
 type panicSMTPSender struct{}
 
-func (p *panicSMTPSender) Send(ctx context.Context, from, to, subject, htmlBody, textBody string) error {
+func (p *panicSMTPSender) Send(ctx context.Context, from, to, subject, htmlBody, textBody string, headers []string) error {
 	panic("SMTPSender.Send should not be called when opt_in=false")
 }
 
@@ -415,7 +440,7 @@ type trackingSMTPSender struct {
 	lastTo string
 }
 
-func (t *trackingSMTPSender) Send(ctx context.Context, from, to, subject, htmlBody, textBody string) error {
+func (t *trackingSMTPSender) Send(ctx context.Context, from, to, subject, htmlBody, textBody string, headers []string) error {
 	t.called = true
 	t.lastTo = to
 	return nil
@@ -470,5 +495,53 @@ func TestRunUserDigest_PausedChannelsExcluded(t *testing.T) {
 	// With 0 comments (< digestSkipThreshold=10), should be skipped.
 	if len(q.contentUpdates) != 1 || q.contentUpdates[0].Status != "skipped_insufficient_data" {
 		t.Errorf("expected skip due to insufficient data (paused channels excluded), got %+v", q.contentUpdates)
+	}
+}
+
+func TestCatchUpMissedWeeksDispatches(t *testing.T) {
+	// Tuesday after Monday 08:00 trigger: startup should catch up previous week.
+	now := time.Date(2024, 1, 9, 12, 0, 0, 0, time.UTC) // Tuesday
+	cs := make([]*db.Comment, 12)
+	for i := range cs {
+		cs[i] = &db.Comment{Body: "x"}
+	}
+	q := &fakeDigestQuery{
+		users:           []*db.User{{ID: "u1"}},
+		comments:        map[string][]*db.Comment{"u1": cs},
+		pendingInserted: true,
+	}
+	llmRaw := `{"top_ideas":[],"top_questions":[],"top_actionable_insights":[],"engagement_health_score":80,"health_score_breakdown":{"response_rate":70,"engagement_depth":75},"total_comments_analyzed":12,"filtered_comments":0}`
+	w := &Worker{
+		Queries:   q,
+		LLMClient: newMockOpenCode(t, llmRaw, "", 0),
+		Logger:    log.New(io.Discard, "", 0),
+		Now:       func() time.Time { return now },
+	}
+	w.dispatched = map[string]struct{}{}
+	w.catchUpMissedWeeks(context.Background())
+	if len(q.contentUpdates) == 0 {
+		t.Fatalf("catch-up should dispatch missed week")
+	}
+}
+
+func TestRedispatchDeferredCompletes(t *testing.T) {
+	cs := make([]*db.Comment, 12)
+	for i := range cs {
+		topic := "t"
+		cat := "praise"
+		cs[i] = &db.Comment{Body: "x", Topic: &topic, Category: &cat}
+	}
+	q := &fakeDigestQuery{
+		users:    []*db.User{{ID: "u1", Email: "u@e.c"}},
+		comments: map[string][]*db.Comment{"u1": cs},
+		deferredDue: []*db.WeeklyDigest{
+			{ID: "d1", UserID: "u1", WeekStartDate: "2024-01-01", Status: "deferred"},
+		},
+	}
+	llmRaw := `{"top_ideas":[],"top_questions":[],"top_actionable_insights":[],"engagement_health_score":80,"health_score_breakdown":{"response_rate":70,"engagement_depth":75},"total_comments_analyzed":12,"filtered_comments":0}`
+	w := newTestWorker(t, q, newMockOpenCode(t, llmRaw, "", 0))
+	w.redispatchDeferred(context.Background())
+	if len(q.contentUpdates) != 1 || q.contentUpdates[0].Status != "completed" {
+		t.Fatalf("deferred should complete, got %+v", q.contentUpdates)
 	}
 }

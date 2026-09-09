@@ -181,9 +181,9 @@ func TestGenerateRefreshTokenIsRandomAndHashed(t *testing.T) {
 
 // memStore implements the auth.RefreshTokenStore in memory.
 type memStore struct {
-	mu        sync.Mutex
-	rows      map[string]memRow
-	versions  map[string]int
+	mu       sync.Mutex
+	rows     map[string]memRow
+	versions map[string]int
 }
 type memRow struct {
 	userID  string

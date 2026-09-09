@@ -2,9 +2,12 @@ package api_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,8 +17,10 @@ import (
 )
 
 type rlMockQuery struct {
+	db.DBQuery
 	count    int
 	failNext bool
+	lastKey  string
 }
 
 func (m *rlMockQuery) IncrementRateLimit(ctx context.Context, userKey string, windowStart time.Time, limit int) (int, error) {
@@ -24,6 +29,7 @@ func (m *rlMockQuery) IncrementRateLimit(ctx context.Context, userKey string, wi
 		return 0, context.Canceled
 	}
 	m.count++
+	m.lastKey = userKey
 	return m.count, nil
 }
 
@@ -413,6 +419,15 @@ func (m *rlMockQuery) UpdateUserPreference(ctx context.Context, userID, key, val
 func (m *rlMockQuery) GetCommentFeedWithFilters(ctx context.Context, userID string, filters map[string]string) ([]*db.Comment, int, error) {
 	return nil, 0, nil
 }
+func (m *rlMockQuery) GrantChannel(ctx context.Context, workspaceID, channelID, grantedBy string) error {
+	return nil
+}
+func (m *rlMockQuery) RevokeChannel(ctx context.Context, workspaceID, channelID string) error {
+	return nil
+}
+func (m *rlMockQuery) ListGrantedChannels(ctx context.Context, workspaceID string) ([]string, error) {
+	return nil, nil
+}
 
 // LifecycleStore methods
 func (m *rlMockQuery) ClaimNextDeletionJob(ctx context.Context, gracePeriod time.Duration) (*db.AccountDeletionJob, error) {
@@ -460,6 +475,15 @@ func (m *rlMockQuery) DeleteUserDigests(ctx context.Context, tx *sql.Tx, userID 
 func (m *rlMockQuery) DeleteUserAuthTokens(ctx context.Context, tx *sql.Tx, userID string) error {
 	return nil
 }
+func (m *rlMockQuery) DeleteUserGDPRData(ctx context.Context, tx *sql.Tx, userID string) error {
+	return nil
+}
+func (m *rlMockQuery) MarkDeletionRevokeStatus(ctx context.Context, jobID string, attempted bool, errorMsg string) error {
+	return nil
+}
+func (m *rlMockQuery) ListJobsPendingRevoke(ctx context.Context) ([]*db.AccountDeletionJob, error) {
+	return nil, nil
+}
 func (m *rlMockQuery) HardDeleteUser(ctx context.Context, tx *sql.Tx, userID string) error {
 	return nil
 }
@@ -505,6 +529,9 @@ func (m *rlMockQuery) MarkEmailAttemptError(ctx context.Context, id string, errM
 	return nil
 }
 func (m *rlMockQuery) ClaimPendingEmails(ctx context.Context, now time.Time, max int) ([]*db.EmailLogRow, error) {
+	return nil, nil
+}
+func (m *rlMockQuery) GetEmailRowByIdempotencyKey(ctx context.Context, key string) (*db.EmailLogRow, error) {
 	return nil, nil
 }
 
@@ -655,6 +682,197 @@ func TestRateLimitMiddleware_DBErrorPassthrough(t *testing.T) {
 
 	if rr.Code != http.StatusOK {
 		t.Errorf("expected 200 on DB error (passthrough), got %d", rr.Code)
+	}
+}
+
+// TestRateLimit_SpoofedForwardedHeaderIgnored — spec "Client identity from
+// a trusted source": with no TRUST_PROXY_HEADER configured, forged
+// X-Forwarded-For / X-Real-IP values must NOT change the bucket key; the
+// RemoteAddr-derived key is used.
+func TestRateLimit_SpoofedForwardedHeaderIgnored(t *testing.T) {
+	cfg := &config.Config{
+		RateLimitEnabled:         true,
+		RateLimitAuthMaxPerMin:   100,
+		RateLimitUnauthMaxPerMin: 10,
+	}
+	q := &rlMockQuery{}
+	mw := api.RateLimitMiddleware(q, cfg)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest("GET", "/auth/login", nil)
+	req.RemoteAddr = "203.0.113.5:41234"
+	req.Header.Set("X-Forwarded-For", "1.2.3.4, 5.6.7.8")
+	req.Header.Set("X-Real-IP", "9.9.9.9")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	first := q.lastKey
+
+	req2 := httptest.NewRequest("GET", "/auth/login", nil)
+	req2.RemoteAddr = "203.0.113.5:9999"
+	req2.Header.Set("X-Forwarded-For", "66.66.66.66")
+	rr2 := httptest.NewRecorder()
+	handler.ServeHTTP(rr2, req2)
+
+	if first == "" || !strings.HasPrefix(first, "ip:") {
+		t.Fatalf("expected ip-hashed key, got %q", first)
+	}
+	if q.lastKey != first {
+		t.Errorf("spoofed XFF changed the rate key: got %q want %q", q.lastKey, first)
+	}
+}
+
+// TestRateLimit_TrustedProxyHeader — when TRUST_PROXY_HEADER is configured,
+// that header (right-most entry) is the bucket key, and client-supplied
+// X-Forwarded-For is ignored.
+func TestRateLimit_TrustedProxyHeader(t *testing.T) {
+	cfg := &config.Config{
+		RateLimitEnabled:         true,
+		RateLimitAuthMaxPerMin:   100,
+		RateLimitUnauthMaxPerMin: 10,
+		TrustProxyHeader:         "X-Real-IP",
+	}
+	q := &rlMockQuery{}
+	mw := api.RateLimitMiddleware(q, cfg)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest("GET", "/auth/login", nil)
+	req.RemoteAddr = "10.0.0.1:41234"
+	req.Header.Set("X-Real-IP", "198.51.100.7")
+	req.Header.Set("X-Forwarded-For", "203.0.113.9") // spoofed, ignored
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	expHash := sha256.Sum256([]byte("198.51.100.7"))
+	if q.lastKey != "ip:"+hex.EncodeToString(expHash[:]) {
+		t.Errorf("expected key from trusted header, got %q", q.lastKey)
+	}
+}
+
+// TestRateLimit_MultiValueForwardedChain — with X-Forwarded-For explicitly
+// trusted, the right-most entry (the peer the proxy observed) wins; a
+// spoofed client prefix does not reset the bucket.
+func TestRateLimit_MultiValueForwardedChain(t *testing.T) {
+	cfg := &config.Config{
+		RateLimitEnabled:         true,
+		RateLimitAuthMaxPerMin:   100,
+		RateLimitUnauthMaxPerMin: 10,
+		TrustProxyHeader:         "X-Forwarded-For",
+	}
+	q := &rlMockQuery{}
+	mw := api.RateLimitMiddleware(q, cfg)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest("GET", "/auth/login", nil)
+	req.RemoteAddr = "10.0.0.1:41234"
+	req.Header.Set("X-Forwarded-For", "198.51.100.7, 10.0.0.1")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	first := q.lastKey
+
+	expHash := sha256.Sum256([]byte("10.0.0.1"))
+	if first != "ip:"+hex.EncodeToString(expHash[:]) {
+		t.Errorf("expected right-most proxy-observed IP, got %q", first)
+	}
+
+	req2 := httptest.NewRequest("GET", "/auth/login", nil)
+	req2.RemoteAddr = "10.0.0.1:41234"
+	req2.Header.Set("X-Forwarded-For", "66.66.66.66, 10.0.0.1")
+	rr2 := httptest.NewRecorder()
+	handler.ServeHTTP(rr2, req2)
+	if q.lastKey != first {
+		t.Errorf("spoofed chain prefix changed the key: got %q want %q", q.lastKey, first)
+	}
+}
+
+// TestRateLimit_PerUserKeying — an authenticated request (user id in the
+// request context, set by AuthMiddleware) is keyed per-user, not by IP.
+func TestRateLimit_PerUserKeying(t *testing.T) {
+	cfg := &config.Config{
+		RateLimitEnabled:         true,
+		RateLimitAuthMaxPerMin:   100,
+		RateLimitUnauthMaxPerMin: 10,
+		TrustProxyHeader:         "X-Forwarded-For",
+	}
+	q := &rlMockQuery{}
+	mw := api.RateLimitMiddleware(q, cfg)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest("GET", "/api/test", nil)
+	req.Header.Set("X-Forwarded-For", "1.2.3.4")
+	req = req.WithContext(context.WithValue(req.Context(), api.UserIDKey, "user-42"))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if q.lastKey != "u:user-42" {
+		t.Errorf("expected per-user key, got %q", q.lastKey)
+	}
+}
+
+// TestRateLimit_AnonymousPathKeyedByTrustedIP — anonymous requests get an
+// IP bucket derived from the trusted source.
+func TestRateLimit_AnonymousPathKeyedByTrustedIP(t *testing.T) {
+	cfg := &config.Config{
+		RateLimitEnabled:         true,
+		RateLimitAuthMaxPerMin:   100,
+		RateLimitUnauthMaxPerMin: 10,
+	}
+	q := &rlMockQuery{}
+	mw := api.RateLimitMiddleware(q, cfg)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest("GET", "/auth/register", nil)
+	req.RemoteAddr = "192.0.2.44:5555"
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	expHash := sha256.Sum256([]byte("192.0.2.44"))
+	if q.lastKey != "ip:"+hex.EncodeToString(expHash[:]) {
+		t.Errorf("expected anonymous IP key, got %q", q.lastKey)
+	}
+}
+
+// TestRateLimit_UnauthenticatedUsesUnauthLimit — anonymous requests are
+// throttled at the unauthenticated limit, not the authenticated one.
+func TestRateLimit_UnauthenticatedUsesUnauthLimit(t *testing.T) {
+	cfg := &config.Config{
+		RateLimitEnabled:         true,
+		RateLimitAuthMaxPerMin:   100,
+		RateLimitUnauthMaxPerMin: 3,
+	}
+	q := &rlMockQuery{}
+	mw := api.RateLimitMiddleware(q, cfg)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	for i := 1; i <= 3; i++ {
+		req := httptest.NewRequest("GET", "/auth/login", nil)
+		req.RemoteAddr = "198.51.100.20:1111"
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("request %d: expected 200, got %d", i, rr.Code)
+		}
+		if rr.Header().Get("X-RateLimit-Limit") != "3" {
+			t.Errorf("request %d: expected unauth limit header 3, got %s", i, rr.Header().Get("X-RateLimit-Limit"))
+		}
+	}
+	req := httptest.NewRequest("GET", "/auth/login", nil)
+	req.RemoteAddr = "198.51.100.20:1111"
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusTooManyRequests {
+		t.Errorf("expected 429 for anonymous request over limit, got %d", rr.Code)
 	}
 }
 

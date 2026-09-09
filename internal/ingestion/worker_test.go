@@ -109,6 +109,15 @@ func (f *fakeWorkerDB) GetPlatformChannelByID(_ context.Context, pcID string) (*
 func (f *fakeWorkerDB) GetIngestionToken(_ context.Context, _ string) (string, string, error) {
 	return f.tokenA, f.tokenR, f.tokenErr
 }
+func (f *fakeWorkerDB) GetIngestionTokenRow(_ context.Context, _ string) (*db.UserChannelTracking, bool, error) {
+	return nil, false, nil
+}
+func (f *fakeWorkerDB) UpdateTokenAndExpiry(_ context.Context, _, _, _ string, _ time.Time) error {
+	return nil
+}
+func (f *fakeWorkerDB) RecoverStaleIngestionJobs(_ context.Context, _ time.Duration) (int64, error) {
+	return 0, nil
+}
 func (f *fakeWorkerDB) PromoteNextIngestionToken(_ context.Context, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -373,3 +382,10 @@ func TestWorker_DeadLetterAfterMaxRetries(t *testing.T) {
 type alerterFunc func()
 
 func (a alerterFunc) Alert(_ context.Context, _, _, _ string) { a() }
+
+func TestWorker_RecoverStaleJobsCallsDB(t *testing.T) {
+	f := newFakeWorkerDB()
+	w := &Worker{DB: f, JobDeadline: 5 * time.Second, Alerter: LogAlerter{}}
+	// Must not panic and must complete.
+	w.RecoverStaleJobs(context.Background())
+}

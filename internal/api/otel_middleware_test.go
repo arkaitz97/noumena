@@ -1,15 +1,21 @@
 package api_test
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"noumena/internal/api"
 )
@@ -73,6 +79,81 @@ func TestOtelMiddlewareDisabledNoPanic(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Errorf("status: got %d, want 200", resp.StatusCode)
+	}
+}
+
+// TestOtelSpanQueryStringRedaction verifies fix-crypto-http-hardening
+// task 4.3: a `?token=` query string never reaches OTel span attributes.
+// http.target must be the URL path only and http.route must be the chi
+// pattern; no attribute value may contain the token.
+func TestOtelSpanQueryStringRedaction(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	prev := otel.GetTracerProvider()
+	otel.SetTracerProvider(tp)
+	t.Cleanup(func() {
+		_ = tp.Shutdown(context.Background())
+		otel.SetTracerProvider(prev)
+	})
+
+	r := chi.NewRouter()
+	r.Use(api.OtelMiddleware())
+	r.Get("/verify-email", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/verify-email?token=super-secret-abc123")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	resp.Body.Close()
+
+	spans := exporter.GetSpans()
+	if len(spans) == 0 {
+		t.Fatal("expected at least one recorded span")
+	}
+	for _, s := range spans {
+		for _, kv := range s.Attributes {
+			val := kv.Value.AsString()
+			if strings.Contains(val, "token=") || strings.Contains(val, "super-secret-abc123") {
+				t.Errorf("span attribute %s leaks query token: %q", kv.Key, val)
+			}
+			if kv.Key == attribute.Key("http.target") && val != "/verify-email" {
+				t.Errorf("http.target: got %q want %q (query must be stripped)", val, "/verify-email")
+			}
+		}
+	}
+}
+
+// TestAccessLogPathOnly verifies fix-crypto-http-hardening task 4.3: the
+// access log records the path only, so a `?token=` query string cannot
+// appear in log output.
+func TestAccessLogPathOnly(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	r := chi.NewRouter()
+	r.Use(api.AccessLogMiddleware(logger))
+	r.Get("/reset-password", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/reset-password?token=log-secret-xyz")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	resp.Body.Close()
+
+	out := buf.String()
+	if strings.Contains(out, "log-secret-xyz") || strings.Contains(out, "token=") {
+		t.Errorf("access log leaked query string:\n%s", out)
+	}
+	if !strings.Contains(out, "/reset-password") {
+		t.Errorf("access log missing path:\n%s", out)
 	}
 }
 

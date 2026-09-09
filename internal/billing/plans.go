@@ -28,14 +28,15 @@ type PlanLimits struct {
 
 	// ChannelLimit is the maximum number of active+paused channels the user
 	// can have. ChannelsUnlimited == true overrides this (Agency).
-	ChannelLimit     int
+	ChannelLimit      int
 	ChannelsUnlimited bool
 
 	// CommentQuotaMonthly is the per-period comment processing budget.
 	CommentQuotaMonthly int
 
-	// Seats is how many users the subscription covers. v1 ignores this for
-	// enforcement; it is reported through GET /api/billing/status.
+	// Seats is how many users the subscription covers. Enforced at workspace
+	// invite acceptance / role change (implement-missing-product-features 4.2)
+	// and reported through GET /api/billing/status.
 	Seats int
 
 	// MonthlyPriceCents and AnnualPriceCents are the canonical USD prices
@@ -118,4 +119,24 @@ func AnnualDiscountPercent() float64 {
 // AnnualPriceFromMonthly calculates the annual price with 20% discount.
 func AnnualPriceFromMonthly(monthlyCents int) int {
 	return int(float64(monthlyCents) * 12 * 0.8)
+}
+
+// Overage unit + price (implement-missing-product-features 8.x). Overage is
+// billed per 1000-comment chunk at $0.50, matching the read-side rollup in
+// db.GetOverageCostForCurrentPeriod. Kept here so the overage-invoicing job
+// and any future billing surfaces share one source of truth.
+const (
+	OverageUnitSize       = 1000
+	OverageUnitPriceCents = 50
+)
+
+// OverageAmountCents returns the USD charge (in cents) for a total overage
+// comment count: ceil(overage / unit) × unit price. Non-positive inputs
+// yield 0.
+func OverageAmountCents(overage int) int {
+	if overage <= 0 {
+		return 0
+	}
+	units := (overage + OverageUnitSize - 1) / OverageUnitSize
+	return units * OverageUnitPriceCents
 }

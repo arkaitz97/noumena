@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"time"
 )
 
@@ -51,12 +52,12 @@ func (q *SQLiteQuery) InsertComment(ctx context.Context, c *Comment) error {
 
 func (q *SQLiteQuery) InsertCommentRowsAffected(ctx context.Context, c *Comment) (int64, error) {
 	query := `
-		INSERT INTO comments (id, platform_channel_id, platform_comment_id, parent_comment_id, reply_depth, author_handle, body, posted_at, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+		INSERT INTO comments (id, platform_channel_id, platform_comment_id, parent_comment_id, reply_depth, author_handle, body, posted_at, video_id, video_title, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 		ON CONFLICT (platform_channel_id, platform_comment_id) DO NOTHING
 	`
 	result, err := q.db.ExecContext(ctx, query,
-		generateUUID(), c.PlatformChannelID, c.PlatformCommentID, c.ParentCommentID, c.ReplyDepth, c.AuthorHandle, c.Body, formatTime(c.PostedAt),
+		generateUUID(), c.PlatformChannelID, c.PlatformCommentID, c.ParentCommentID, c.ReplyDepth, c.AuthorHandle, c.Body, formatTime(c.PostedAt), c.VideoID, c.VideoTitle,
 	)
 	if err != nil {
 		return 0, err
@@ -102,11 +103,22 @@ func (q *SQLiteQuery) GetUnprocessedComments(ctx context.Context, limit int) ([]
 }
 
 func (q *SQLiteQuery) GetUnprocessedCommentsByChannel(ctx context.Context, limit int) (map[string][]*Comment, error) {
+	// Channels without an active primary (token_priority=0) tracker are
+	// excluded at claim time: the LLM processor skips them anyway, and
+	// claiming them every tick re-scans the same batch forever (log spam +
+	// churn). Comments stay unprocessed and get picked up once a primary
+	// exists.
 	query := `
-		SELECT id, platform_channel_id, platform_comment_id, parent_comment_id, reply_depth, author_handle, body, posted_at, category, actionable_insights, topic, confidence, processed_at, created_at
-		FROM comments
-		WHERE processed_at IS NULL AND body != ''
-		ORDER BY posted_at ASC
+		SELECT c.id, c.platform_channel_id, c.platform_comment_id, c.parent_comment_id, c.reply_depth, c.author_handle, c.body, c.posted_at, c.category, c.actionable_insights, c.topic, c.confidence, c.processed_at, c.created_at
+		FROM comments c
+		WHERE (c.processed_at IS NULL OR c.sentiment_score IS NULL) AND c.body != ''
+		  AND EXISTS (
+		       SELECT 1 FROM user_channel_tracking uct
+		        WHERE uct.platform_channel_id = c.platform_channel_id
+		          AND uct.tracking_status = 'active'
+		          AND uct.token_priority = 0
+		  )
+		ORDER BY c.posted_at ASC
 		LIMIT ?
 	`
 	rows, err := q.db.QueryContext(ctx, query, limit)
@@ -128,12 +140,15 @@ func (q *SQLiteQuery) GetUnprocessedCommentsByChannel(ctx context.Context, limit
 
 func scanCommentRow(rows *sql.Rows) (*Comment, error) {
 	var c Comment
-	var postedAt, processedAt, createdAt sql.NullString
+	var postedAt, processedAt, createdAt, insights sql.NullString
 	if err := rows.Scan(
 		&c.ID, &c.PlatformChannelID, &c.PlatformCommentID, &c.ParentCommentID, &c.ReplyDepth, &c.AuthorHandle, &c.Body, &postedAt,
-		&c.Category, &c.ActionableInsights, &c.Topic, &c.Confidence, &processedAt, &createdAt,
+		&c.Category, &insights, &c.Topic, &c.Confidence, &processedAt, &createdAt,
 	); err != nil {
 		return nil, err
+	}
+	if insights.Valid {
+		c.ActionableInsights = json.RawMessage(insights.String)
 	}
 	c.PostedAt = parseTime(postedAt.String)
 	c.ProcessedAt = parseTimePtr(processedAt)

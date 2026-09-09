@@ -19,8 +19,8 @@ import (
 
 // MockQuery implements db.DBQuery for testing
 type MockQuery struct {
-	users          map[string]*db.User
-	refreshTokens  map[string]struct {
+	users         map[string]*db.User
+	refreshTokens map[string]struct {
 		userID  string
 		expires time.Time
 	}
@@ -29,17 +29,23 @@ type MockQuery struct {
 		expires time.Time
 		usedAt  *time.Time
 	}
+	emailChangeTokens map[string]struct {
+		userID  string
+		email   string
+		expires time.Time
+		usedAt  *time.Time
+	}
 	passwordResetTokens map[string]struct {
 		userID  string
 		expires time.Time
 		usedAt  *time.Time
 	}
-	verifResendCount    map[string]int
-	forgotPwSentCount   map[string]int
-	lockoutEmailsSent   int
-	verifyEmailsSent    int
-	resetEmailsSent     int
-	googleNoticesSent   int
+	verifResendCount  map[string]int
+	forgotPwSentCount map[string]int
+	lockoutEmailsSent int
+	verifyEmailsSent  int
+	resetEmailsSent   int
+	googleNoticesSent int
 	// weekly-digest fixtures (read-only handler tests)
 	latestDigests map[string]*db.WeeklyDigest
 	digestsByUser map[string][]*db.WeeklyDigest
@@ -60,14 +66,16 @@ type MockQuery struct {
 	overageCost           map[string]float64
 	subscriptionUpdates   []db.SubscriptionUpdate
 	usageLogs             []struct {
-		UserID                string
-		Count                 int
+		UserID                 string
+		Count                  int
 		PeriodStart, PeriodEnd time.Time
 	}
 	pauseAlphaCalls []struct {
 		UserID    string
 		KeepCount int
 	}
+	// billing_usage history fixture (implement-missing-product-features 3.2)
+	billingUsage map[string][]db.BillingUsage
 }
 
 func (m *MockQuery) CreateUser(ctx context.Context, email, passwordHash string) (*db.User, error) {
@@ -191,6 +199,14 @@ func (m *MockQuery) EnqueueLLMJob(ctx context.Context, commentIDs []string, prov
 	return "", nil
 }
 
+func (m *MockQuery) EnqueueLLMJobIfNotExists(ctx context.Context, commentIDs []string, provider string) (string, bool, error) {
+	return "", true, nil
+}
+
+func (m *MockQuery) RecoverStaleLLMJobs(ctx context.Context, olderThan time.Duration) (int64, error) {
+	return 0, nil
+}
+
 func (m *MockQuery) MarkLLMJobProcessing(ctx context.Context, jobID string) error {
 	return nil
 }
@@ -250,6 +266,15 @@ func (m *MockQuery) ListDigests(ctx context.Context, userID string, limit, offse
 	return all[offset:end], nil
 }
 func (m *MockQuery) GetStalePendingDigests(ctx context.Context, olderThan time.Time) ([]*db.WeeklyDigest, error) {
+	return nil, nil
+}
+func (m *MockQuery) GetDeferredDigestsDue(ctx context.Context, now time.Time, limit int) ([]*db.WeeklyDigest, error) {
+	return nil, nil
+}
+func (m *MockQuery) GetWeeklyDigestByID(ctx context.Context, digestID string) (*db.WeeklyDigest, error) {
+	return nil, db.ErrNotFound
+}
+func (m *MockQuery) GetMissingDigestWeeks(ctx context.Context, userID string, weeks []time.Time) ([]time.Time, error) {
 	return nil, nil
 }
 func (m *MockQuery) UpdateUserDigestOptIn(ctx context.Context, userID string, optIn bool) error {
@@ -422,6 +447,72 @@ func (m *MockQuery) InvalidateEmailVerificationTokensForUser(ctx context.Context
 }
 func (m *MockQuery) CountVerificationResendsInWindow(ctx context.Context, userID string, since time.Time) (int, error) {
 	return m.verifResendCount[userID], nil
+}
+func (m *MockQuery) InsertEmailChangeToken(ctx context.Context, userID, pendingEmail, tokenHash string, expiresAt time.Time) error {
+	if m.emailChangeTokens == nil {
+		m.emailChangeTokens = make(map[string]struct {
+			userID  string
+			email   string
+			expires time.Time
+			usedAt  *time.Time
+		})
+	}
+	m.emailChangeTokens[tokenHash] = struct {
+		userID  string
+		email   string
+		expires time.Time
+		usedAt  *time.Time
+	}{userID: userID, email: pendingEmail, expires: expiresAt}
+	return nil
+}
+func (m *MockQuery) ConsumeEmailChangeToken(ctx context.Context, tokenHash string) (string, string, error) {
+	row, ok := m.emailChangeTokens[tokenHash]
+	if !ok || row.usedAt != nil || time.Now().After(row.expires) {
+		return "", "", nil
+	}
+	now := time.Now()
+	row.usedAt = &now
+	m.emailChangeTokens[tokenHash] = row
+	return row.userID, row.email, nil
+}
+func (m *MockQuery) GetActiveEmailChange(ctx context.Context, userID string) (*db.EmailChange, error) {
+	for _, r := range m.emailChangeTokens {
+		if r.userID == userID && r.usedAt == nil {
+			return &db.EmailChange{UserID: userID, PendingEmail: r.email, ExpiresAt: r.expires}, nil
+		}
+	}
+	return nil, db.ErrNotFound
+}
+func (m *MockQuery) InvalidateEmailChangeTokensForUser(ctx context.Context, userID string) error {
+	for h, r := range m.emailChangeTokens {
+		if r.userID == userID && r.usedAt == nil {
+			now := time.Now()
+			r.usedAt = &now
+			m.emailChangeTokens[h] = r
+		}
+	}
+	return nil
+}
+func (m *MockQuery) ApplyEmailChange(ctx context.Context, userID, newEmail string) error {
+	u := m.users[newEmail]
+	if u != nil {
+		return nil // simulated uniqueness collision
+	}
+	for _, existing := range m.users {
+		if existing.ID == userID {
+			delete(m.users, existing.Email)
+			existing.Email = newEmail
+			now := time.Now()
+			existing.EmailVerifiedAt = &now
+			existing.TokenVersion++
+			m.users[newEmail] = existing
+			return nil
+		}
+	}
+	return db.ErrNotFound
+}
+func (m *MockQuery) ListWorkspaceMembers(ctx context.Context, workspaceID string) ([]*db.WorkspaceMemberWithEmail, error) {
+	return nil, nil
 }
 func (m *MockQuery) InsertPasswordResetToken(ctx context.Context, userID, tokenHash string, expiresAt time.Time) error {
 	if m.passwordResetTokens == nil {
@@ -678,8 +769,8 @@ func (m *MockQuery) GetOverageCostForCurrentPeriod(ctx context.Context, userID s
 
 func (m *MockQuery) InsertCommentUsageLog(ctx context.Context, tx *sql.Tx, userID string, count int, periodStart, periodEnd time.Time) error {
 	m.usageLogs = append(m.usageLogs, struct {
-		UserID                string
-		Count                 int
+		UserID                 string
+		Count                  int
 		PeriodStart, PeriodEnd time.Time
 	}{userID, count, periodStart, periodEnd})
 	return nil
@@ -698,6 +789,14 @@ func (m *MockQuery) ExpirePastDueGrace(ctx context.Context, graceHours int) (int
 	return 0, nil
 }
 
+func (m *MockQuery) GetBillingUsage(ctx context.Context, userID string, limit int) ([]db.BillingUsage, error) {
+	all := m.billingUsage[userID]
+	if limit > len(all) {
+		limit = len(all)
+	}
+	return all[:limit], nil
+}
+
 // spec-gap-improvements additions
 func (m *MockQuery) UpdateChannelCustomPrompt(ctx context.Context, userID, platformChannelID string, customPrompt *string) error {
 	return nil
@@ -709,7 +808,7 @@ func (m *MockQuery) GetWorkspace(ctx context.Context, workspaceID string) (*db.W
 	return nil, nil
 }
 func (m *MockQuery) UpdateWorkspace(ctx context.Context, workspaceID, name string) error { return nil }
-func (m *MockQuery) DeleteWorkspace(ctx context.Context, workspaceID string) error { return nil }
+func (m *MockQuery) DeleteWorkspace(ctx context.Context, workspaceID string) error       { return nil }
 func (m *MockQuery) ListWorkspacesForUser(ctx context.Context, userID string) ([]*db.WorkspaceWithMembers, error) {
 	return nil, nil
 }
@@ -784,6 +883,15 @@ func (m *MockQuery) BulkUnstarComments(ctx context.Context, userID string, comme
 	return 0, nil
 }
 func (m *MockQuery) GetCommentThread(ctx context.Context, userID, commentID string, maxDepth int) ([]*db.Comment, error) {
+	return nil, nil
+}
+func (m *MockQuery) GrantChannel(ctx context.Context, workspaceID, channelID, grantedBy string) error {
+	return nil
+}
+func (m *MockQuery) RevokeChannel(ctx context.Context, workspaceID, channelID string) error {
+	return nil
+}
+func (m *MockQuery) ListGrantedChannels(ctx context.Context, workspaceID string) ([]string, error) {
 	return nil, nil
 }
 

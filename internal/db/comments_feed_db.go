@@ -10,6 +10,7 @@ import (
 type FeedRow struct {
 	Comment
 	ChannelName string `json:"channel_name"`
+	PlatformID  string `json:"platform_id"`
 	IsStarred   bool   `json:"is_starred"`
 }
 
@@ -43,17 +44,30 @@ func (q *SQLiteQuery) runFeedQuery(ctx context.Context, sqlStr string, args []an
 		r := &FeedRow{}
 		var isStarredInt int
 		var actionableInsights sql.NullString
+		var postedAt, processedAt, createdAt sql.NullString
+		var videoID, videoTitle sql.NullString
 		if err := rows.Scan(
 			&r.ID, &r.PlatformChannelID, &r.PlatformCommentID, &r.ParentCommentID, &r.ReplyDepth,
-			&r.AuthorHandle, &r.Body, &r.PostedAt, &r.Category, &actionableInsights,
-			&r.Topic, &r.Confidence, &r.ProcessedAt, &r.CreatedAt,
-			&r.ChannelName, &isStarredInt,
+			&r.AuthorHandle, &r.Body, &postedAt, &r.Category, &actionableInsights,
+			&r.Topic, &r.Confidence, &videoID, &videoTitle, &processedAt, &createdAt,
+			&r.ChannelName, &r.PlatformID, &isStarredInt,
 		); err != nil {
 			return nil, err
 		}
 		if actionableInsights.Valid {
 			r.ActionableInsights = []byte(actionableInsights.String)
 		}
+		if videoID.Valid {
+			v := videoID.String
+			r.VideoID = &v
+		}
+		if videoTitle.Valid {
+			v := videoTitle.String
+			r.VideoTitle = &v
+		}
+		r.PostedAt = parseTime(postedAt.String)
+		r.ProcessedAt = parseTimePtr(processedAt)
+		r.CreatedAt = parseTime(createdAt.String)
 		r.IsStarred = isStarredInt != 0
 		out = append(out, r)
 	}
@@ -86,14 +100,12 @@ func (q *SQLiteQuery) StarCommentScoped(ctx context.Context, userID, commentID s
 		WHERE EXISTS (
 			SELECT 1
 			FROM comments c
-			JOIN user_channel_tracking uct ON uct.platform_channel_id = c.platform_channel_id
 			WHERE c.id = ?
-			  AND uct.user_id = ?
-			  AND uct.tracking_status IN ('active','paused')
+			  AND (EXISTS(SELECT 1 FROM user_channel_tracking uct WHERE uct.platform_channel_id=c.platform_channel_id AND uct.user_id=? AND uct.tracking_status IN ('active','paused')) OR EXISTS(SELECT 1 FROM channel_grants cg JOIN workspace_members wm ON wm.workspace_id=cg.workspace_id WHERE cg.channel_id=c.platform_channel_id AND wm.user_id=?))
 		)
 		ON CONFLICT (user_id, comment_id) DO NOTHING
 	`
-	result, err := q.db.ExecContext(ctx, sqlStr, userID, commentID, commentID, userID)
+	result, err := q.db.ExecContext(ctx, sqlStr, userID, commentID, commentID, userID, userID)
 	if err != nil {
 		return false, err
 	}
@@ -126,29 +138,32 @@ func (q *SQLiteQuery) UserHasAccessToComment(ctx context.Context, userID, commen
 		SELECT EXISTS (
 			SELECT 1
 			FROM comments c
-			JOIN user_channel_tracking uct ON uct.platform_channel_id = c.platform_channel_id
 			WHERE c.id = ?
-			  AND uct.user_id = ?
-			  AND uct.tracking_status IN ('active','paused')
+			  AND (EXISTS(SELECT 1 FROM user_channel_tracking uct WHERE uct.platform_channel_id=c.platform_channel_id AND uct.user_id=? AND uct.tracking_status IN ('active','paused')) OR EXISTS(SELECT 1 FROM channel_grants cg JOIN workspace_members wm ON wm.workspace_id=cg.workspace_id WHERE cg.channel_id=c.platform_channel_id AND wm.user_id=?))
 		)
 	`
 	var ok bool
-	err := q.db.QueryRowContext(ctx, sqlStr, commentID, userID).Scan(&ok)
+	err := q.db.QueryRowContext(ctx, sqlStr, commentID, userID, userID).Scan(&ok)
 	return ok, err
 }
 
 func (q *SQLiteQuery) UserTracksChannel(ctx context.Context, userID, channelID string) (bool, error) {
 	const sqlStr = `
-		SELECT EXISTS (
+		SELECT (EXISTS (
 			SELECT 1
 			FROM user_channel_tracking
 			WHERE user_id = ?
 			  AND platform_channel_id = ?
 			  AND tracking_status IN ('active','paused')
-		)
+		) OR EXISTS (
+			SELECT 1
+			FROM channel_grants cg JOIN workspace_members wm ON wm.workspace_id=cg.workspace_id
+			WHERE cg.channel_id = ?
+			  AND wm.user_id = ?
+		))
 	`
 	var ok bool
-	err := q.db.QueryRowContext(ctx, sqlStr, userID, channelID).Scan(&ok)
+	err := q.db.QueryRowContext(ctx, sqlStr, userID, channelID, channelID, userID).Scan(&ok)
 	return ok, err
 }
 
@@ -158,9 +173,9 @@ type InsightTypeCount struct {
 }
 
 type TopInsight struct {
-	Type        string  `json:"type"`
-	Description string  `json:"description"`
-	Count       int64   `json:"count"`
+	Type          string  `json:"type"`
+	Description   string  `json:"description"`
+	Count         int64   `json:"count"`
 	AvgConfidence float64 `json:"avg_confidence"`
 }
 

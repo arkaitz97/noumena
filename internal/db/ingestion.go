@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"math/rand"
 	"time"
 )
 
@@ -207,6 +208,8 @@ func (q *SQLiteQuery) MarkJobFailed(ctx context.Context, jobID, errMsg string, c
 	if delaySecs > 16 {
 		delaySecs = 16
 	}
+	// Jitter: +[0,delaySecs]s so bursty channels don't retry in lockstep.
+	delaySecs += rand.Intn(delaySecs + 1)
 	scheduledAt := time.Now().UTC().Add(time.Duration(delaySecs) * time.Second).Format(time.RFC3339)
 	_, err := q.db.ExecContext(ctx,
 		`UPDATE ingestion_jobs
@@ -354,4 +357,21 @@ func (q *SQLiteQuery) GetMaxBackfillDays(ctx context.Context, platformChannelID 
 		return 90, nil
 	}
 	return int(days.Int64), nil
+}
+
+// RecoverStaleIngestionJobs resets running jobs older than olderThan to pending.
+func (q *SQLiteQuery) RecoverStaleIngestionJobs(ctx context.Context, olderThan time.Duration) (int64, error) {
+	cutoff := time.Now().UTC().Add(-olderThan).Format(time.RFC3339)
+	res, err := q.db.ExecContext(ctx,
+		`UPDATE ingestion_jobs
+		    SET status = 'pending', started_at = NULL,
+		        scheduled_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+		  WHERE status = 'running'
+		    AND started_at IS NOT NULL
+		    AND started_at < ?`,
+		cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }

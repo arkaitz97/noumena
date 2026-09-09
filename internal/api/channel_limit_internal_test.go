@@ -23,10 +23,11 @@ import (
 // Every method that is not used by the helper panics so accidental future
 // dependencies surface immediately.
 type guardMockQuery struct {
-	user        *db.User
-	getUserErr  error
-	channelCnt  int
-	getCntErr   error
+	db.DBQuery
+	user       *db.User
+	getUserErr error
+	channelCnt int
+	getCntErr  error
 }
 
 func (g *guardMockQuery) GetUserByID(ctx context.Context, id string) (*db.User, error) {
@@ -389,6 +390,15 @@ func (g *guardMockQuery) GetChannelCustomPrompt(context.Context, string, string)
 	panic("not implemented")
 }
 func (g *guardMockQuery) GetCommentBodyByID(context.Context, string) (string, error) {
+	panic("not implemented")
+}
+func (g *guardMockQuery) DeleteUserGDPRData(context.Context, *sql.Tx, string) error {
+	panic("not implemented")
+}
+func (g *guardMockQuery) MarkDeletionRevokeStatus(context.Context, string, bool, string) error {
+	panic("not implemented")
+}
+func (g *guardMockQuery) ListJobsPendingRevoke(context.Context) ([]*db.AccountDeletionJob, error) {
 	panic("not implemented")
 }
 

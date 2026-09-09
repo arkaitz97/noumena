@@ -29,6 +29,7 @@ type WorkerDB interface {
 	MarkJobCompleted(ctx context.Context, jobID string) error
 	MarkJobFailed(ctx context.Context, jobID, errMsg string, currentRetryCount int) error
 	MarkJobDeadLettered(ctx context.Context, jobID, errMsg string) error
+	RecoverStaleIngestionJobs(ctx context.Context, olderThan time.Duration) (int64, error)
 
 	UpdateLastSyncedAt(ctx context.Context, platformChannelID string, t time.Time) error
 	UpdateLastSyncedAtIfNull(ctx context.Context, platformChannelID string) error
@@ -38,6 +39,8 @@ type WorkerDB interface {
 
 	GetPlatformChannelByID(ctx context.Context, platformChannelID string) (*db.PlatformChannel, error)
 	GetIngestionToken(ctx context.Context, platformChannelID string) (string, string, error)
+	GetIngestionTokenRow(ctx context.Context, platformChannelID string) (*db.UserChannelTracking, bool, error)
+	UpdateTokenAndExpiry(ctx context.Context, trackingID, encryptedAccess, encryptedRefresh string, expiresAt time.Time) error
 	PromoteNextIngestionToken(ctx context.Context, platformChannelID string) error
 	GetMaxBackfillDays(ctx context.Context, platformChannelID string) (int, error)
 
@@ -66,6 +69,10 @@ const (
 	lockBusyRescheduleIn = 30 * time.Second
 	commentBatchSize     = 100
 	deadLetterBackoff    = 1 * time.Hour
+	// Reaper: sweep stale running jobs older than max job duration.
+	reaperInterval = 5 * time.Minute
+	staleJobAge    = 15 * time.Minute
+	llmStaleJobAge = 15 * time.Minute
 )
 
 // Worker drives the job queue: claims jobs, executes them, and reports
@@ -102,6 +109,9 @@ func (w *Worker) Run(ctx context.Context) {
 	if w.MaxConcurrency < 1 {
 		w.MaxConcurrency = 1
 	}
+	// Startup reaper sweep so crash-left running jobs resume immediately.
+	w.RecoverStaleJobs(ctx)
+	go w.runReaper(ctx)
 	sem := make(chan struct{}, w.MaxConcurrency)
 	var wg sync.WaitGroup
 
@@ -209,21 +219,25 @@ func (w *Worker) processJob(parent context.Context, job *db.IngestionJob) {
 		return
 	}
 
-	accessTok, err := w.obtainAccessToken(jobCtx, job.PlatformChannelID)
-	if err != nil {
-		// "no token" → job is a noop; mark completed without raising an error
-		// on the channel (the channel-management layer surfaces missing tokens).
-		if errors.Is(err, errNoToken) {
-			// Initialize last_synced_at if it was NULL so we don't keep
-			// re-enqueuing this channel as a backfill on every tick.
-			_ = w.DB.UpdateLastSyncedAtIfNull(parent, job.PlatformChannelID)
-			_ = w.DB.MarkJobCompleted(parent, job.ID)
+	accessTok := ""
+	if w.Client.APIKey == "" {
+		tok, terr := w.obtainAccessToken(jobCtx, job.PlatformChannelID)
+		if terr != nil {
+			// "no token" → job is a noop; mark completed without raising an error
+			// on the channel (the channel-management layer surfaces missing tokens).
+			if errors.Is(terr, errNoToken) {
+				// Initialize last_synced_at if it was NULL so we don't keep
+				// re-enqueuing this channel as a backfill on every tick.
+				_ = w.DB.UpdateLastSyncedAtIfNull(parent, job.PlatformChannelID)
+				_ = w.DB.MarkJobCompleted(parent, job.ID)
+				return
+			}
+			w.failJob(parent, job, terr)
+			outcome = telemetry.OutcomeError
+			recordIngestionError(parent, classifyIngestionError(terr))
 			return
 		}
-		w.failJob(parent, job, err)
-		outcome = telemetry.OutcomeError
-		recordIngestionError(parent, classifyIngestionError(err))
-		return
+		accessTok = tok
 	}
 
 	// 3. Compute publishedAfter window.
@@ -340,11 +354,24 @@ func (w *Worker) runIngestion(jobCtx, persistCtx context.Context, pc *db.Platfor
 			}
 			t, ok, err := nextThread()
 			if err != nil {
+				var cde *CommentsDisabledError
+				if errors.As(err, &cde) {
+					// Permanent: video owner disabled comments. Skip the
+					// video, keep the rest of the ingestion run intact.
+					log.Printf("worker: skip video=%s channel=%s: comments disabled", v.ID, job.PlatformChannelID)
+					break
+				}
 				return err
 			}
 			if !ok {
 				break
 			}
+			// Comments API returns videoId but never videoTitle — carry the
+			// title from the search.list ref that discovered this video.
+			if t.VideoID == "" {
+				t.VideoID = v.ID
+			}
+			t.VideoTitle = v.Title
 			c := t.ToDBComment(pc.ID)
 			batch = append(batch, c)
 			if t.PostedAt.After(maxPostedAt) {
@@ -370,6 +397,10 @@ func (w *Worker) runIngestion(jobCtx, persistCtx context.Context, pc *db.Platfor
 					if !rok {
 						break
 					}
+					// Deep replies: comments.list gives videoId, not title —
+					// inherit both from the parent thread.
+					r.VideoID = t.VideoID
+					r.VideoTitle = t.VideoTitle
 					rc := r.ToDBComment(pc.ID)
 					batch = append(batch, rc)
 					if r.PostedAt.After(maxPostedAt) {
@@ -454,6 +485,32 @@ func (w *Worker) obtainAccessToken(ctx context.Context, platformChannelID string
 		// the next ingestion token.
 		return "", &TokenInvalidError{StatusCode: 401, Body: err.Error()}
 	}
+	// Persist refreshed token/expiry so each poll doesn't re-refresh.
+	if fresh != nil && (fresh.AccessToken != access || !fresh.Expiry.IsZero()) {
+		if row, ok, rerr := w.DB.GetIngestionTokenRow(ctx, platformChannelID); rerr == nil && ok {
+			expiry := row.TokenExpiresAt
+			if !fresh.Expiry.IsZero() {
+				expiry = &fresh.Expiry
+			}
+			encAccess, eerr := auth.Encrypt(fresh.AccessToken)
+			if eerr == nil {
+				encRefresh := accessEnc
+				// oauth2 reuses refresh token unless rotated.
+				if fresh.RefreshToken != "" && fresh.RefreshToken != refresh {
+					if enc, e2 := auth.Encrypt(fresh.RefreshToken); e2 == nil {
+						encRefresh = enc
+					}
+				} else {
+					encRefresh = refreshEnc
+				}
+				exp := time.Now().UTC().Add(time.Hour)
+				if expiry != nil {
+					exp = *expiry
+				}
+				_ = w.DB.UpdateTokenAndExpiry(ctx, row.ID, encAccess, encRefresh, exp)
+			}
+		}
+	}
 	return fresh.AccessToken, nil
 }
 
@@ -466,6 +523,40 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 	select {
 	case <-ctx.Done():
 	case <-t.C:
+	}
+}
+
+// RecoverStaleJobs resets running jobs older than staleJobAge to pending.
+// Age guard exceeds max job duration so active slow jobs are never swept.
+// Every reset is logged for auditability.
+func (w *Worker) RecoverStaleJobs(ctx context.Context) {
+	n, err := w.DB.RecoverStaleIngestionJobs(ctx, staleJobAge)
+	if err != nil {
+		log.Printf("worker: reaper ingestion err=%v", err)
+	} else if n > 0 {
+		log.Printf("worker: reaper reset %d stale ingestion jobs to pending", n)
+	}
+	if llmReaper, ok := w.DB.(interface {
+		RecoverStaleLLMJobs(context.Context, time.Duration) (int64, error)
+	}); ok {
+		if m, err := llmReaper.RecoverStaleLLMJobs(ctx, llmStaleJobAge); err != nil {
+			log.Printf("worker: reaper llm err=%v", err)
+		} else if m > 0 {
+			log.Printf("worker: reaper reset %d stale llm jobs to pending", m)
+		}
+	}
+}
+
+func (w *Worker) runReaper(ctx context.Context) {
+	t := time.NewTicker(reaperInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			w.RecoverStaleJobs(ctx)
+		}
 	}
 }
 

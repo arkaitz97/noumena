@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"noumena/internal/auth"
+	"noumena/internal/config"
 	"noumena/internal/db"
 	"noumena/internal/dbtest"
 )
@@ -52,15 +53,27 @@ func seedUser(t *testing.T, ctx context.Context, database *sql.DB, email string)
 // that round-trips through the user_channel_tracking columns and that
 // the persisted column is in fact ciphertext (not plaintext).
 func Test_TokenEncryptionRoundTrip(t *testing.T) {
-	harness := dbtest.SetupTestDB(t)
-	if harness == nil {
+	database := dbtest.SetupTestDB(t)
+	if database == nil {
 		return
 	}
-	adopt(t, harness.DB)
-	q := db.NewSQLiteQuery(harness.DB)
+	adopt(t, database)
+	q := db.NewSQLiteQuery(database)
 	ctx := context.Background()
 
-	userID := seedUser(t, ctx, harness.DB, "enc@example.com")
+	// auth.Encrypt/Decrypt key off config.Default.EncryptionKey, which is
+	// nil unless config.Load ran. Install a test key so the round-trip is
+	// exercised against the real helpers (fix-crypto-http-hardening).
+	prevKey := config.Default.EncryptionKey
+	prevPrev := config.Default.EncryptionKeyPrevious
+	config.Default.EncryptionKey = []byte("0123456789abcdef0123456789abcdef")
+	config.Default.EncryptionKeyPrevious = nil
+	t.Cleanup(func() {
+		config.Default.EncryptionKey = prevKey
+		config.Default.EncryptionKeyPrevious = prevPrev
+	})
+
+	userID := seedUser(t, ctx, database, "enc@example.com")
 
 	// Create a platform channel via production code.
 	chID, inserted, err := q.UpsertPlatformChannel(ctx, "youtube", "yt-enc-1", "Enc Channel")
@@ -86,7 +99,7 @@ func Test_TokenEncryptionRoundTrip(t *testing.T) {
 
 	// Inspect the raw row: must NOT contain plaintext.
 	var rawAccess, rawRefresh string
-	if err := harness.DB.QueryRowContext(ctx,
+	if err := database.QueryRowContext(ctx,
 		`SELECT access_token_enc, refresh_token_enc
 		 FROM user_channel_tracking WHERE user_id = ?`, userID).
 		Scan(&rawAccess, &rawRefresh); err != nil {
@@ -114,35 +127,38 @@ func Test_TokenEncryptionRoundTrip(t *testing.T) {
 // Verifies that InsertOAuthState / ConsumeOAuthState round-trip and that
 // a second consume of the same token is rejected.
 func Test_OauthStatesLifecycle(t *testing.T) {
-	harness := dbtest.SetupTestDB(t)
-	if harness == nil {
+	database := dbtest.SetupTestDB(t)
+	if database == nil {
 		return
 	}
-	adopt(t, harness.DB)
-	q := db.NewSQLiteQuery(harness.DB)
+	adopt(t, database)
+	q := db.NewSQLiteQuery(database)
 	ctx := context.Background()
 
-	userID := seedUser(t, ctx, harness.DB, "oauth@example.com")
+	userID := seedUser(t, ctx, database, "oauth@example.com")
 
 	const stateToken = "opaque-state-token"
-	const channelID = "ch-oauth"
-	const platform = "youtube"
+	expiresAt := time.Now().Add(10 * time.Minute)
 
-	if err := q.InsertOAuthState(ctx, stateToken, userID, channelID, platform); err != nil {
+	if err := q.InsertOAuthState(ctx, stateToken, userID, expiresAt); err != nil {
 		t.Fatalf("InsertOAuthState: %v", err)
 	}
 
-	gotUserID, gotChannelID, gotPlatform, err := q.ConsumeOAuthState(ctx, stateToken)
+	consumed, err := q.ConsumeOAuthState(ctx, stateToken, userID)
 	if err != nil {
 		t.Fatalf("ConsumeOAuthState: %v", err)
 	}
-	if gotUserID != userID || gotChannelID != channelID || gotPlatform != platform {
-		t.Fatalf("consume mismatch: got %s/%s/%s, want %s/%s/%s", gotUserID, gotChannelID, gotPlatform, userID, channelID, platform)
+	if !consumed {
+		t.Fatal("expected first consume to succeed")
 	}
 
-	// Second consume must fail.
-	if _, _, _, err := q.ConsumeOAuthState(ctx, stateToken); err == nil {
-		t.Fatal("expected error on second consume, got nil")
+	// Second consume must be rejected (row already deleted).
+	consumed, err = q.ConsumeOAuthState(ctx, stateToken, userID)
+	if err != nil {
+		t.Fatalf("second ConsumeOAuthState: %v", err)
+	}
+	if consumed {
+		t.Fatal("expected second consume to be rejected")
 	}
 }
 
@@ -151,12 +167,12 @@ func Test_OauthStatesLifecycle(t *testing.T) {
 // Verifies that the first call inserts and the second call returns
 // inserted=false with the same channel ID.
 func Test_UpsertPlatformChannelInsertConflict(t *testing.T) {
-	harness := dbtest.SetupTestDB(t)
-	if harness == nil {
+	database := dbtest.SetupTestDB(t)
+	if database == nil {
 		return
 	}
-	adopt(t, harness.DB)
-	q := db.NewSQLiteQuery(harness.DB)
+	adopt(t, database)
+	q := db.NewSQLiteQuery(database)
 	ctx := context.Background()
 
 	chID, inserted, err := q.UpsertPlatformChannel(ctx, "youtube", "yt-upsert-1", "First Name")
@@ -179,12 +195,12 @@ func Test_UpsertPlatformChannelInsertConflict(t *testing.T) {
 // WHERE deleted_at IS NULL prevents duplicate active channels but
 // allows re-insertion after a soft-delete.
 func Test_PartialUniqueIndexRace(t *testing.T) {
-	harness := dbtest.SetupTestDB(t)
-	if harness == nil {
+	database := dbtest.SetupTestDB(t)
+	if database == nil {
 		return
 	}
-	adopt(t, harness.DB)
-	q := db.NewSQLiteQuery(harness.DB)
+	adopt(t, database)
+	q := db.NewSQLiteQuery(database)
 	ctx := context.Background()
 
 	// First insert succeeds.
@@ -246,15 +262,15 @@ func Test_PartialUniqueIndexRace(t *testing.T) {
 //
 // Verifies that soft-deleted channels are excluded from the sync queue.
 func Test_GetChannelsForSyncExcludesDeleted(t *testing.T) {
-	harness := dbtest.SetupTestDB(t)
-	if harness == nil {
+	database := dbtest.SetupTestDB(t)
+	if database == nil {
 		return
 	}
-	adopt(t, harness.DB)
-	q := db.NewSQLiteQuery(harness.DB)
+	adopt(t, database)
+	q := db.NewSQLiteQuery(database)
 	ctx := context.Background()
 
-	userID := seedUser(t, ctx, harness.DB, "sync@example.com")
+	userID := seedUser(t, ctx, database, "sync@example.com")
 
 	chID, _, err := q.UpsertPlatformChannel(ctx, "youtube", "yt-sync-1", "Sync Channel")
 	if err != nil {
@@ -305,22 +321,22 @@ func Test_GetChannelsForSyncExcludesDeleted(t *testing.T) {
 // Verifies that when the transaction is rolled back, no tracking row is
 // created.
 func Test_ConnectChannelTxRollback(t *testing.T) {
-	harness := dbtest.SetupTestDB(t)
-	if harness == nil {
+	database := dbtest.SetupTestDB(t)
+	if database == nil {
 		return
 	}
-	adopt(t, harness.DB)
-	q := db.NewSQLiteQuery(harness.DB)
+	adopt(t, database)
+	q := db.NewSQLiteQuery(database)
 	ctx := context.Background()
 
-	userID := seedUser(t, ctx, harness.DB, "rollback@example.com")
+	userID := seedUser(t, ctx, database, "rollback@example.com")
 
 	chID, _, err := q.UpsertPlatformChannel(ctx, "youtube", "yt-rollback-1", "Rollback Channel")
 	if err != nil {
 		t.Fatalf("UpsertPlatformChannel: %v", err)
 	}
 
-	tx, err := harness.DB.BeginTx(ctx, nil)
+	tx, err := database.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatalf("BeginTx: %v", err)
 	}

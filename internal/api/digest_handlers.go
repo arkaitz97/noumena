@@ -1,9 +1,9 @@
 // Package api: digest_handlers.go owns the read-only weekly-digest API
 // surface introduced by the weekly-digest change:
 //
-//   GET   /api/digests           — paginated list, newest first
-//   GET   /api/digests/latest    — most-recent digest or 404
-//   PATCH /api/user/preferences  — opt-in toggle for digest emails
+//	GET   /api/digests           — paginated list, newest first
+//	GET   /api/digests/latest    — most-recent digest or 404
+//	PATCH /api/user/preferences  — opt-in toggle for digest emails
 //
 // Authentication + email-verification middleware are applied at the router
 // level (see cmd/api/main.go); these handlers can assume UserIDKey is set.
@@ -15,7 +15,9 @@ import (
 	"net/http"
 	"strconv"
 
+	"noumena/internal/config"
 	"noumena/internal/db"
+	"noumena/internal/email"
 )
 
 // DigestHandler bundles the dependencies for the digest endpoints. The
@@ -23,6 +25,7 @@ import (
 // to drive these handlers without a live Postgres pool.
 type DigestHandler struct {
 	Queries db.DBQuery
+	Cfg     *config.Config
 }
 
 const (
@@ -133,5 +136,43 @@ func (h *DigestHandler) UpdatePreferences(w http.ResponseWriter, r *http.Request
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"digest_email_opt_in": *req.DigestEmailOptIn,
+	})
+}
+
+// Unsubscribe handles GET /unsubscribe?user_id=..&job=..&sig=..&exp=..
+// NO AUTH MIDDLEWARE — the HMAC signature (email/signer.go, same secret
+// as export download links) IS the auth. Any verification failure is a
+// 403 without leaking which leg failed. On success the user's digest
+// email opt-in flips off (fix-email-delivery 5.x).
+func (h *DigestHandler) Unsubscribe(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	userID := q.Get("user_id")
+	jobID := q.Get("job")
+	sig := q.Get("sig")
+	expStr := q.Get("exp")
+	if userID == "" || jobID == "" || sig == "" || expStr == "" {
+		http.Error(w, "missing signature", http.StatusForbidden)
+		return
+	}
+	expUnix, err := email.ParseExp(expStr)
+	if err != nil {
+		http.Error(w, "invalid expiry", http.StatusForbidden)
+		return
+	}
+	secret := ""
+	if h.Cfg != nil {
+		secret = h.Cfg.ExportSignedURLSecret
+	}
+	if err := email.VerifyURL(secret, userID, jobID, expUnix, sig); err != nil {
+		http.Error(w, "invalid or expired signature", http.StatusForbidden)
+		return
+	}
+	if err := h.Queries.UpdateUserDigestOptIn(r.Context(), userID, false); err != nil {
+		writeError(w, http.StatusInternalServerError, "update_failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":              "ok",
+		"digest_email_opt_in": false,
 	})
 }

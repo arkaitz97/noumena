@@ -52,7 +52,7 @@ func (q *SQLiteQuery) BulkStarComments(ctx context.Context, userID string, comme
 	defer tx.Rollback()
 
 	stmt, err := tx.PrepareContext(ctx,
-		`INSERT OR IGNORE INTO user_comment_stars (user_id, comment_id) VALUES (?, ?)`)
+		`INSERT OR IGNORE INTO user_comment_stars (user_id, comment_id) SELECT ?, ? WHERE EXISTS (SELECT 1 FROM comments c WHERE c.id = ? AND (EXISTS(SELECT 1 FROM user_channel_tracking uct WHERE uct.platform_channel_id=c.platform_channel_id AND uct.user_id=? AND uct.tracking_status IN ('active','paused')) OR EXISTS(SELECT 1 FROM channel_grants cg JOIN workspace_members wm ON wm.workspace_id=cg.workspace_id WHERE cg.channel_id=c.platform_channel_id AND wm.user_id=?)))`)
 	if err != nil {
 		return 0, err
 	}
@@ -60,7 +60,7 @@ func (q *SQLiteQuery) BulkStarComments(ctx context.Context, userID string, comme
 
 	count := 0
 	for _, id := range commentIDs {
-		result, err := stmt.ExecContext(ctx, userID, id)
+		result, err := stmt.ExecContext(ctx, userID, id, id, userID, userID)
 		if err != nil {
 			return count, err
 		}
@@ -75,13 +75,15 @@ func (q *SQLiteQuery) BulkUnstarComments(ctx context.Context, userID string, com
 		return 0, nil
 	}
 	placeholders := make([]string, len(commentIDs))
-	args := make([]interface{}, len(commentIDs)+1)
+	args := make([]interface{}, len(commentIDs)+3)
 	args[0] = userID
 	for i, id := range commentIDs {
 		placeholders[i] = "?"
 		args[i+1] = id
 	}
-	query := `DELETE FROM user_comment_stars WHERE user_id = ? AND comment_id IN (` + strings.Join(placeholders, ",") + `)`
+	args[len(commentIDs)+1] = userID
+	args[len(commentIDs)+2] = userID
+	query := `DELETE FROM user_comment_stars WHERE user_id = ? AND comment_id IN (` + strings.Join(placeholders, ",") + `) AND EXISTS (SELECT 1 FROM comments c WHERE c.id = user_comment_stars.comment_id AND (EXISTS(SELECT 1 FROM user_channel_tracking uct WHERE uct.platform_channel_id=c.platform_channel_id AND uct.user_id=? AND uct.tracking_status IN ('active','paused')) OR EXISTS(SELECT 1 FROM channel_grants cg JOIN workspace_members wm ON wm.workspace_id=cg.workspace_id WHERE cg.channel_id=c.platform_channel_id AND wm.user_id=?)))`
 	result, err := q.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return 0, err

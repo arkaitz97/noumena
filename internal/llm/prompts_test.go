@@ -247,6 +247,76 @@ func TestBuildClassificationPrompt_NoParentContext(t *testing.T) {
 	}
 }
 
+func TestSentimentScore_ClosedSet(t *testing.T) {
+	cases := map[string]int{
+		"negative": -1,
+		"neutral":  0,
+		"positive": 1,
+		"":         0,
+		"angry":    0,
+		"Positive": 0, // case-sensitive closed set
+	}
+	for label, want := range cases {
+		if got := SentimentScore(SentimentLabel(label)); got != want {
+			t.Errorf("SentimentScore(%q) = %d, want %d", label, got, want)
+		}
+	}
+}
+
+func TestParseClassificationResponse_SentimentParsed(t *testing.T) {
+	raw := `[{"comment_index":0,"category":"praise","confidence":0.9,"topic":"x","sentiment":"positive","actionable_insights":[]}]`
+	got, err := ParseClassificationResponse(raw, 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got[0].Sentiment != "positive" {
+		t.Errorf("sentiment = %q, want positive", got[0].Sentiment)
+	}
+	if sc := SentimentScore(got[0].Sentiment); sc != 1 {
+		t.Errorf("score = %d, want 1", sc)
+	}
+}
+
+// Omitting or refusing sentiment must not fail the batch — it defaults to
+// neutral (0), same tolerance as category parsing.
+func TestParseClassificationResponse_SentimentMissingDefaultsNeutral(t *testing.T) {
+	raw := `[{"comment_index":0,"category":"question","confidence":0.8,"topic":"x","actionable_insights":[]}]`
+	got, err := ParseClassificationResponse(raw, 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got[0].Sentiment != "" {
+		t.Errorf("sentiment = %q, want empty", got[0].Sentiment)
+	}
+	if sc := SentimentScore(got[0].Sentiment); sc != 0 {
+		t.Errorf("score = %d, want 0", sc)
+	}
+}
+
+func TestParseClassificationResponse_SentimentInvalidDefaultsNeutral(t *testing.T) {
+	raw := `[{"comment_index":0,"category":"question","confidence":0.8,"topic":"x","sentiment":"ecstatic","actionable_insights":[]}]`
+	got, err := ParseClassificationResponse(raw, 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if sc := SentimentScore(got[0].Sentiment); sc != 0 {
+		t.Errorf("score = %d, want 0", sc)
+	}
+}
+
+// Legacy numeric sentiment (older provider fixtures) must not fail the
+// batch: it collapses to neutral.
+func TestParseClassificationResponse_SentimentNumericTolerated(t *testing.T) {
+	raw := `[{"comment_index":0,"category":"question","confidence":0.8,"topic":"x","sentiment":0.5,"actionable_insights":[]}]`
+	got, err := ParseClassificationResponse(raw, 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if sc := SentimentScore(got[0].Sentiment); sc != 0 {
+		t.Errorf("score = %d, want 0", sc)
+	}
+}
+
 func contains(s, sub string) bool {
 	return len(s) >= len(sub) && (s == sub || (len(s) > 0 && (indexOf(s, sub) >= 0)))
 }

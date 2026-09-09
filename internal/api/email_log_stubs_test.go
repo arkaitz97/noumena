@@ -20,11 +20,16 @@ func (g *guardMockQuery) IsEmailIdempotencyKeyUsed(context.Context, string) (boo
 func (g *guardMockQuery) LogEmailAttempt(context.Context, db.EmailAttemptInput) (string, error) {
 	return "stub-id", nil
 }
-func (g *guardMockQuery) MarkEmailSent(context.Context, string, time.Time) error          { return nil }
-func (g *guardMockQuery) IncrementEmailAttempt(context.Context, string, int, string) error { return nil }
-func (g *guardMockQuery) MarkEmailFailed(context.Context, string, string) error           { return nil }
-func (g *guardMockQuery) MarkEmailAttemptError(context.Context, string, string) error     { return nil }
+func (g *guardMockQuery) MarkEmailSent(context.Context, string, time.Time) error { return nil }
+func (g *guardMockQuery) IncrementEmailAttempt(context.Context, string, int, string) error {
+	return nil
+}
+func (g *guardMockQuery) MarkEmailFailed(context.Context, string, string) error       { return nil }
+func (g *guardMockQuery) MarkEmailAttemptError(context.Context, string, string) error { return nil }
 func (g *guardMockQuery) ClaimPendingEmails(context.Context, time.Time, int) ([]*db.EmailLogRow, error) {
+	return nil, nil
+}
+func (g *guardMockQuery) GetEmailRowByIdempotencyKey(context.Context, string) (*db.EmailLogRow, error) {
 	return nil, nil
 }
 
@@ -40,11 +45,11 @@ func (g *guardMockQuery) CancelAccountDeletion(context.Context, string) error { 
 func (g *guardMockQuery) ClaimNextDeletionJob(context.Context, time.Duration) (*db.AccountDeletionJob, error) {
 	return nil, nil
 }
-func (g *guardMockQuery) MarkDeletionStage(context.Context, string, string) error          { return nil }
-func (g *guardMockQuery) MarkDeletionFailed(context.Context, string, string) error         { return nil }
-func (g *guardMockQuery) IncrementChannelsProcessed(context.Context, string) error         { return nil }
-func (g *guardMockQuery) MarkDeletionCompleted(context.Context, string, string) error      { return nil }
-func (g *guardMockQuery) MarkDeletionCompletedJobOnly(context.Context, string) error       { return nil }
+func (g *guardMockQuery) MarkDeletionStage(context.Context, string, string) error     { return nil }
+func (g *guardMockQuery) MarkDeletionFailed(context.Context, string, string) error    { return nil }
+func (g *guardMockQuery) IncrementChannelsProcessed(context.Context, string) error    { return nil }
+func (g *guardMockQuery) MarkDeletionCompleted(context.Context, string, string) error { return nil }
+func (g *guardMockQuery) MarkDeletionCompletedJobOnly(context.Context, string) error  { return nil }
 func (g *guardMockQuery) GetUserTrackingChannels(context.Context, string) ([]*db.UserChannelTrackingRow, error) {
 	return nil, nil
 }
@@ -57,14 +62,14 @@ func (g *guardMockQuery) DeleteUserChannelTracking(context.Context, *sql.Tx, str
 func (g *guardMockQuery) DeleteCommentsByChannelChunked(context.Context, string, int, string) (int, error) {
 	return 0, nil
 }
-func (g *guardMockQuery) DeletePlatformChannel(context.Context, *sql.Tx, string) error      { return nil }
+func (g *guardMockQuery) DeletePlatformChannel(context.Context, *sql.Tx, string) error { return nil }
 func (g *guardMockQuery) DeleteUserStarsForChannel(context.Context, *sql.Tx, string, string) error {
 	return nil
 }
-func (g *guardMockQuery) DeleteUserStarsAll(context.Context, *sql.Tx, string) error      { return nil }
-func (g *guardMockQuery) DeleteUserDigests(context.Context, *sql.Tx, string) error       { return nil }
-func (g *guardMockQuery) DeleteUserAuthTokens(context.Context, *sql.Tx, string) error    { return nil }
-func (g *guardMockQuery) HardDeleteUser(context.Context, *sql.Tx, string) error          { return nil }
+func (g *guardMockQuery) DeleteUserStarsAll(context.Context, *sql.Tx, string) error   { return nil }
+func (g *guardMockQuery) DeleteUserDigests(context.Context, *sql.Tx, string) error    { return nil }
+func (g *guardMockQuery) DeleteUserAuthTokens(context.Context, *sql.Tx, string) error { return nil }
+func (g *guardMockQuery) HardDeleteUser(context.Context, *sql.Tx, string) error       { return nil }
 func (g *guardMockQuery) EnqueueDataExport(context.Context, string) (*db.DataExportJob, error) {
 	return nil, nil
 }

@@ -15,7 +15,11 @@ import (
 )
 
 type Worker struct {
-	Queries      *db.SQLiteQuery
+	Queries *db.SQLiteQuery
+	// Pool is the query_only export read handle (db.ExportDB), NOT the
+	// main write pool: streaming a long export must never occupy the
+	// main pool's single connection and starve writers. Falls back to
+	// the main DB when no dedicated handle exists (in-memory tests).
 	Pool         *sql.DB
 	ExportDir    string
 	TTLHours     int

@@ -1,16 +1,16 @@
 // Package lifecycle: export_worker.go drains the `data_export_jobs`
 // queue. Each claimed job:
 //
-//   1. Loads the user's full bundle (GetUserExportBundle).
-//   2. Serialises each section to indented JSON.
-//   3. Streams those bytes into a ZIP file at
-//      EXPORT_STORAGE_DIR/<user_id>/<job_id>.zip.
-//   4. Enforces EXPORT_MAX_BYTES (default 500MB) — on overflow we add
-//      a `README.md` explaining the truncation and set partial=true.
-//   5. Mints a signed URL with TTL = EXPORT_LINK_TTL_DAYS.
-//   6. Writes terminal state via MarkDataExportCompleted (which also
-//      mirrors URL+expiry onto the users row).
-//   7. Emits the `export_ready` transactional email.
+//  1. Loads the user's full bundle (GetUserExportBundle).
+//  2. Serialises each section to indented JSON.
+//  3. Streams those bytes into a ZIP file at
+//     EXPORT_STORAGE_DIR/<user_id>/<job_id>.zip.
+//  4. Enforces EXPORT_MAX_BYTES (default 500MB) — on overflow we add
+//     a `README.md` explaining the truncation and set partial=true.
+//  5. Mints a signed URL with TTL = EXPORT_LINK_TTL_DAYS.
+//  6. Writes terminal state via MarkDataExportCompleted (which also
+//     mirrors URL+expiry onto the users row).
+//  7. Emits the `export_ready` transactional email.
 //
 // Single-instance design (no horizontal scale needed at our volumes).
 // Lock acquisition is via the SELECT ... FOR UPDATE SKIP LOCKED inside
@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -37,9 +38,20 @@ import (
 	"noumena/internal/telemetry"
 )
 
+// dataExportStore is the narrow DB surface the export worker needs
+// beyond db.DBQuery: the crash-recovery + orphan-sweep operations that
+// are only relevant to data_export_jobs (fix-export-pipeline 3+4). Kept
+// local to avoid widening the global DBQuery interface and its mocks.
+type dataExportStore interface {
+	db.DBQuery
+	RequeueDataExport(ctx context.Context, jobID string) error
+	ResetStuckDataExports(ctx context.Context, olderThan time.Duration) (int, error)
+	ListExportJobsForSweep(ctx context.Context) ([]*db.DataExportJob, error)
+}
+
 // ExportWorker drains data_export_jobs.
 type ExportWorker struct {
-	Queries  db.DBQuery
+	Queries  dataExportStore
 	Pipeline *email.Pipeline
 	Cfg      *config.Config
 	Logger   *log.Logger
@@ -49,11 +61,26 @@ type ExportWorker struct {
 
 	stopOnce sync.Once
 	done     chan struct{}
+
+	// activeJobID is the job currently being processed. The run loop is
+	// single-goroutine, so no lock is needed. The reaper skips the
+	// periodic stuck-reset while a job is active: a legitimately long
+	// export (>30m) must not be requeued under itself.
+	activeJobID string
 }
 
 // MaxBytesDefault is the cap on the assembled ZIP body before we mark
 // the export as partial. Spec D9: 500 MB.
 const MaxBytesDefault = 500 * 1024 * 1024
+
+// stuckExportResetAfter is the age past which an 'exporting' job is
+// considered crashed and requeued (design 3: 30m).
+const stuckExportResetAfter = 30 * time.Minute
+
+// errExportRequeued marks a runJob failure that already cleaned up (file
+// removed, job back to 'queued'); processOne must not then mark it
+// 'failed'.
+var errExportRequeued = errors.New("export requeued after mark failure")
 
 func (w *ExportWorker) Start(ctx context.Context) {
 	if w.Logger == nil {
@@ -82,18 +109,76 @@ func (w *ExportWorker) Stop() {
 
 func (w *ExportWorker) run(ctx context.Context) {
 	defer close(w.done)
-	t := time.NewTicker(w.Tick)
-	defer t.Stop()
 	w.Logger.Printf("export_worker_started tick=%s storage=%s ttl_days=%d",
 		w.Tick, w.Cfg.ExportStorageDir, w.Cfg.ExportLinkTTLDays)
+
+	// Startup recovery (single-instance: nothing is exporting yet):
+	// remove ZIPs whose job is neither completed nor queued, then requeue
+	// jobs stuck 'exporting' past the threshold (fix-export-pipeline 3+4).
+	w.recoverAtBoot(ctx)
+
+	t := time.NewTicker(w.Tick)
+	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			w.Logger.Printf("export_worker_stopping err=%v", ctx.Err())
 			return
 		case <-t.C:
+			w.resetStuck(ctx)
 			w.processOne(ctx)
 		}
+	}
+}
+
+// recoverAtBoot sweeps orphan ZIPs and requeues crash-stuck jobs. It runs
+// once before the ticker starts, so no job is mid-flight: every row in
+// 'exporting' at boot is a crash leftover.
+func (w *ExportWorker) recoverAtBoot(ctx context.Context) {
+	stale, err := w.Queries.ListExportJobsForSweep(ctx)
+	if err != nil {
+		w.Logger.Printf("export_worker_sweep_list_err err=%v", err)
+	} else {
+		for _, job := range stale {
+			if err := ctx.Err(); err != nil {
+				return
+			}
+			w.removeJobZip(job)
+		}
+	}
+	w.resetStuck(ctx)
+}
+
+// resetStuck requeues 'exporting' jobs older than stuckExportResetAfter
+// (crash recovery). Skipped while a job is active: its started_at is
+// legitimately old on a >30m export and requeuing it under itself would
+// double-process the bundle.
+func (w *ExportWorker) resetStuck(ctx context.Context) {
+	if w.activeJobID != "" {
+		return
+	}
+	n, err := w.Queries.ResetStuckDataExports(ctx, stuckExportResetAfter)
+	if err != nil {
+		w.Logger.Printf("export_worker_reset_stuck_err err=%v", err)
+		return
+	}
+	if n > 0 {
+		w.Logger.Printf("export_worker_reset_stuck count=%d", n)
+	}
+}
+
+// removeJobZip deletes the job's ZIP at its deterministic path. The path
+// mirrors runJob: <storage>/<user_id>/<job_id>.zip. Used by the startup
+// orphan sweep and by the mark-failure cleanup.
+func (w *ExportWorker) removeJobZip(job *db.DataExportJob) {
+	path := filepath.Join(w.Cfg.ExportStorageDir, job.UserID, job.ID+".zip")
+	err := os.Remove(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		w.Logger.Printf("export_worker_zip_remove_err job=%s path=%s err=%v", job.ID, path, err)
+		return
+	}
+	if err == nil {
+		w.Logger.Printf("export_worker_zip_removed job=%s path=%s", job.ID, path)
 	}
 }
 
@@ -108,7 +193,17 @@ func (w *ExportWorker) processOne(ctx context.Context) {
 	}
 	w.Logger.Printf("export_worker_claimed job=%s user=%s", job.ID, job.UserID)
 
+	w.activeJobID = job.ID
+	defer func() { w.activeJobID = "" }()
+
 	if err := w.runJob(ctx, job); err != nil {
+		if errors.Is(err, errExportRequeued) {
+			// Cleanup already done inside runJob (file removed, job
+			// requeued); only log + count the outcome.
+			w.Logger.Printf("export_worker_mark_failed_requeued job=%s err=%v", job.ID, err)
+			recordExportCompleted(ctx, telemetry.OutcomeError)
+			return
+		}
 		w.Logger.Printf("export_worker_failed job=%s err=%v", job.ID, err)
 		_ = w.Queries.MarkDataExportFailed(ctx, job.ID, err.Error())
 		// otel-instrumentation: terminal-state counter, error path.
@@ -158,7 +253,17 @@ func (w *ExportWorker) runJob(ctx context.Context, job *db.DataExportJob) error 
 		w.Cfg.AppBaseURL, job.ID, sigParams)
 
 	if err := w.Queries.MarkDataExportCompleted(ctx, job.ID, job.UserID, zipPath, downloadURL, expiry, partial); err != nil {
-		return fmt.Errorf("mark completed: %w", err)
+		// The ZIP is on disk but the completion tx failed (and rolled
+		// back — no URL-less 'completed' row exists). Remove the file
+		// and return the job to the retryable queue instead of leaving
+		// an orphan (fix-export-pipeline 4.1 / spec: mark-completion
+		// failure). MarkDataExportCompleted is atomic: either both the
+		// job flip and the users mirror commit, or neither does.
+		w.removeJobZip(job)
+		if rErr := w.Queries.RequeueDataExport(ctx, job.ID); rErr != nil {
+			w.Logger.Printf("export_worker_requeue_err job=%s err=%v", job.ID, rErr)
+		}
+		return fmt.Errorf("%w: %v", errExportRequeued, err)
 	}
 
 	// Email is best-effort: the user's own dashboard also surfaces the

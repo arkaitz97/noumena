@@ -54,6 +54,11 @@ type Message struct {
 	IdempotencyKey string
 	Subject        string // optional override; templates may set their own
 	Variables      map[string]any
+	// ListUnsubscribe, when set, is emitted as the List-Unsubscribe
+	// header on the message (spec: every digest/marketing email exposes
+	// an unsubscribe path). The value is the full https URL; the header
+	// value is "<url>".
+	ListUnsubscribe string
 }
 
 // Pipeline owns the dependencies for the new email send path. A single
@@ -74,9 +79,10 @@ type Pipeline struct {
 
 // SMTPSender is the narrow surface the pipeline needs from a transport.
 // The production path uses NetSMTPSender (smtp.go) which wraps net/smtp;
-// tests inject a fake.
+// tests inject a fake. headers carries extra MIME headers (e.g.
+// List-Unsubscribe) keyed by header name.
 type SMTPSender interface {
-	Send(ctx context.Context, from, to, subject, htmlBody, textBody string) error
+	Send(ctx context.Context, from, to, subject, htmlBody, textBody string, headers []string) error
 }
 
 // errAlreadySent is the sentinel returned by short-circuit paths so the
@@ -158,50 +164,71 @@ func (p *Pipeline) Send(ctx context.Context, msg Message) error {
 		Status:          "pending",
 		AttemptCount:    1,
 		LastAttemptedAt: &now,
+		ToAddress:       msg.ToAddress,
+		Subject:         subject,
+		HTMLBody:        html,
+		TextBody:        text,
 	})
 	if err != nil {
 		// Race: another caller raced us through the unique constraint.
-		// Treat as idempotent success.
+		// Read the winning row: only a 'sent' row is a true idempotent
+		// duplicate. A 'pending'/'failed' row is a retry candidate — the
+		// first sender hit a transient failure, so we must NOT drop the
+		// email (spec: duplicate key after failed send is not a no-op).
 		if isUniqueConstraintViolation(err) {
 			p.logf("email_idempotent_race template=%s key=%s", msg.Template, msg.IdempotencyKey)
-			// Race-resolved duplicate is semantically the same as
-			// the read-side dedupe above.
-			recordEmailSent(ctx, msg.Template, telemetry.OutcomeIdempotentDedupe)
+			existing, rerr := p.Queries.GetEmailRowByIdempotencyKey(ctx, msg.IdempotencyKey)
+			if rerr != nil {
+				return fmt.Errorf("email.Send: read raced row: %w", rerr)
+			}
+			if existing == nil {
+				// Row vanished between violation and read (shouldn't
+				// happen in practice) — safe to dedupe.
+				recordEmailSent(ctx, msg.Template, telemetry.OutcomeIdempotentDedupe)
+				return nil
+			}
+			if existing.Status == "sent" {
+				// Semantically the same as the read-side dedupe above.
+				recordEmailSent(ctx, msg.Template, telemetry.OutcomeIdempotentDedupe)
+				return nil
+			}
+			// pending/failed: the email was never delivered. Re-attempt
+			// the send with the persisted body (what the retry worker
+			// would do). attempt_count increments so the worker's
+			// 3-attempt cap still applies to this row.
+			p.deliverRow(ctx, existing)
 			return nil
 		}
 		return fmt.Errorf("email.Send: insert log row: %w", err)
 	}
 
 	from := formatFrom(cfg.EmailFromName, cfg.EmailFromAddress)
-	if err := p.Sender.Send(ctx, from, msg.ToAddress, subject, html, text); err != nil {
+	headers := extraHeaders(msg.ListUnsubscribe)
+	if err := p.Sender.Send(ctx, from, msg.ToAddress, subject, html, text, headers); err != nil {
 		// Transient: leave row pending; retry worker will pick up.
 		_ = p.Queries.MarkEmailAttemptError(ctx, logID, err.Error())
 		p.logf("email_send_failed template=%s key=%s err=%v", msg.Template, msg.IdempotencyKey, err)
-		// otel-instrumentation: SMTP failure is the canonical "error"
-		// outcome. The retry worker will record its own attempts via
-		// recordEmailRetry and (eventually) a terminal error here on
-		// the final exhausted attempt.
 		recordEmailSent(ctx, msg.Template, telemetry.OutcomeError)
 		return fmt.Errorf("email.Send: smtp: %w", err)
 	}
 
 	if err := p.Queries.MarkEmailSent(ctx, logID, now); err != nil {
-		// We *did* send, but couldn't mark sent. The retry worker will
-		// re-send if it picks the row up — that's acceptable since the
-		// idempotency key dedup happens server-side at the SMTP relay
-		// (modern providers dedup on Message-ID + recipient within a
-		// short window; we accept the rare double-send risk).
 		p.logf("email_mark_sent_failed template=%s key=%s err=%v", msg.Template, msg.IdempotencyKey, err)
 		return nil
 	}
 	p.logf("email_sent template=%s key=%s to=%s", msg.Template, msg.IdempotencyKey, redactAddr(msg.ToAddress))
-	// otel-instrumentation: success path. Note the MarkEmailSent
-	// failure branch above falls through to here without
-	// re-recording — we DID send the mail, so the contract is
-	// "success" from the user's perspective even if we lost the
-	// audit row update.
 	recordEmailSent(ctx, msg.Template, telemetry.OutcomeSuccess)
 	return nil
+}
+
+// extraHeaders converts an optional List-Unsubscribe URL into the MIME
+// header set carried on the message. Empty in is an empty slice so the
+// sender appends nothing.
+func extraHeaders(listUnsubscribe string) []string {
+	if listUnsubscribe == "" {
+		return nil
+	}
+	return []string{"List-Unsubscribe: <" + listUnsubscribe + ">"}
 }
 
 func (p *Pipeline) now() time.Time {
@@ -209,6 +236,14 @@ func (p *Pipeline) now() time.Time {
 		return p.Now()
 	}
 	return time.Now().UTC()
+}
+
+// deliverRow re-attempts delivery of an existing pending row using its
+// persisted body (used by both the idempotency race path and the retry
+// worker). Success marks the row sent; failure increments attempt_count,
+// and once the cap is reached marks the row failed with a terminal metric.
+func (p *Pipeline) deliverRow(ctx context.Context, r *db.EmailLogRow) {
+	deliverRow(ctx, p.Queries, p.Sender, p.Cfg, p.logf, r)
 }
 
 func (p *Pipeline) logf(format string, args ...any) {

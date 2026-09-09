@@ -45,10 +45,10 @@ func (f *fakeClient) ClassifyBatch(ctx context.Context, comments []PromptComment
 	out := make([]LLMResult, len(comments))
 	for i := range comments {
 		out[i] = LLMResult{
-			CommentIndex:     i,
-			Category:         "praise",
-			Confidence:       0.9,
-			Topic:            "topic",
+			CommentIndex:       i,
+			Category:           "praise",
+			Confidence:         0.9,
+			Topic:              "topic",
 			ActionableInsights: []Insight{},
 		}
 	}
@@ -69,6 +69,8 @@ type fakeQuery struct {
 	updates []updateCall
 	usage   map[string]int
 
+	sentiments []sentimentCall
+
 	jobs       map[string]string // jobID -> status
 	jobErrMsgs map[string]string
 	enqueueErr error
@@ -78,6 +80,11 @@ type updateCall struct {
 	id, category, topic, provider, model string
 	actionableInsights                   []byte
 	confidence                           float64
+}
+
+type sentimentCall struct {
+	id    string
+	score int
 }
 
 func newFakeQuery() *fakeQuery {
@@ -121,6 +128,13 @@ func (q *fakeQuery) UpdateCommentLLMData(ctx context.Context, id, category, topi
 	return nil
 }
 
+func (q *fakeQuery) UpdateCommentSentiment(ctx context.Context, id string, score int) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.sentiments = append(q.sentiments, sentimentCall{id, score})
+	return nil
+}
+
 func (q *fakeQuery) IncrementCommentsUsed(ctx context.Context, userID string, count int) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -137,6 +151,11 @@ func (q *fakeQuery) EnqueueLLMJob(ctx context.Context, commentIDs []string, prov
 	id := fmt.Sprintf("job-%d", len(q.jobs)+1)
 	q.jobs[id] = "pending"
 	return id, nil
+}
+
+func (q *fakeQuery) EnqueueLLMJobIfNotExists(ctx context.Context, commentIDs []string, provider string) (string, bool, error) {
+	id, err := q.EnqueueLLMJob(ctx, commentIDs, provider)
+	return id, true, err
 }
 
 func (q *fakeQuery) MarkLLMJobProcessing(ctx context.Context, jobID string) error {
@@ -541,3 +560,115 @@ func TestProcessor_NoOverageRowForFreePlan(t *testing.T) {
 // guard: prove fakeQueryBilling still embeds the original fakeQuery.
 var _ = errors.New
 
+// Sentiment labels map to -1/0/1 and are persisted for every comment.
+func TestProcessor_PersistsSentimentScores(t *testing.T) {
+	q := newFakeQuery()
+	channel := "ch1"
+	batch := makeBatch(channel, 3)
+	q.grouped[channel] = batch
+	q.primaryByChannel[channel] = withinQuotaUser("u1")
+
+	cli := &fakeClient{
+		provider: "openai", model: "gpt-4o",
+		resultsFn: func(comments []PromptComment) ([]LLMResult, error) {
+			return []LLMResult{
+				{CommentIndex: 0, Category: "praise", Confidence: 0.9, Topic: "x", Sentiment: "positive", ActionableInsights: []Insight{}},
+				{CommentIndex: 1, Category: "question", Confidence: 0.9, Topic: "y", Sentiment: "negative", ActionableInsights: []Insight{}},
+				{CommentIndex: 2, Category: "other", Confidence: 0.9, Topic: "z", Sentiment: "neutral", ActionableInsights: []Insight{}},
+			}, nil
+		},
+	}
+	p := NewProcessor(cli, q)
+	p.tickOnce(context.Background())
+
+	if len(q.sentiments) != 3 {
+		t.Fatalf("want 3 sentiment updates, got %d", len(q.sentiments))
+	}
+	wantScores := map[string]int{
+		batch[0].ID: 1,
+		batch[1].ID: -1,
+		batch[2].ID: 0,
+	}
+	for _, s := range q.sentiments {
+		if want, ok := wantScores[s.id]; !ok || s.score != want {
+			t.Errorf("sentiment for %s = %d, want %d", s.id, s.score, want)
+		}
+	}
+}
+
+// A comment whose LLM output omits sentiment defaults to neutral (0) — the
+// batch still completes.
+func TestProcessor_SentimentMissingDefaultsNeutral(t *testing.T) {
+	q := newFakeQuery()
+	channel := "ch1"
+	batch := makeBatch(channel, 1)
+	q.grouped[channel] = batch
+	q.primaryByChannel[channel] = withinQuotaUser("u1")
+
+	cli := &fakeClient{provider: "openai", model: "gpt-4o"}
+	p := NewProcessor(cli, q)
+	p.tickOnce(context.Background())
+
+	if len(q.sentiments) != 1 {
+		t.Fatalf("want 1 sentiment update, got %d", len(q.sentiments))
+	}
+	if q.sentiments[0].score != 0 {
+		t.Errorf("score = %d, want 0", q.sentiments[0].score)
+	}
+	var completed int
+	for _, st := range q.jobs {
+		if st == "completed" {
+			completed++
+		}
+	}
+	if completed != 1 {
+		t.Errorf("want 1 completed job, got %d", completed)
+	}
+}
+
+func TestProcessor_PanicInTickDoesNotKill(t *testing.T) {
+	q := newFakeQuery()
+	q.grouped["ch1"] = makeBatch("ch1", 2)
+	q.primaryByChannel["ch1"] = withinQuotaUser("u1")
+	cli := &fakeClient{
+		provider: "openai", model: "gpt-4o",
+		resultsFn: func(comments []PromptComment) ([]LLMResult, error) {
+			panic("boom")
+		},
+	}
+	p := NewProcessor(cli, q)
+	// Must not propagate panic.
+	p.tickOnce(context.Background())
+	// Second tick with healthy client still works.
+	cli2 := &fakeClient{provider: "openai", model: "gpt-4o"}
+	p2 := NewProcessor(cli2, q)
+	p2.tickOnce(context.Background())
+	if len(cli2.calls) != 1 {
+		t.Fatalf("want processor alive after panic, got %d calls", len(cli2.calls))
+	}
+}
+
+type dedupeQuery struct {
+	*fakeQuery
+	existingID string
+}
+
+func (q *dedupeQuery) EnqueueLLMJobIfNotExists(ctx context.Context, commentIDs []string, provider string) (string, bool, error) {
+	return q.existingID, false, nil
+}
+
+func TestProcessor_DedupeSkipsLLMCall(t *testing.T) {
+	inner := newFakeQuery()
+	inner.grouped["ch1"] = makeBatch("ch1", 3)
+	inner.primaryByChannel["ch1"] = withinQuotaUser("u1")
+	q := &dedupeQuery{fakeQuery: inner, existingID: "job-existing"}
+	cli := &fakeClient{provider: "openai", model: "gpt-4o"}
+	p := NewProcessor(cli, q)
+	p.tickOnce(context.Background())
+	if len(cli.calls) != 0 {
+		t.Fatalf("deduped batch must skip LLM, got %d calls", len(cli.calls))
+	}
+	if len(inner.updates) != 0 {
+		t.Fatalf("deduped batch must not persist, got %d", len(inner.updates))
+	}
+}

@@ -58,19 +58,70 @@ For each comment in the user message, return ONE JSON object with exactly these 
 - comment_index (integer, the zero-based index of the comment in the user message)
 - category (string, EXACTLY one of: question, praise, constructive_criticism, toxic_criticism, content_idea, collaboration_ask, spam, other)
 - confidence (number in [0.0, 1.0], your confidence in the category)
+- sentiment (string, EXACTLY one of: negative, neutral, positive)
 - topic (string, at most 10 whitespace-separated words describing the primary subject)
 - actionable_insights (array of insight objects, may be empty; each has: type (one of: video_idea, editing_tip, feature_request, collaboration_ask, improvement_suggestion, content_format_request, other), description (string, max 200 characters), confidence (number in [0.0, 1.0]))
 
 Return ONLY a single JSON array containing one object per input comment, in the same order. Do NOT wrap the array in markdown code fences. Do NOT include any prose before or after the array. Do NOT add comments inside the JSON. Extract at most 5 actionable_insights per comment.`
 
+// SentimentLabel is the closed-set sentiment value the LLM emits per
+// comment. Labels are case-sensitive and defined by the prompt contract.
+type SentimentLabel string
+
+const (
+	SentimentNegative SentimentLabel = "negative"
+	SentimentNeutral  SentimentLabel = "neutral"
+	SentimentPositive SentimentLabel = "positive"
+)
+
+// UnmarshalJSON accepts the canonical string label or a legacy numeric
+// value (older provider fixtures emit numbers). Numeric values carry no
+// valid label and collapse to the empty label (score 0 / neutral) rather
+// than failing the whole batch; null is tolerated the same way.
+func (s *SentimentLabel) UnmarshalJSON(b []byte) error {
+	if string(b) == "null" {
+		*s = ""
+		return nil
+	}
+	var str string
+	if err := json.Unmarshal(b, &str); err == nil {
+		*s = SentimentLabel(str)
+		return nil
+	}
+	var num float64
+	if err := json.Unmarshal(b, &num); err == nil {
+		*s = ""
+		return nil
+	}
+	return fmt.Errorf("invalid sentiment value %s", b)
+}
+
 // LLMResult is the parsed-and-validated classification for a single comment.
 // CommentIndex is the zero-based position in the prompt's enumerated list.
+// Sentiment is the closed-set label (negative|neutral|positive) the model
+// emits; map it to a score with SentimentScore.
 type LLMResult struct {
-	CommentIndex     int       `json:"comment_index"`
-	Category         string    `json:"category"`
-	Confidence       float64   `json:"confidence"`
-	Topic            string    `json:"topic"`
-	ActionableInsights []Insight `json:"actionable_insights"`
+	CommentIndex       int            `json:"comment_index"`
+	Category           string         `json:"category"`
+	Confidence         float64        `json:"confidence"`
+	Topic              string         `json:"topic"`
+	ActionableInsights []Insight      `json:"actionable_insights"`
+	Sentiment          SentimentLabel `json:"sentiment"`
+}
+
+// SentimentScore maps the closed-set sentiment label to an integer score
+// (-1/0/1) for aggregation. Missing or unknown labels default to neutral (0)
+// so a single malformed field never fails the whole batch, mirroring the
+// tolerance applied to category parsing.
+func SentimentScore(s SentimentLabel) int {
+	switch s {
+	case SentimentNegative:
+		return -1
+	case SentimentPositive:
+		return 1
+	default:
+		return 0
+	}
 }
 
 // PromptComment is the minimal shape required to build a classification

@@ -2,20 +2,24 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"log"
 	"net/http"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"noumena/internal/billing"
 	"noumena/internal/config"
 	"noumena/internal/db"
 )
 
 type WorkspaceHandler struct {
-	Queries     db.DBQuery
-	Cfg         *config.Config
+	Queries db.DBQuery
+	Cfg     *config.Config
 }
 
 func (h *WorkspaceHandler) CreateDefaultWorkspace(userID string) error {
@@ -42,7 +46,102 @@ func (h *WorkspaceHandler) ListWorkspaces(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	for _, w := range workspaces {
+		owner, err := h.Queries.GetUserByID(r.Context(), w.CreatedBy)
+		if err != nil {
+			continue
+		}
+		w.SeatsLimit = billing.LimitsFor(owner.SubscriptionPlan).Seats
+	}
+
 	writeJSON(w, http.StatusOK, workspaces)
+}
+
+// ActiveWorkspaceRole returns the caller's role in their active workspace.
+// Backs the frontend role bootstrap (GET /api/workspaces/active/role).
+func (h *WorkspaceHandler) ActiveWorkspaceRole(w http.ResponseWriter, r *http.Request) {
+	wsCtx, ok := r.Context().Value(workspaceCtxKey{}).(*WorkspaceContext)
+	if !ok || wsCtx == nil {
+		writeError(w, http.StatusForbidden, "workspace context required")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"role": wsCtx.Role})
+}
+
+// ListMembers returns the workspace member roster with emails. Admin-only
+// (same gate as invite/role/remove mutations).
+func (h *WorkspaceHandler) ListMembers(w http.ResponseWriter, r *http.Request) {
+	userID, ok := r.Context().Value(UserIDKey).(string)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	workspaceID := chi.URLParam(r, "id")
+
+	if err := h.requireAdmin(r.Context(), userID, workspaceID); err != nil {
+		if err == http.ErrAbortHandler {
+			writeError(w, http.StatusForbidden, "admin role required")
+			return
+		}
+		writeError(w, http.StatusForbidden, "not a member of this workspace")
+		return
+	}
+
+	members, err := h.Queries.ListWorkspaceMembers(r.Context(), workspaceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list members")
+		return
+	}
+	seats, err := h.seatUsageFor(r.Context(), workspaceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load seat usage")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"members":      members,
+		"member_count": seats.Used,
+		"seats_limit":  seats.Limit,
+	})
+}
+
+func (h *WorkspaceHandler) GetWorkspaceByID(w http.ResponseWriter, r *http.Request) {
+	userID, ok := r.Context().Value(UserIDKey).(string)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	workspaceID := chi.URLParam(r, "id")
+
+	if _, err := h.Queries.GetWorkspaceMember(r.Context(), workspaceID, userID); err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "workspace not found")
+		} else {
+			writeError(w, http.StatusInternalServerError, "failed to get workspace")
+		}
+		return
+	}
+
+	workspace, err := h.Queries.GetWorkspace(r.Context(), workspaceID)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "workspace not found")
+		} else {
+			writeError(w, http.StatusInternalServerError, "failed to get workspace")
+		}
+		return
+	}
+
+	seats, err := h.seatUsageFor(r.Context(), workspaceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load seat usage")
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		*db.Workspace
+		MemberCount int `json:"member_count"`
+		SeatsLimit  int `json:"seats_limit"`
+	}{workspace, seats.Used, seats.Limit})
 }
 
 func (h *WorkspaceHandler) CreateWorkspace(w http.ResponseWriter, r *http.Request) {
@@ -80,7 +179,7 @@ func (h *WorkspaceHandler) CreateWorkspace(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	if err := h.Queries.InsertAuditLog(r.Context(), userID, "workspace.created", `{"workspace_id":"`+workspace.ID+`","name":"`+req.Name+`"}`, clientIP(r)); err != nil {
+	if err := h.Queries.InsertAuditLog(r.Context(), userID, "workspace.created", `{"workspace_id":"`+workspace.ID+`","name":"`+req.Name+`"}`, clientIP(r, h.Cfg)); err != nil {
 	}
 
 	writeJSON(w, http.StatusCreated, workspace)
@@ -116,7 +215,7 @@ func (h *WorkspaceHandler) UpdateWorkspace(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	_ = h.Queries.InsertAuditLog(r.Context(), userID, "workspace.updated", `{"workspace_id":"`+workspaceID+`"}`, clientIP(r))
+	_ = h.Queries.InsertAuditLog(r.Context(), userID, "workspace.updated", `{"workspace_id":"`+workspaceID+`"}`, clientIP(r, h.Cfg))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -138,7 +237,7 @@ func (h *WorkspaceHandler) DeleteWorkspace(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	_ = h.Queries.InsertAuditLog(r.Context(), userID, "workspace.deleted", `{"workspace_id":"`+workspaceID+`"}`, clientIP(r))
+	_ = h.Queries.InsertAuditLog(r.Context(), userID, "workspace.deleted", `{"workspace_id":"`+workspaceID+`"}`, clientIP(r, h.Cfg))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -166,7 +265,7 @@ func (h *WorkspaceHandler) ActivateWorkspace(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	_ = h.Queries.InsertAuditLog(r.Context(), userID, "workspace.activated", `{"workspace_id":"`+workspaceID+`"}`, clientIP(r))
+	_ = h.Queries.InsertAuditLog(r.Context(), userID, "workspace.activated", `{"workspace_id":"`+workspaceID+`"}`, clientIP(r, h.Cfg))
 	writeJSON(w, http.StatusOK, map[string]string{"workspace_id": workspaceID, "role": member.Role})
 }
 
@@ -208,7 +307,12 @@ func (h *WorkspaceHandler) InviteMember(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	token := generateInviteToken()
+	token, err := generateInviteToken()
+	if err != nil {
+		log.Printf("workspace: generate invite token: %v", err)
+		writeError(w, http.StatusInternalServerError, "failed to create invite")
+		return
+	}
 	tokenHash := sha256.Sum256([]byte(token))
 	tokenHashHex := hex.EncodeToString(tokenHash[:])
 
@@ -223,14 +327,14 @@ func (h *WorkspaceHandler) InviteMember(w http.ResponseWriter, r *http.Request) 
 	inviteURL := h.Cfg.AppBaseURL + "/invites/accept?token=" + token
 
 	_ = h.Queries.InsertAuditLog(r.Context(), userID, "workspace.invite_created",
-		`{"workspace_id":"`+workspaceID+`","email":"`+req.Email+`","role":"`+req.Role+`"}`, clientIP(r))
+		`{"workspace_id":"`+workspaceID+`","email":"`+req.Email+`","role":"`+req.Role+`"}`, clientIP(r, h.Cfg))
 
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
-		"invite_id":   invite.ID,
-		"email":       invite.Email,
-		"role":        invite.Role,
-		"expires_at":  invite.ExpiresAt,
-		"invite_url":  inviteURL,
+		"invite_id":  invite.ID,
+		"email":      invite.Email,
+		"role":       invite.Role,
+		"expires_at": invite.ExpiresAt,
+		"invite_url": inviteURL,
 	})
 }
 
@@ -277,6 +381,15 @@ func (h *WorkspaceHandler) AcceptInvite(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	if err := h.checkSeatCapacity(r.Context(), invite.WorkspaceID); err != nil {
+		if errors.Is(err, errSeatLimit) {
+			writeError(w, http.StatusConflict, "seat limit reached, upgrade your plan")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to check seat capacity")
+		return
+	}
+
 	if err := h.Queries.AddWorkspaceMember(r.Context(), invite.WorkspaceID, userID, invite.Role); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to join workspace")
 		return
@@ -289,7 +402,7 @@ func (h *WorkspaceHandler) AcceptInvite(w http.ResponseWriter, r *http.Request) 
 	}
 
 	_ = h.Queries.InsertAuditLog(r.Context(), userID, "workspace.invite_accepted",
-		`{"workspace_id":"`+invite.WorkspaceID+`","email":"`+invite.Email+`"}`, clientIP(r))
+		`{"workspace_id":"`+invite.WorkspaceID+`","email":"`+invite.Email+`"}`, clientIP(r, h.Cfg))
 
 	http.Redirect(w, r, h.Cfg.AppBaseURL+"/dashboard", http.StatusFound)
 }
@@ -336,7 +449,7 @@ func (h *WorkspaceHandler) RemoveMember(w http.ResponseWriter, r *http.Request) 
 	}
 
 	_ = h.Queries.InsertAuditLog(r.Context(), userID, "workspace.member_removed",
-		`{"workspace_id":"`+workspaceID+`","target_user_id":"`+targetUserID+`"}`, clientIP(r))
+		`{"workspace_id":"`+workspaceID+`","target_user_id":"`+targetUserID+`"}`, clientIP(r, h.Cfg))
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -372,13 +485,90 @@ func (h *WorkspaceHandler) ChangeMemberRole(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	if err := h.checkSeatCapacity(r.Context(), workspaceID); err != nil {
+		if errors.Is(err, errSeatLimit) {
+			writeError(w, http.StatusConflict, "seat limit reached, upgrade your plan")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to check seat capacity")
+		return
+	}
+
 	if err := h.Queries.UpdateWorkspaceMemberRole(r.Context(), workspaceID, targetUserID, req.Role); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to update role")
 		return
 	}
 
 	_ = h.Queries.InsertAuditLog(r.Context(), userID, "workspace.member_role_changed",
-		`{"workspace_id":"`+workspaceID+`","target_user_id":"`+targetUserID+`","role":"`+req.Role+`"}`, clientIP(r))
+		`{"workspace_id":"`+workspaceID+`","target_user_id":"`+targetUserID+`","role":"`+req.Role+`"}`, clientIP(r, h.Cfg))
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *WorkspaceHandler) GrantChannel(w http.ResponseWriter, r *http.Request) {
+	userID, ok := r.Context().Value(UserIDKey).(string)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	workspaceID := chi.URLParam(r, "id")
+	channelID := chi.URLParam(r, "channelId")
+
+	member, err := h.Queries.GetWorkspaceMember(r.Context(), workspaceID, userID)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeError(w, http.StatusForbidden, "not a member of this workspace")
+		} else {
+			writeError(w, http.StatusInternalServerError, "failed to get workspace member")
+		}
+		return
+	}
+	if member.Role == "viewer" {
+		writeError(w, http.StatusForbidden, "analyst role required")
+		return
+	}
+
+	if err := h.Queries.GrantChannel(r.Context(), workspaceID, channelID, userID); err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "channel not found")
+		} else {
+			writeError(w, http.StatusInternalServerError, "failed to grant channel")
+		}
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *WorkspaceHandler) RevokeChannel(w http.ResponseWriter, r *http.Request) {
+	userID, ok := r.Context().Value(UserIDKey).(string)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	workspaceID := chi.URLParam(r, "id")
+	channelID := chi.URLParam(r, "channelId")
+
+	member, err := h.Queries.GetWorkspaceMember(r.Context(), workspaceID, userID)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeError(w, http.StatusForbidden, "not a member of this workspace")
+		} else {
+			writeError(w, http.StatusInternalServerError, "failed to get workspace member")
+		}
+		return
+	}
+	if member.Role == "viewer" {
+		writeError(w, http.StatusForbidden, "analyst role required")
+		return
+	}
+
+	if err := h.Queries.RevokeChannel(r.Context(), workspaceID, channelID); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to revoke channel")
+		return
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -394,17 +584,70 @@ func (h *WorkspaceHandler) requireAdmin(ctx context.Context, userID, workspaceID
 	return nil
 }
 
-func generateInviteToken() string {
-	b := make([]byte, 32)
-	for i := range b {
-		b[i] = byte(i)
-	}
-	return hex.EncodeToString(b)
+// seatUsage is the resolved seat capacity for a workspace: the owner's plan
+// seat limit and the number of active members consuming seats.
+type seatUsage struct {
+	Limit int
+	Used  int
 }
 
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		return xff
+// seatUsageFor resolves seat capacity from the billing plan catalog (single
+// source of truth: internal/billing/plans.go, LimitsFor().Seats) and the
+// active-member count in workspace_members. Pending invites live in
+// workspace_invites and never consume a seat.
+func (h *WorkspaceHandler) seatUsageFor(ctx context.Context, workspaceID string) (*seatUsage, error) {
+	ws, err := h.Queries.GetWorkspace(ctx, workspaceID)
+	if err != nil {
+		return nil, err
 	}
-	return r.RemoteAddr
+	owner, err := h.Queries.GetUserByID(ctx, ws.CreatedBy)
+	if err != nil {
+		return nil, err
+	}
+	used, err := h.Queries.CountWorkspaceMembers(ctx, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	return &seatUsage{Limit: billing.LimitsFor(owner.SubscriptionPlan).Seats, Used: used}, nil
+}
+
+// errSeatLimit marks a workspace at or over its plan seat cap.
+var errSeatLimit = errors.New("seat limit reached")
+
+// checkSeatCapacity returns errSeatLimit when the workspace is at or over its
+// plan seat cap. Over-cap (legacy, pre-deploy) workspaces are logged but their
+// existing members are never removed or denied — only new admissions (invite
+// accept / role change) stay blocked while over cap.
+func (h *WorkspaceHandler) checkSeatCapacity(ctx context.Context, workspaceID string) error {
+	su, err := h.seatUsageFor(ctx, workspaceID)
+	if err != nil {
+		return err
+	}
+	if su.Used >= su.Limit {
+		if su.Used > su.Limit {
+			log.Printf("workspace %s is over seat capacity (%d/%d) - existing members unaffected, new admissions blocked",
+				workspaceID, su.Used, su.Limit)
+		}
+		return errSeatLimit
+	}
+	return nil
+}
+
+// generateInviteToken returns a 32-byte cryptographically random token,
+// hex-encoded (64 characters). Only the SHA-256 hash is stored; the raw value
+// appears in the invite URL.
+func generateInviteToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func clientIP(r *http.Request, cfg *config.Config) string {
+	header := ""
+	if cfg != nil {
+		header = cfg.TrustProxyHeader
+	}
+	return trustedClientIP(r, header)
 }

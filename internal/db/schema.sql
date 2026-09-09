@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS users (
     digest_email_sent_at TEXT,
     trial_ends_at TEXT,
     subscription_status TEXT NOT NULL DEFAULT 'active'
-        CHECK (subscription_status IN ('active','past_due','paused','canceled')),
+        CHECK (subscription_status IN ('active','past_due','paused','canceled','trialing')),
     current_period_end TEXT,
     billing_interval TEXT CHECK (billing_interval IS NULL OR billing_interval IN ('month','year')),
     stripe_subscription_id TEXT,
@@ -84,6 +84,24 @@ CREATE INDEX IF NOT EXISTS idx_email_verification_tokens_user_id
     ON email_verification_tokens(user_id);
 CREATE INDEX IF NOT EXISTS idx_email_verification_tokens_expires_at
     ON email_verification_tokens(expires_at);
+
+-- Email-change tokens (fix-frontend-plumbing): one active pending email
+-- change per user. The old email stays live until the new one is verified.
+CREATE TABLE IF NOT EXISTS email_change_tokens (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    pending_email TEXT NOT NULL,
+    token_hash TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_email_change_tokens_token_hash
+    ON email_change_tokens(token_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_email_change_tokens_user_active
+    ON email_change_tokens(user_id) WHERE used_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_email_change_tokens_expires_at
+    ON email_change_tokens(expires_at);
 
 -- Password reset tokens
 CREATE TABLE IF NOT EXISTS password_reset_tokens (
@@ -170,6 +188,18 @@ CREATE INDEX IF NOT EXISTS idx_user_channel_tracking_token_expiry_scan
 
 CREATE INDEX IF NOT EXISTS idx_user_channel_tracking_workspace
     ON user_channel_tracking(workspace_id);
+
+-- Workspace-scoped channel grants
+CREATE TABLE IF NOT EXISTS channel_grants (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    channel_id TEXT NOT NULL REFERENCES platform_channels(id) ON DELETE CASCADE,
+    granted_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE(workspace_id, channel_id)
+);
+CREATE INDEX IF NOT EXISTS idx_channel_grants_workspace
+    ON channel_grants(workspace_id, channel_id);
 
 -- Short-lived OAuth state table for CSRF protection
 CREATE TABLE IF NOT EXISTS oauth_states (
@@ -382,6 +412,10 @@ CREATE TABLE IF NOT EXISTS email_send_log (
     last_attempted_at TEXT,
     last_error TEXT,
     sent_at TEXT,
+    to_address TEXT NOT NULL DEFAULT '',
+    subject TEXT NOT NULL DEFAULT '',
+    html_body TEXT NOT NULL DEFAULT '',
+    text_body TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 

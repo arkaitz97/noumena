@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,10 +21,11 @@ import (
 )
 
 // BillingHandler owns the four endpoints introduced by the `billing` change:
-//   POST /api/billing/checkout
-//   GET  /api/billing/portal
-//   GET  /api/billing/status
-//   POST /webhooks/stripe (public, signature-verified)
+//
+//	POST /api/billing/checkout
+//	GET  /api/billing/portal
+//	GET  /api/billing/status
+//	POST /webhooks/stripe (public, signature-verified)
 //
 // All persistence is delegated to the billing-specific helpers on
 // *db.SQLiteQuery (see internal/db/billing.go). Webhook handling
@@ -154,15 +156,38 @@ func (h *BillingHandler) CreatePortalSession(w http.ResponseWriter, r *http.Requ
 // ----------------------------------------------------------------------------
 
 type statusResponse struct {
-	Plan             string     `json:"plan"`
-	Status           string     `json:"status"`
-	Interval         *string    `json:"interval,omitempty"`
-	CurrentPeriodEnd *time.Time `json:"current_period_end,omitempty"`
-	ChannelsUsed     int        `json:"channels_used"`
-	ChannelsLimit    int        `json:"channels_limit"`
-	CommentsUsed     int        `json:"comments_used"`
-	CommentsLimit    int        `json:"comments_limit"`
-	OverageCost      float64    `json:"overage_cost"`
+	Plan              string     `json:"plan"`
+	Status            string     `json:"status"`
+	Interval          *string    `json:"interval,omitempty"`
+	CurrentPeriodEnd  *time.Time `json:"current_period_end,omitempty"`
+	ChannelsUsed      int        `json:"channels_used"`
+	ChannelsLimit     int        `json:"channels_limit"`
+	ChannelsUnlimited bool       `json:"channels_unlimited"`
+	CommentsUsed      int        `json:"comments_used"`
+	CommentsLimit     int        `json:"comments_limit"`
+	OverageCost       float64    `json:"overage_cost"`
+	// Trial (implement-missing-product-features 5.2): derived, additive.
+	Trial trialInfo `json:"trial"`
+}
+
+// trialInfo is the derived trial state consumed by the billing store's
+// trial countdown. Active when trial_ends_at is in the future AND the user
+// is not on a paid plan (trial users keep the free quota; only the billing
+// status changes).
+type trialInfo struct {
+	Active        bool   `json:"active"`
+	EndsAt        string `json:"ends_at,omitempty"`
+	DaysRemaining int    `json:"days_remaining"`
+}
+
+// trialDaysRemaining mirrors the reminder-cron's day math: full days until
+// expiry, rounded up, floor 0.
+func trialDaysRemaining(endsAt time.Time) int {
+	d := int(time.Until(endsAt).Hours()/24) + 1
+	if d < 0 {
+		d = 0
+	}
+	return d
 }
 
 func (h *BillingHandler) Status(w http.ResponseWriter, r *http.Request) {
@@ -212,19 +237,106 @@ func (h *BillingHandler) Status(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	trial := trialInfo{Active: false}
+	if user.TrialEndsAt != nil {
+		trial.EndsAt = user.TrialEndsAt.UTC().Format(time.RFC3339)
+		// Trial is active while the deadline is in the future AND there is
+		// no paid subscription: upgrades exit the trial immediately.
+		if time.Now().Before(*user.TrialEndsAt) && !billing.IsPaidPlan(plan) {
+			trial.Active = true
+			trial.DaysRemaining = trialDaysRemaining(*user.TrialEndsAt)
+		}
+	}
+
 	resp := statusResponse{
-		Plan:             plan,
-		Status:           user.SubscriptionStatus,
-		Interval:         user.BillingInterval,
-		CurrentPeriodEnd: user.CurrentPeriodEnd,
-		ChannelsUsed:     channelCount,
-		ChannelsLimit:    limits.ChannelLimit,
-		CommentsUsed:     user.CommentsUsedThisPeriod,
-		CommentsLimit:    limits.CommentQuotaMonthly,
-		OverageCost:      overage,
+		Plan:              plan,
+		Status:            user.SubscriptionStatus,
+		Interval:          user.BillingInterval,
+		CurrentPeriodEnd:  user.CurrentPeriodEnd,
+		ChannelsUsed:      channelCount,
+		ChannelsLimit:     limits.ChannelLimit,
+		ChannelsUnlimited: limits.ChannelsUnlimited,
+		CommentsUsed:      user.CommentsUsedThisPeriod,
+		CommentsLimit:     limits.CommentQuotaMonthly,
+		OverageCost:       overage,
+		Trial:             trial,
 	}
 	if resp.Status == "" {
 		resp.Status = "active"
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// ----------------------------------------------------------------------------
+// GET /api/billing/usage (implement-missing-product-features 3.2)
+// ----------------------------------------------------------------------------
+
+// BillingUsageStore is the narrow read surface the usage endpoint needs.
+// *db.SQLiteQuery satisfies it via GetBillingUsage.
+type BillingUsageStore interface {
+	GetBillingUsage(ctx context.Context, userID string, limit int) ([]db.BillingUsage, error)
+}
+
+type usagePeriod struct {
+	PeriodStart  string `json:"period_start"`
+	PeriodEnd    string `json:"period_end"`
+	CommentsUsed int    `json:"comments_used"`
+	Quota        int    `json:"quota"`
+}
+
+type usageResponse struct {
+	Periods []usagePeriod `json:"periods"`
+}
+
+const (
+	usageDefaultPeriods = 6
+	usageMaxPeriods     = 12
+)
+
+// Usage returns the user's last N usage periods, newest first. Billing is
+// per-user in this app, so access control is simply the authenticated user
+// (same as Status). Query param `periods` clamps to [1,12]; invalid values
+// are rejected with 400.
+func (h *BillingHandler) Usage(w http.ResponseWriter, r *http.Request) {
+	userID, ok := r.Context().Value(UserIDKey).(string)
+	if !ok || userID == "" {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	periods := usageDefaultPeriods
+	if q := r.URL.Query().Get("periods"); q != "" {
+		n, err := strconv.Atoi(q)
+		if err != nil || n < 1 || n > usageMaxPeriods {
+			http.Error(w, "invalid periods", http.StatusBadRequest)
+			return
+		}
+		periods = n
+	}
+
+	store, ok := h.Queries.(BillingUsageStore)
+	if !ok {
+		// Mock-mode queries that predate this endpoint have no history;
+		// return an empty list rather than an internal error.
+		writeJSON(w, http.StatusOK, usageResponse{Periods: []usagePeriod{}})
+		return
+	}
+
+	rows, err := store.GetBillingUsage(r.Context(), userID, periods)
+	if err != nil {
+		log.Printf("billing: GetBillingUsage user=%s err=%v", userID, err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	resp := usageResponse{Periods: make([]usagePeriod, 0, len(rows))}
+	for _, u := range rows {
+		resp.Periods = append(resp.Periods, usagePeriod{
+			PeriodStart:  u.PeriodStart.UTC().Format(time.RFC3339),
+			PeriodEnd:    u.PeriodEnd.UTC().Format(time.RFC3339),
+			CommentsUsed: u.CommentsUsed,
+			Quota:        u.Quota,
+		})
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -567,10 +679,10 @@ func (h *BillingHandler) handleInvoicePaymentFailed(ctx context.Context, tx *sql
 }
 
 type stripeSubscriptionEvent struct {
-	ID         string            `json:"id"`
-	Customer   string            `json:"customer"`
-	Status     string            `json:"status"`
-	Metadata   map[string]string `json:"metadata"`
+	ID       string            `json:"id"`
+	Customer string            `json:"customer"`
+	Status   string            `json:"status"`
+	Metadata map[string]string `json:"metadata"`
 }
 
 func (h *BillingHandler) handleSubscriptionUpdated(ctx context.Context, tx *sql.Tx, event stripe.Event) error {

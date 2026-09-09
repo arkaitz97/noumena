@@ -29,6 +29,7 @@ import (
 	"noumena/internal/billing"
 	"noumena/internal/config"
 	"noumena/internal/db"
+	"noumena/internal/dbtest"
 )
 
 func newAccountRouter(h *api.AccountHandler, userID string) *chi.Mux {
@@ -107,6 +108,7 @@ func TestGetProfile_Unauthenticated(t *testing.T) {
 // calls and returns a configurable error on each. Used by 3.7 / 3.8 tests
 // to assert the wiring behaviour without exercising the real Stripe SDK.
 type fakeBillingClient struct {
+	db.DBQuery
 	billing.Client
 	cancellations []string
 	cancelErr     error
@@ -260,8 +262,8 @@ func TestDeleteAccount_CreatesAuditLogEntry(t *testing.T) {
 	if entry.Action != "deletion_requested" {
 		t.Errorf("expected action deletion_requested, got %s", entry.Action)
 	}
-	if entry.IPAddress != "192.168.1.1:12345" {
-		t.Errorf("expected IP 192.168.1.1:12345, got %s", entry.IPAddress)
+	if entry.IPAddress != "192.168.1.1" {
+		t.Errorf("expected IP 192.168.1.1, got %s", entry.IPAddress)
 	}
 }
 
@@ -327,5 +329,46 @@ func TestCancelAccountDeletion_RejectsWithoutPendingDeletion(t *testing.T) {
 
 	if w.Code != http.StatusConflict {
 		t.Fatalf("expected 409 Conflict, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// 1.4: the deletion endpoint succeeds on a real SQLite DB — row marked,
+// job enqueued, no Postgres-ism (NOW()/$1) errors.
+func TestDeleteAccount_RealDB(t *testing.T) {
+	ctx := context.Background()
+	database := dbtest.SetupTestDB(t)
+	q := db.NewSQLiteQuery(database)
+
+	user, err := q.CreateUserWithPassword(ctx, "gdpr_delete@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUserWithPassword: %v", err)
+	}
+	h := &api.AccountHandler{Queries: q, Cfg: config.Default}
+	r := newAccountRouter(h, user.ID)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/user/account",
+		bytes.NewBufferString(`{"email_confirmation":"gdpr_delete@example.com"}`))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var deletionRequestedAt string
+	if err := database.QueryRowContext(ctx,
+		`SELECT deletion_requested_at FROM users WHERE id=?`, user.ID).Scan(&deletionRequestedAt); err != nil {
+		t.Fatalf("read deletion_requested_at: %v", err)
+	}
+	if deletionRequestedAt == "" {
+		t.Error("deletion_requested_at not set on users row")
+	}
+	var status string
+	if err := database.QueryRowContext(ctx,
+		`SELECT status FROM account_deletion_jobs WHERE user_id=?`, user.ID).Scan(&status); err != nil {
+		t.Fatalf("read deletion job: %v", err)
+	}
+	if status != "pending" {
+		t.Errorf("deletion job status = %q, want pending", status)
 	}
 }

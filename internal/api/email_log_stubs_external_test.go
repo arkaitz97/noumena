@@ -21,11 +21,14 @@ func (m *MockQuery) IsEmailIdempotencyKeyUsed(context.Context, string) (bool, er
 func (m *MockQuery) LogEmailAttempt(context.Context, db.EmailAttemptInput) (string, error) {
 	return "stub-id", nil
 }
-func (m *MockQuery) MarkEmailSent(context.Context, string, time.Time) error          { return nil }
+func (m *MockQuery) MarkEmailSent(context.Context, string, time.Time) error           { return nil }
 func (m *MockQuery) IncrementEmailAttempt(context.Context, string, int, string) error { return nil }
-func (m *MockQuery) MarkEmailFailed(context.Context, string, string) error           { return nil }
-func (m *MockQuery) MarkEmailAttemptError(context.Context, string, string) error     { return nil }
+func (m *MockQuery) MarkEmailFailed(context.Context, string, string) error            { return nil }
+func (m *MockQuery) MarkEmailAttemptError(context.Context, string, string) error      { return nil }
 func (m *MockQuery) ClaimPendingEmails(context.Context, time.Time, int) ([]*db.EmailLogRow, error) {
+	return nil, nil
+}
+func (m *MockQuery) GetEmailRowByIdempotencyKey(context.Context, string) (*db.EmailLogRow, error) {
 	return nil, nil
 }
 
@@ -42,11 +45,11 @@ func (m *MockQuery) CancelAccountDeletion(context.Context, string) error { retur
 func (m *MockQuery) ClaimNextDeletionJob(context.Context, time.Duration) (*db.AccountDeletionJob, error) {
 	return nil, nil
 }
-func (m *MockQuery) MarkDeletionStage(context.Context, string, string) error          { return nil }
-func (m *MockQuery) MarkDeletionFailed(context.Context, string, string) error         { return nil }
-func (m *MockQuery) IncrementChannelsProcessed(context.Context, string) error         { return nil }
-func (m *MockQuery) MarkDeletionCompleted(context.Context, string, string) error      { return nil }
-func (m *MockQuery) MarkDeletionCompletedJobOnly(context.Context, string) error       { return nil }
+func (m *MockQuery) MarkDeletionStage(context.Context, string, string) error     { return nil }
+func (m *MockQuery) MarkDeletionFailed(context.Context, string, string) error    { return nil }
+func (m *MockQuery) IncrementChannelsProcessed(context.Context, string) error    { return nil }
+func (m *MockQuery) MarkDeletionCompleted(context.Context, string, string) error { return nil }
+func (m *MockQuery) MarkDeletionCompletedJobOnly(context.Context, string) error  { return nil }
 func (m *MockQuery) GetUserTrackingChannels(context.Context, string) ([]*db.UserChannelTrackingRow, error) {
 	return nil, nil
 }
@@ -59,14 +62,21 @@ func (m *MockQuery) DeleteUserChannelTracking(context.Context, *sql.Tx, string, 
 func (m *MockQuery) DeleteCommentsByChannelChunked(context.Context, string, int, string) (int, error) {
 	return 0, nil
 }
-func (m *MockQuery) DeletePlatformChannel(context.Context, *sql.Tx, string) error      { return nil }
+func (m *MockQuery) DeletePlatformChannel(context.Context, *sql.Tx, string) error { return nil }
 func (m *MockQuery) DeleteUserStarsForChannel(context.Context, *sql.Tx, string, string) error {
 	return nil
 }
-func (m *MockQuery) DeleteUserStarsAll(context.Context, *sql.Tx, string) error      { return nil }
-func (m *MockQuery) DeleteUserDigests(context.Context, *sql.Tx, string) error       { return nil }
-func (m *MockQuery) DeleteUserAuthTokens(context.Context, *sql.Tx, string) error    { return nil }
-func (m *MockQuery) HardDeleteUser(context.Context, *sql.Tx, string) error          { return nil }
+func (m *MockQuery) DeleteUserStarsAll(context.Context, *sql.Tx, string) error   { return nil }
+func (m *MockQuery) DeleteUserDigests(context.Context, *sql.Tx, string) error    { return nil }
+func (m *MockQuery) DeleteUserAuthTokens(context.Context, *sql.Tx, string) error { return nil }
+func (m *MockQuery) DeleteUserGDPRData(context.Context, *sql.Tx, string) error   { return nil }
+func (m *MockQuery) HardDeleteUser(context.Context, *sql.Tx, string) error       { return nil }
+func (m *MockQuery) MarkDeletionRevokeStatus(context.Context, string, bool, string) error {
+	return nil
+}
+func (m *MockQuery) ListJobsPendingRevoke(context.Context) ([]*db.AccountDeletionJob, error) {
+	return nil, nil
+}
 func (m *MockQuery) EnqueueDataExport(context.Context, string) (*db.DataExportJob, error) {
 	return nil, nil
 }

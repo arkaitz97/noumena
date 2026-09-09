@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"noumena/internal/auth"
+	"noumena/internal/config"
 	"noumena/internal/db"
 )
 
@@ -73,6 +74,10 @@ func authMiddleware(q db.DBQuery, next http.Handler) http.Handler {
 func RequireVerifiedEmail(q db.DBQuery) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !config.Default.EmailVerificationRequired {
+				next.ServeHTTP(w, r)
+				return
+			}
 			userID, ok := r.Context().Value(UserIDKey).(string)
 			if !ok || userID == "" {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)

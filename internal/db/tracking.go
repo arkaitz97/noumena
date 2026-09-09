@@ -11,7 +11,8 @@ func (q *SQLiteQuery) GetIngestionToken(ctx context.Context, pcID string) (strin
 		SELECT access_token_enc, refresh_token_enc
 		FROM user_channel_tracking
 		WHERE platform_channel_id = ? AND tracking_status = 'active'
-		ORDER BY token_priority ASC, created_at ASC
+		ORDER BY CASE WHEN token_expires_at IS NULL OR token_expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now') THEN 0 ELSE 1 END,
+		         token_priority ASC, created_at ASC
 		LIMIT 1
 	`
 	var access, refresh string

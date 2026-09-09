@@ -26,16 +26,16 @@ type mockEmailClient struct {
 	verifications, resets, lockouts, googleNotices int
 }
 
-func (m *mockEmailClient) SendVerificationEmail(to, link string) error { m.verifications++; return nil }
+func (m *mockEmailClient) SendVerificationEmail(to, link string) error  { m.verifications++; return nil }
 func (m *mockEmailClient) SendPasswordResetEmail(to, link string) error { m.resets++; return nil }
 func (m *mockEmailClient) SendLoginLockoutEmail(to string) error        { m.lockouts++; return nil }
 func (m *mockEmailClient) SendGoogleOnlyAccountResetNotice(to string) error {
 	m.googleNotices++
 	return nil
 }
-func (m *mockEmailClient) SendWelcomeEmail(to string) error                  { return nil }
-func (m *mockEmailClient) SendDigestEmail(to, content string) error          { return nil }
-func (m *mockEmailClient) SendLockedAccountEmail(to string) error            { return m.SendLoginLockoutEmail(to) }
+func (m *mockEmailClient) SendWelcomeEmail(to string) error         { return nil }
+func (m *mockEmailClient) SendDigestEmail(to, content string) error { return nil }
+func (m *mockEmailClient) SendLockedAccountEmail(to string) error   { return m.SendLoginLockoutEmail(to) }
 func (m *mockEmailClient) SendTokenExpiryEmail(to, channelName string, expiresAt time.Time, settingsURL string) error {
 	return nil
 }
@@ -60,6 +60,7 @@ func setupAuthRouter(queries *MockQuery, mc email.Client) *chi.Mux {
 			r.Use(api.AuthMiddlewareWithQueries(queries))
 			r.Post("/logout-all", h.LogoutAll)
 			r.Post("/resend-verification", h.ResendVerification)
+			r.Post("/password", h.ChangePassword)
 		})
 	})
 
@@ -311,6 +312,57 @@ func TestVerifyEmailUnknownToken(t *testing.T) {
 	}
 }
 
+// TestVerifyEmailChangeFlow covers the fix-frontend-plumbing email-change
+// path: an email_change_tokens token (issued by PATCH /user/me) commits the
+// pending address, marks it verified, and can only be consumed once.
+func TestVerifyEmailChangeFlow(t *testing.T) {
+	q := &MockQuery{}
+	r := setupAuthRouter(q, &mockEmailClient{})
+
+	// Seed a user (old email) + a pending email-change token for new@.
+	user := &db.User{ID: "u-emailchange", Email: "old@example.com", TokenVersion: 3}
+	q.users = map[string]*db.User{user.Email: user}
+	raw := "change-token-raw"
+	hash := auth.HashRefreshToken(raw)
+	if err := q.InsertEmailChangeToken(context.Background(), user.ID, "new@example.com", hash, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	req, _ := http.NewRequest("POST", "/auth/verify-email?token="+raw, nil)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("verify-email-change got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	updated := q.users["new@example.com"]
+	if updated == nil {
+		t.Fatalf("user not moved to new email")
+	}
+	if updated.EmailVerifiedAt == nil {
+		t.Errorf("new email not marked verified")
+	}
+	if updated.TokenVersion != 4 {
+		t.Errorf("token_version not bumped: got %d, want 4", updated.TokenVersion)
+	}
+	// Old email must no longer resolve (keep-old-until-verified semantics
+	// end once the change commits).
+	if _, ok := q.users["old@example.com"]; ok {
+		t.Errorf("old email still present after commit")
+	}
+
+	// Replay → 410, and the email stays on the committed value.
+	req2, _ := http.NewRequest("POST", "/auth/verify-email?token="+raw, nil)
+	rr2 := httptest.NewRecorder()
+	r.ServeHTTP(rr2, req2)
+	if rr2.Code != http.StatusGone {
+		t.Errorf("expected 410 on replay, got %d", rr2.Code)
+	}
+	if _, ok := q.users["new@example.com"]; !ok {
+		t.Errorf("email reverted after replay")
+	}
+}
+
 func TestForgotPasswordAlwaysGeneric(t *testing.T) {
 	q := &MockQuery{}
 	mc := &mockEmailClient{}
@@ -453,13 +505,19 @@ func (c *captureClient) SendPasswordResetEmail(to, link string) error {
 	c.captureFn(link)
 	return c.inner.SendPasswordResetEmail(to, link)
 }
-func (c *captureClient) SendLoginLockoutEmail(to string) error            { return c.inner.SendLoginLockoutEmail(to) }
+func (c *captureClient) SendLoginLockoutEmail(to string) error {
+	return c.inner.SendLoginLockoutEmail(to)
+}
 func (c *captureClient) SendGoogleOnlyAccountResetNotice(to string) error {
 	return c.inner.SendGoogleOnlyAccountResetNotice(to)
 }
-func (c *captureClient) SendWelcomeEmail(to string) error           { return c.inner.SendWelcomeEmail(to) }
-func (c *captureClient) SendDigestEmail(to, content string) error   { return c.inner.SendDigestEmail(to, content) }
-func (c *captureClient) SendLockedAccountEmail(to string) error     { return c.inner.SendLockedAccountEmail(to) }
+func (c *captureClient) SendWelcomeEmail(to string) error { return c.inner.SendWelcomeEmail(to) }
+func (c *captureClient) SendDigestEmail(to, content string) error {
+	return c.inner.SendDigestEmail(to, content)
+}
+func (c *captureClient) SendLockedAccountEmail(to string) error {
+	return c.inner.SendLockedAccountEmail(to)
+}
 func (c *captureClient) SendTokenExpiryEmail(to, channelName string, expiresAt time.Time, settingsURL string) error {
 	return c.inner.SendTokenExpiryEmail(to, channelName, expiresAt, settingsURL)
 }
@@ -482,7 +540,7 @@ var _ = db.ErrNotFound
 // Google SSO surface (redirect + JSON twins + /auth/me). It injects a
 // caller-supplied OAuthExchanger so we never hit Google's real token endpoint
 // or JWKS in unit tests.
-func setupGoogleAuthRouter(queries *MockQuery, mc email.Client, exchanger func(ctx context.Context, code, codeVerifier, redirectURI string) (*oauth.IDClaims, error)) (*chi.Mux, *api.AuthHandler) {
+func setupGoogleAuthRouter(queries *MockQuery, mc email.Client, exchanger func(ctx context.Context, code, codeVerifier, redirectURI string) (string, *oauth.IDClaims, error)) (*chi.Mux, *api.AuthHandler) {
 	r := chi.NewRouter()
 	h := &api.AuthHandler{
 		Queries:        queries,
@@ -494,11 +552,11 @@ func setupGoogleAuthRouter(queries *MockQuery, mc email.Client, exchanger func(c
 		r.Post("/login", h.Login)
 		r.Get("/google", h.GoogleStart)
 		r.Get("/google/callback", h.GoogleCallback)
-		r.Post("/google/link", h.LinkGoogleConfirm)
 		r.Get("/google/auth-url", h.GetGoogleAuthURL)
 		r.Post("/google/callback", h.GoogleCallbackJSON)
 		r.Group(func(r chi.Router) {
 			r.Use(api.AuthMiddlewareWithQueries(queries))
+			r.Post("/google/link", h.LinkGoogleConfirm)
 			r.Get("/me", h.Me)
 		})
 	})
@@ -592,9 +650,9 @@ func TestGoogleCallbackJSON_StateMismatch(t *testing.T) {
 	t.Cleanup(func() { config.Default.GoogleSSOClientID = prev })
 
 	exchangerCalled := false
-	exch := func(ctx context.Context, code, verifier, redirectURI string) (*oauth.IDClaims, error) {
+	exch := func(ctx context.Context, code, verifier, redirectURI string) (string, *oauth.IDClaims, error) {
 		exchangerCalled = true
-		return nil, nil
+		return "", nil, nil
 	}
 	r, _ := setupGoogleAuthRouter(&MockQuery{}, &mockEmailClient{}, exch)
 	_, cookie := performAuthURLAndExtractCookie(t, r)
@@ -629,8 +687,8 @@ func TestGoogleCallbackJSON_ReturningUser(t *testing.T) {
 	// Pre-create a user with the matching google_sub.
 	_, _ = q.CreateUserGoogle(context.Background(), "ret@example.com", "google-sub-123")
 
-	exch := func(ctx context.Context, code, verifier, redirectURI string) (*oauth.IDClaims, error) {
-		return &oauth.IDClaims{Sub: "google-sub-123", Email: "ret@example.com"}, nil
+	exch := func(ctx context.Context, code, verifier, redirectURI string) (string, *oauth.IDClaims, error) {
+		return "fake-id-token", &oauth.IDClaims{Sub: "google-sub-123", Email: "ret@example.com"}, nil
 	}
 	r, _ := setupGoogleAuthRouter(q, &mockEmailClient{}, exch)
 	state, cookie := performAuthURLAndExtractCookie(t, r)
@@ -668,8 +726,8 @@ func TestGoogleCallbackJSON_NewUser(t *testing.T) {
 	t.Cleanup(func() { config.Default.GoogleSSOClientID = prev })
 
 	q := &MockQuery{}
-	exch := func(ctx context.Context, code, verifier, redirectURI string) (*oauth.IDClaims, error) {
-		return &oauth.IDClaims{Sub: "new-sub-1", Email: "newbie@example.com"}, nil
+	exch := func(ctx context.Context, code, verifier, redirectURI string) (string, *oauth.IDClaims, error) {
+		return "fake-id-token", &oauth.IDClaims{Sub: "new-sub-1", Email: "newbie@example.com"}, nil
 	}
 	r, _ := setupGoogleAuthRouter(q, &mockEmailClient{}, exch)
 	state, cookie := performAuthURLAndExtractCookie(t, r)
@@ -713,8 +771,8 @@ func TestGoogleCallbackJSON_LinkRequired(t *testing.T) {
 	q := &MockQuery{}
 	// Create a password-only account whose email will collide.
 	_, _ = q.CreateUserWithPassword(context.Background(), "pw@example.com", "$2y$12$hashhashhashhashhashha")
-	exch := func(ctx context.Context, code, verifier, redirectURI string) (*oauth.IDClaims, error) {
-		return &oauth.IDClaims{Sub: "incoming-sub", Email: "pw@example.com"}, nil
+	exch := func(ctx context.Context, code, verifier, redirectURI string) (string, *oauth.IDClaims, error) {
+		return "fake-id-token", &oauth.IDClaims{Sub: "incoming-sub", Email: "pw@example.com"}, nil
 	}
 	r, _ := setupGoogleAuthRouter(q, &mockEmailClient{}, exch)
 	state, cookie := performAuthURLAndExtractCookie(t, r)
@@ -735,6 +793,9 @@ func TestGoogleCallbackJSON_LinkRequired(t *testing.T) {
 	if resp["email"] != "pw@example.com" || resp["sub"] != "incoming-sub" {
 		t.Errorf("unexpected payload: %+v", resp)
 	}
+	if resp["id_token"] != "fake-id-token" {
+		t.Errorf("expected verified id_token surfaced for the link flow, got %q", resp["id_token"])
+	}
 	for _, c := range rr.Result().Cookies() {
 		if c.Name == "refresh_token" && c.MaxAge > 0 {
 			t.Errorf("must not set refresh_token on link_required")
@@ -747,8 +808,8 @@ func TestGoogleCallbackJSON_InvalidIDToken(t *testing.T) {
 	config.Default.GoogleSSOClientID = "test-client"
 	t.Cleanup(func() { config.Default.GoogleSSOClientID = prev })
 
-	exch := func(ctx context.Context, code, verifier, redirectURI string) (*oauth.IDClaims, error) {
-		return nil, errors.New("aud mismatch")
+	exch := func(ctx context.Context, code, verifier, redirectURI string) (string, *oauth.IDClaims, error) {
+		return "", nil, errors.New("aud mismatch")
 	}
 	r, _ := setupGoogleAuthRouter(&MockQuery{}, &mockEmailClient{}, exch)
 	state, cookie := performAuthURLAndExtractCookie(t, r)
@@ -887,8 +948,8 @@ func TestGoogleCallbackRedirect_RegressionReturningUser(t *testing.T) {
 
 	q := &MockQuery{}
 	_, _ = q.CreateUserGoogle(context.Background(), "rg@example.com", "rg-sub")
-	exch := func(ctx context.Context, code, verifier, redirectURI string) (*oauth.IDClaims, error) {
-		return &oauth.IDClaims{Sub: "rg-sub", Email: "rg@example.com"}, nil
+	exch := func(ctx context.Context, code, verifier, redirectURI string) (string, *oauth.IDClaims, error) {
+		return "fake-id-token", &oauth.IDClaims{Sub: "rg-sub", Email: "rg@example.com"}, nil
 	}
 	r, _ := setupGoogleAuthRouter(q, &mockEmailClient{}, exch)
 
@@ -928,5 +989,130 @@ func TestGoogleCallbackRedirect_RegressionReturningUser(t *testing.T) {
 	}
 	if cbRR.Header().Get("Location") == "" {
 		t.Errorf("expected Location header on returning_user 302")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// fix-auth-critical-security: LinkGoogleConfirm hardening
+// ---------------------------------------------------------------------------
+
+// registerAndGetAccessToken registers a user and returns the access token.
+func registerAndGetAccessToken(t *testing.T, r *chi.Mux, email string) string {
+	t.Helper()
+	rr := registerJSON(t, r, email, "Password1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("register: %d (%s)", rr.Code, rr.Body.String())
+	}
+	var resp map[string]string
+	_ = json.Unmarshal(rr.Body.Bytes(), &resp)
+	return resp["access_token"]
+}
+
+// doLinkConfirm performs a (possibly unauthenticated) POST /auth/google/link.
+func doLinkConfirm(t *testing.T, r *chi.Mux, access, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req, _ := http.NewRequest("POST", "/auth/google/link", bytes.NewBufferString(body))
+	if access != "" {
+		req.Header.Set("Authorization", "Bearer "+access)
+	}
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	return rr
+}
+
+// setupLinkRouter creates a password account + session and wires a fake
+// ID-token verifier into the handler. Tests may override verifier behavior
+// by mutating h.IDTokenVerifier after this call.
+func setupLinkRouter(t *testing.T) (*chi.Mux, *api.AuthHandler, *MockQuery, string) {
+	t.Helper()
+	q := &MockQuery{}
+	r, h := setupGoogleAuthRouter(q, &mockEmailClient{}, nil)
+	h.IDTokenVerifier = func(ctx context.Context, idToken string) (*oauth.IDClaims, error) {
+		return &oauth.IDClaims{Sub: "google-sub-9", Email: "link@example.com"}, nil
+	}
+	access := registerAndGetAccessToken(t, r, "link@example.com")
+	return r, h, q, access
+}
+
+func TestLinkGoogleConfirm_UnauthenticatedRejected(t *testing.T) {
+	r, _, q, _ := setupLinkRouter(t)
+	rr := doLinkConfirm(t, r, "", `{"email":"link@example.com","sub":"google-sub-9","id_token":"any"}`)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d (%s)", rr.Code, rr.Body.String())
+	}
+	if u := q.users["link@example.com"]; u == nil || u.GoogleSub != nil {
+		t.Errorf("no account mutation allowed on unauthenticated link attempt")
+	}
+}
+
+func TestLinkGoogleConfirm_ExpiredOrInvalidTokenRejected(t *testing.T) {
+	r, h, q, access := setupLinkRouter(t)
+	h.IDTokenVerifier = func(ctx context.Context, idToken string) (*oauth.IDClaims, error) {
+		return nil, errors.New("token expired")
+	}
+	rr := doLinkConfirm(t, r, access, `{"email":"link@example.com","sub":"google-sub-9","id_token":"expired"}`)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d (%s)", rr.Code, rr.Body.String())
+	}
+	if u := q.users["link@example.com"]; u == nil || u.GoogleSub != nil {
+		t.Errorf("no account mutation allowed on invalid token")
+	}
+}
+
+func TestLinkGoogleConfirm_MissingIDTokenRejected(t *testing.T) {
+	r, _, q, access := setupLinkRouter(t)
+	rr := doLinkConfirm(t, r, access, `{"email":"link@example.com","sub":"google-sub-9"}`)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d (%s)", rr.Code, rr.Body.String())
+	}
+	if u := q.users["link@example.com"]; u == nil || u.GoogleSub != nil {
+		t.Errorf("no account mutation allowed when id_token missing")
+	}
+}
+
+func TestLinkGoogleConfirm_WrongSubRejected(t *testing.T) {
+	r, _, q, access := setupLinkRouter(t)
+	// Verified token's sub differs from the requested sub.
+	rr := doLinkConfirm(t, r, access, `{"email":"link@example.com","sub":"attacker-sub","id_token":"any"}`)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d (%s)", rr.Code, rr.Body.String())
+	}
+	if u := q.users["link@example.com"]; u == nil || u.GoogleSub != nil {
+		t.Errorf("no account mutation allowed on sub mismatch")
+	}
+}
+
+func TestLinkGoogleConfirm_WrongEmailRejected(t *testing.T) {
+	r, _, q, access := setupLinkRouter(t)
+	// Session user (link@example.com) attempts to link onto another account.
+	rr := doLinkConfirm(t, r, access, `{"email":"victim@example.com","sub":"google-sub-9","id_token":"any"}`)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d (%s)", rr.Code, rr.Body.String())
+	}
+	if u := q.users["link@example.com"]; u == nil || u.GoogleSub != nil {
+		t.Errorf("no account mutation allowed on email mismatch")
+	}
+}
+
+func TestLinkGoogleConfirm_LegitFlowIssuesTokens(t *testing.T) {
+	r, _, q, access := setupLinkRouter(t)
+	rr := doLinkConfirm(t, r, access, `{"email":"link@example.com","sub":"google-sub-9","id_token":"any"}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (%s)", rr.Code, rr.Body.String())
+	}
+	if u := q.users["link@example.com"]; u == nil || u.GoogleSub == nil || *u.GoogleSub != "google-sub-9" {
+		t.Errorf("google_sub not set on legit flow: %+v", u)
+	}
+	if rr.Header().Get("X-Access-Token") == "" {
+		t.Errorf("expected X-Access-Token header on successful link")
+	}
+	var refresh *http.Cookie
+	for _, c := range rr.Result().Cookies() {
+		if c.Name == "refresh_token" {
+			refresh = c
+		}
+	}
+	if refresh == nil || refresh.Value == "" {
+		t.Errorf("expected refresh_token cookie on successful link")
 	}
 }

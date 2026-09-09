@@ -33,16 +33,16 @@ const (
 // FeedFilters models every query-string parameter accepted by /feed and
 // /saved (with mode-specific overrides applied by the builder).
 type FeedFilters struct {
-	Channels      []string // platform_channels.id (UUID strings)
-	Categories    []string // category enum values
-	InsightType   string   // filter by insight type (JSONB containment)
-	DateFrom      *time.Time
-	DateTo        *time.Time
-	Search        *string
-	IncludeToxic  bool
-	Limit         int
-	Offset        int
-	Sort          string // "newest" | "oldest"
+	Channels     []string // platform_channels.id (UUID strings)
+	Categories   []string // category enum values
+	InsightType  string   // filter by insight type (JSONB containment)
+	DateFrom     *time.Time
+	DateTo       *time.Time
+	Search       *string
+	IncludeToxic bool
+	Limit        int
+	Offset       int
+	Sort         string // "newest" | "oldest"
 }
 
 // HighSignalCategories is the default category set applied when the caller
@@ -61,8 +61,8 @@ var ToxicCategories = map[string]struct{}{
 // AllowedSorts enumerates the sort modes accepted on /feed. /saved overrides
 // the sort internally and so is not constrained by this set.
 var AllowedSorts = map[string]string{
-	"newest":  "ORDER BY c.posted_at DESC",
-	"oldest":  "ORDER BY c.posted_at ASC",
+	"newest": "ORDER BY c.posted_at DESC",
+	"oldest": "ORDER BY c.posted_at ASC",
 }
 
 // applyToxicLayer enforces the two-layer toxic filter described in
@@ -112,8 +112,9 @@ func BuildFeedQuery(userID string, filters FeedFilters, mode FeedMode) (string, 
 	case ModeFeed, ModeSaved, ModeStream:
 		projection = `c.id, c.platform_channel_id, c.platform_comment_id, c.parent_comment_id, c.reply_depth,
 			c.author_handle, c.body, c.posted_at, c.category, c.actionable_insights,
-			c.topic, c.confidence, c.processed_at, c.created_at,
+			c.topic, c.confidence, c.video_id, c.video_title, c.processed_at, c.created_at,
 			pc.display_name AS channel_name,
+			pc.platform_channel_id AS platform_id,
 			EXISTS (SELECT 1 FROM user_comment_stars ucs
 			        WHERE ucs.user_id = $1 AND ucs.comment_id = c.id) AS is_starred`
 	}
@@ -123,10 +124,7 @@ func BuildFeedQuery(userID string, filters FeedFilters, mode FeedMode) (string, 
 	// tracking_status IN ('active','paused') so paused channels remain
 	// readable (consistent with the source spec's "still see your data").
 	from := `comments c
-		JOIN platform_channels pc ON pc.id = c.platform_channel_id
-		JOIN user_channel_tracking uct ON uct.platform_channel_id = pc.id
-		   AND uct.user_id = $1
-		   AND uct.tracking_status IN ('active','paused')`
+		JOIN platform_channels pc ON pc.id = c.platform_channel_id`
 	if mode == ModeSaved {
 		// Inner-join through user_comment_stars to scope the result set to
 		// only rows the caller has starred.
@@ -136,7 +134,7 @@ func BuildFeedQuery(userID string, filters FeedFilters, mode FeedMode) (string, 
 	}
 
 	// --- WHERE ------------------------------------------------------------
-	where := []string{"c.processed_at IS NOT NULL"}
+	where := []string{"(EXISTS(SELECT 1 FROM user_channel_tracking uct WHERE uct.platform_channel_id=pc.id AND uct.user_id=$1 AND uct.tracking_status IN ('active','paused')) OR EXISTS(SELECT 1 FROM channel_grants cg JOIN workspace_members wm ON wm.workspace_id=cg.workspace_id WHERE cg.channel_id=pc.id AND wm.user_id=$1))", "c.processed_at IS NOT NULL"}
 
 	// Effective category list after the two-layer toxic rule.
 	effectiveCats, explicitCats := applyToxicLayer(filters.Categories, filters.IncludeToxic)

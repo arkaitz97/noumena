@@ -210,6 +210,67 @@ func (q *SQLiteQuery) GetStalePendingDigests(ctx context.Context, olderThan time
 	return out, rows.Err()
 }
 
+// GetDeferredDigestsDue returns deferred digests old enough to retry but not yet expired.
+func (q *SQLiteQuery) GetDeferredDigestsDue(ctx context.Context, now time.Time, limit int) ([]*WeeklyDigest, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	retryAfter := now.Add(-24 * time.Hour).Format(time.RFC3339)
+	expireAfter := now.Add(-7 * 24 * time.Hour).Format(time.RFC3339)
+	const sqlStr = `
+		SELECT id, user_id, week_start_date, status,
+		       COALESCE(content, ''), emailed_at, created_at
+		FROM weekly_digests
+		WHERE status = 'deferred' AND created_at <= ? AND created_at > ?
+		ORDER BY created_at ASC
+		LIMIT ?
+	`
+	rows, err := q.db.QueryContext(ctx, sqlStr, retryAfter, expireAfter, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*WeeklyDigest
+	for rows.Next() {
+		d, err := scanWeeklyDigestRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// GetWeeklyDigestByID fetches a single digest row.
+func (q *SQLiteQuery) GetWeeklyDigestByID(ctx context.Context, digestID string) (*WeeklyDigest, error) {
+	const sqlStr = `
+		SELECT id, user_id, week_start_date, status,
+		       COALESCE(content, ''), emailed_at, created_at
+		FROM weekly_digests
+		WHERE id = ?
+		LIMIT 1
+	`
+	return scanWeeklyDigest(q.db.QueryRowContext(ctx, sqlStr, digestID))
+}
+
+// GetMissingDigestWeeks returns week_starts (YYYY-MM-DD Mondays) in [since, until) with no digest row for user.
+func (q *SQLiteQuery) GetMissingDigestWeeks(ctx context.Context, userID string, weeks []time.Time) ([]time.Time, error) {
+	var out []time.Time
+	for _, w := range weeks {
+		ws := w.UTC().Format("2006-01-02")
+		var exists bool
+		if err := q.db.QueryRowContext(ctx,
+			`SELECT EXISTS (SELECT 1 FROM weekly_digests WHERE user_id = ? AND week_start_date = ?)`,
+			userID, ws).Scan(&exists); err != nil {
+			return nil, err
+		}
+		if !exists {
+			out = append(out, w)
+		}
+	}
+	return out, nil
+}
+
 func (q *SQLiteQuery) UpdateUserDigestOptIn(ctx context.Context, userID string, optIn bool) error {
 	_, err := q.db.ExecContext(ctx,
 		`UPDATE users SET digest_email_opt_in = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?`,

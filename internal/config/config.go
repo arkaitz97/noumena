@@ -2,21 +2,31 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
 // Config holds runtime configuration loaded from environment variables.
 type Config struct {
 	// Auth / JWT
-	JWTSecret            []byte
-	JWTAccessTTL         time.Duration
-	JWTRefreshTTL        time.Duration
-	BcryptCost           int
-	EmailVerificationTTL time.Duration
-	PasswordResetTTL     time.Duration
-	AppBaseURL           string
+	JWTSecret                 []byte
+	JWTAccessTTL              time.Duration
+	JWTRefreshTTL             time.Duration
+	BcryptCost                int
+	EmailVerificationTTL      time.Duration
+	EmailVerificationRequired bool
+	PasswordResetTTL          time.Duration
+	AppBaseURL                string
+
+	// Encryption keys (fix-crypto-http-hardening). ENCRYPTION_KEY is
+	// mandatory and validated in Load(); ENCRYPTION_KEY_PREVIOUS is
+	// optional and only used for decryption during key rotation. Values
+	// are used as raw AES key bytes: 16, 24, or 32 bytes.
+	EncryptionKey         []byte
+	EncryptionKeyPrevious []byte
 
 	// Google SSO (separate OAuth client from YouTube)
 	GoogleSSOClientID     string
@@ -46,10 +56,15 @@ type Config struct {
 	IngestionJobDeadline         time.Duration
 	IngestionMaxConcurrency      int
 	IngestionDeadLetterAlertTo   string
+	// YouTubeAPIKey enables key-based (OAuth-free) ingestion reads: when set,
+	// the worker skips per-user OAuth token acquisition for search.list /
+	// commentThreads.list / comments.list. Public-data only.
+	YouTubeAPIKey string
 
 	// LLM batch-processing (llm-processing change)
 	LLMProcessorEnabled       bool
 	LLMProcessorTickInterval  time.Duration
+	LLMProcessorBatchTimeout  time.Duration
 	LLMBatchSize              int
 	LLMConfidenceThreshold    float64
 	LLMProcessorShutdownGrace time.Duration
@@ -71,31 +86,42 @@ type Config struct {
 
 	// Billing (billing change). All Stripe-related values are required only
 	// when BillingEnabled = true. Load() validates this; see task 2.4.
-	BillingEnabled              bool
-	StripeSecretKey             string
-	StripeWebhookSecret         string
-	StripePriceCreatorMonthly   string
-	StripePriceCreatorAnnual    string
-	StripePriceStudioMonthly    string
-	StripePriceStudioAnnual     string
-	StripePriceAgencyMonthly    string
-	StripePriceAgencyAnnual     string
-	BillingCheckoutSuccessURL   string
-	BillingCheckoutCancelURL    string
+	BillingEnabled            bool
+	StripeSecretKey           string
+	StripeWebhookSecret       string
+	StripePriceCreatorMonthly string
+	StripePriceCreatorAnnual  string
+	StripePriceStudioMonthly  string
+	StripePriceStudioAnnual   string
+	StripePriceAgencyMonthly  string
+	StripePriceAgencyAnnual   string
+	BillingCheckoutSuccessURL string
+	BillingCheckoutCancelURL  string
+	// BillingOverageInvoicingEnabled gates the overage-invoicing cron
+	// (implement-missing-product-features 8.x). Default false: rollout in
+	// Stripe test mode only, per the change roadmap.
+	BillingOverageInvoicingEnabled bool
+
+	// LLM provider failover (implement-missing-product-features 6.x).
+	// LLMPrimaryProvider is the default provider (opencode|openai|anthropic);
+	// LLMFallbackProvider empty means no fallback. Consumers: internal/llm.
+	LLMPrimaryProvider  string
+	LLMFallbackProvider string
 
 	// Transactional email pipeline (data-lifecycle change). When EmailEnabled
 	// is false every call to email.Send is a logged no-op and no row is
 	// written to email_send_log; this is the documented rollout/rollback
 	// switch (design.md, Migration Plan).
-	EmailEnabled       bool
-	EmailProvider      string // "smtp" today; reserved for future provider expansion
-	EmailFromAddress   string
-	EmailFromName      string
-	SMTPHost           string
-	SMTPPort           int
-	SMTPUsername       string
-	SMTPPassword       string
-	AppSupportEmail    string
+	EmailEnabled     bool
+	EmailProvider    string // "smtp" today; reserved for future provider expansion
+	EmailFromAddress string
+	EmailFromName    string
+	SMTPHost         string
+	SMTPPort         int
+	SMTPUsername     string
+	SMTPPassword     string
+	SMTPCmdTimeout   time.Duration
+	AppSupportEmail  string
 
 	// Lifecycle workers (data-lifecycle change). When LifecycleWorkersEnabled
 	// is false the deletion + export + cleanup goroutines are not started;
@@ -122,10 +148,22 @@ type Config struct {
 	OTELResourceAttributes   string
 
 	// Rate limiting (spec-gap-improvements). PostgreSQL-backed sliding window.
-	RateLimitEnabled          bool
-	RateLimitAuthMaxPerMin    int
-	RateLimitUnauthMaxPerMin  int
-	RateLimitCleanupTick      time.Duration
+	RateLimitEnabled         bool
+	RateLimitAuthMaxPerMin   int
+	RateLimitUnauthMaxPerMin int
+	RateLimitCleanupTick     time.Duration
+
+	// HTTP hardening (fix-crypto-http-hardening).
+	// TrustProxyHeader: when non-empty, the client IP is read from this
+	// single header (set by the reverse proxy) instead of client-supplied
+	// X-Forwarded-For. Empty means trust RemoteAddr only.
+	TrustProxyHeader string
+	// MaxBodyBytes caps every request body (http.MaxBytesReader). The
+	// Stripe webhook keeps its own stricter cap.
+	MaxBodyBytes int64
+	// CSPHeader is the Content-Security-Policy sent on every response;
+	// empty disables the header.
+	CSPHeader string
 
 	// Cookie security. Secure cookies require HTTPS; set false for local HTTP dev.
 	CookieSecure bool
@@ -139,6 +177,7 @@ var Default = &Config{
 	JWTRefreshTTL:             720 * time.Hour, // 30 days
 	BcryptCost:                12,
 	EmailVerificationTTL:      24 * time.Hour,
+	EmailVerificationRequired: true,
 	PasswordResetTTL:          1 * time.Hour,
 	AppBaseURL:                "http://localhost:3000",
 	ChannelDeletionGraceHours: 24,
@@ -156,6 +195,7 @@ var Default = &Config{
 	// LLM processor defaults from llm-processing/proposal.md.
 	LLMProcessorEnabled:       false, // gated until smoke-tested
 	LLMProcessorTickInterval:  10 * time.Second,
+	LLMProcessorBatchTimeout:  30 * time.Second,
 	LLMBatchSize:              50,
 	LLMConfidenceThreshold:    0.7,
 	LLMProcessorShutdownGrace: 30 * time.Second,
@@ -180,6 +220,7 @@ var Default = &Config{
 	// workers in isolation.
 	EmailEnabled:               false,
 	EmailProvider:              "smtp",
+	SMTPCmdTimeout:             10 * time.Second,
 	LifecycleWorkersEnabled:    false,
 	AccountLifecycleAPIEnabled: false,
 	ExportStorageDir:           "/var/lib/noumena/data-exports",
@@ -200,23 +241,70 @@ var Default = &Config{
 	RateLimitUnauthMaxPerMin: 10,
 	RateLimitCleanupTick:     5 * time.Minute,
 
+	// HTTP hardening defaults (fix-crypto-http-hardening). No proxy header
+	// is trusted by default (RemoteAddr only), global body cap is 2 MiB,
+	// and a base CSP is emitted. Override with env vars.
+	TrustProxyHeader: "",
+	MaxBodyBytes:     2 << 20, // 2 MiB
+	CSPHeader:        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; media-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
+
 	// Cookie security. Secure by default (HTTPS only); set COOKIE_SECURE=false for local HTTP dev.
 	CookieSecure: true,
+
+	// implement-missing-product-features defaults.
+	// Overage invoicing is a Stripe test-mode-only rollout: off by default.
+	BillingOverageInvoicingEnabled: false,
+	// LLM provider failover: OpenCode remains the sole default provider;
+	// LLMFallbackProvider empty = no fallback (backward compatible).
+	LLMPrimaryProvider:  "opencode",
+	LLMFallbackProvider: "",
 }
 
 // Load reads configuration from environment variables, applying defaults
-// where values are missing. It returns an error if any *required* value
-// (currently: JWT_SECRET in production) is missing or malformed.
+// where values are missing. It returns an error if any *required* value is
+// missing or malformed.
 //
-// strict=true causes Load to fail when required values are absent. Pass false
-// in dev/test bootstrap if you want to fall back to insecure defaults.
+// JWT_SECRET safety is unconditional (not gated by strict): the server must
+// never boot with a missing, placeholder, or weak signing key — see
+// fix-auth-critical-security. strict=true additionally fails on other missing
+// required values (APP_BASE_URL, Google/YouTube OAuth config).
 func Load(strict bool) (*Config, error) {
 	c := *Default // copy of defaults
 
-	if v := os.Getenv("JWT_SECRET"); v != "" {
-		c.JWTSecret = []byte(v)
-	} else if strict {
-		return nil, fmt.Errorf("JWT_SECRET is required")
+	// --- Mandatory JWT signing secret --------------------------------------
+	// Unconditional: a forgeable signing key is a critical vulnerability, so
+	// validation happens regardless of STRICT_CONFIG.
+	secret := os.Getenv("JWT_SECRET")
+	if secret == "" {
+		return nil, fmt.Errorf("JWT_SECRET is required (generate one with: openssl rand -base64 32)")
+	}
+	if strings.Contains(secret, "change-me") || strings.Contains(secret, "replace-me") {
+		return nil, fmt.Errorf("JWT_SECRET must not be the legacy default or a placeholder value")
+	}
+	if len(secret) < 32 {
+		return nil, fmt.Errorf("JWT_SECRET must be at least 32 bytes, got %d", len(secret))
+	}
+	c.JWTSecret = []byte(secret)
+	// Warning only: trivially low entropy (all one character) is technically
+	// valid length-wise but should never appear in a real deployment.
+	if strings.Trim(secret, secret[:1]) == "" {
+		log.Printf("WARN: JWT_SECRET has trivially low entropy (single repeated character); generate one with: openssl rand -base64 32")
+	}
+
+	// --- Mandatory encryption key -----------------------------------------
+	// ENCRYPTION_KEY encrypts OAuth tokens at rest. Unconditional (like
+	// JWT_SECRET): there is no hardcoded fallback, so the server must never
+	// boot without a real key — see fix-crypto-http-hardening. Values are
+	// used as raw AES key bytes, so a valid AES key size is required.
+	if err := validateEncryptionKey(os.Getenv("ENCRYPTION_KEY")); err != nil {
+		return nil, err
+	}
+	c.EncryptionKey = []byte(os.Getenv("ENCRYPTION_KEY"))
+	if prev := os.Getenv("ENCRYPTION_KEY_PREVIOUS"); prev != "" {
+		if err := validateEncryptionKey(prev); err != nil {
+			return nil, fmt.Errorf("ENCRYPTION_KEY_PREVIOUS: %w", err)
+		}
+		c.EncryptionKeyPrevious = []byte(prev)
 	}
 
 	if v := os.Getenv("JWT_ACCESS_TTL"); v != "" {
@@ -252,6 +340,10 @@ func Load(strict bool) (*Config, error) {
 			return nil, fmt.Errorf("EMAIL_VERIFICATION_TTL: %w", err)
 		}
 		c.EmailVerificationTTL = d
+	}
+
+	if v := os.Getenv("EMAIL_VERIFICATION_REQUIRED"); v != "" {
+		c.EmailVerificationRequired = v == "1" || v == "true" || v == "yes"
 	}
 
 	if v := os.Getenv("PASSWORD_RESET_TTL"); v != "" {
@@ -358,6 +450,7 @@ func Load(strict bool) (*Config, error) {
 		c.IngestionMaxConcurrency = n
 	}
 	c.IngestionDeadLetterAlertTo = os.Getenv("INGESTION_DEAD_LETTER_ALERT_TO")
+	c.YouTubeAPIKey = os.Getenv("YOUTUBE_API_KEY")
 
 	// --- LLM processing ----------------------------------------------------
 	if v := os.Getenv("LLM_PROCESSOR_ENABLED"); v != "" {
@@ -369,6 +462,13 @@ func Load(strict bool) (*Config, error) {
 			return nil, fmt.Errorf("LLM_PROCESSOR_TICK_INTERVAL: %w", err)
 		}
 		c.LLMProcessorTickInterval = d
+	}
+	if v := os.Getenv("LLM_PROCESSOR_BATCH_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return nil, fmt.Errorf("LLM_PROCESSOR_BATCH_TIMEOUT must be a positive duration")
+		}
+		c.LLMProcessorBatchTimeout = d
 	}
 	if v := os.Getenv("LLM_BATCH_SIZE"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -398,6 +498,14 @@ func Load(strict bool) (*Config, error) {
 	if v := os.Getenv("OPENCODE_MODEL"); v != "" {
 		c.OpenCodeModel = v
 	}
+
+	// --- LLM provider failover (implement-missing-product-features 6.4) ----
+	// LLM_PRIMARY defaults to "opencode" (sole provider today); LLM_FALLBACK
+	// empty = no failover. Values validated by the LLM package consumers.
+	if v := os.Getenv("LLM_PRIMARY"); v != "" {
+		c.LLMPrimaryProvider = v
+	}
+	c.LLMFallbackProvider = os.Getenv("LLM_FALLBACK")
 
 	// --- Insights API ------------------------------------------------------
 	if v := os.Getenv("INSIGHTS_API_ENABLED"); v != "" {
@@ -473,6 +581,9 @@ func Load(strict bool) (*Config, error) {
 	c.StripePriceAgencyAnnual = os.Getenv("STRIPE_PRICE_AGENCY_ANNUAL")
 	c.BillingCheckoutSuccessURL = os.Getenv("BILLING_CHECKOUT_SUCCESS_URL")
 	c.BillingCheckoutCancelURL = os.Getenv("BILLING_CHECKOUT_CANCEL_URL")
+	if v := os.Getenv("BILLING_OVERAGE_INVOICING_ENABLED"); v != "" {
+		c.BillingOverageInvoicingEnabled = v == "1" || v == "true" || v == "yes"
+	}
 
 	// Task 2.4: when billing is enabled all Stripe vars are mandatory.
 	if c.BillingEnabled {
@@ -517,6 +628,13 @@ func Load(strict bool) (*Config, error) {
 	}
 	c.SMTPUsername = os.Getenv("SMTP_USERNAME")
 	c.SMTPPassword = os.Getenv("SMTP_PASSWORD")
+	if v := os.Getenv("SMTP_CMD_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return nil, fmt.Errorf("SMTP_CMD_TIMEOUT must be a positive duration (e.g. 10s)")
+		}
+		c.SMTPCmdTimeout = d
+	}
 	c.AppSupportEmail = os.Getenv("APP_SUPPORT_EMAIL")
 
 	if c.EmailEnabled {
@@ -649,12 +767,39 @@ func Load(strict bool) (*Config, error) {
 		c.RateLimitCleanupTick = d
 	}
 
+	// --- HTTP hardening (fix-crypto-http-hardening) ----------------------
+	c.TrustProxyHeader = os.Getenv("TRUST_PROXY_HEADER")
+	if v := os.Getenv("MAX_BODY_BYTES"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("MAX_BODY_BYTES must be a positive integer")
+		}
+		c.MaxBodyBytes = n
+	}
+	if v := os.Getenv("SECURITY_CSP"); v != "" {
+		c.CSPHeader = v
+	}
+
 	if v := os.Getenv("COOKIE_SECURE"); v != "" {
 		c.CookieSecure = v == "1" || v == "true" || v == "yes"
 	}
 
 	Default = &c
 	return &c, nil
+}
+
+// validateEncryptionKey rejects empty or invalid-size AES keys. The env
+// value is used as raw key bytes (16/24/32 bytes for AES-128/192/256).
+func validateEncryptionKey(key string) error {
+	if key == "" {
+		return fmt.Errorf("ENCRYPTION_KEY is required (generate one with: openssl rand -base64 24; 16/24/32-byte raw value)")
+	}
+	switch len(key) {
+	case 16, 24, 32:
+		return nil
+	default:
+		return fmt.Errorf("ENCRYPTION_KEY must be 16, 24, or 32 bytes (got %d bytes)", len(key))
+	}
 }
 
 // EnsureExportDir validates that the configured EXPORT_DIR exists and is

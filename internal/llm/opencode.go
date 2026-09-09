@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // opencodeClient is a hand-rolled OpenAI-compatible client targeted at the
@@ -26,6 +28,9 @@ type opencodeClient struct {
 	baseURL    string
 	apiKey     string
 	model      string
+	// sessionID is a stable per-client ID sent as x-opencode-session. OpenCode
+	// Go (zen/go) requires it (2026-09-06+) for request routing + token caching.
+	sessionID string
 }
 
 // NewOpenCodeClient constructs an LLMClient backed by the OpenCode HTTP API.
@@ -42,6 +47,7 @@ func NewOpenCodeClient(apiKey, baseURL, model string) *opencodeClient {
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		apiKey:     apiKey,
 		model:      model,
+		sessionID:  uuid.NewString(),
 	}
 }
 
@@ -63,6 +69,7 @@ func newOpenCodeClientWithHTTP(client *http.Client, baseURL, apiKey, model strin
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		apiKey:     apiKey,
 		model:      model,
+		sessionID:  uuid.NewString(),
 	}
 }
 
@@ -120,6 +127,7 @@ func (c *opencodeClient) doOnceDigest(ctx context.Context, endpoint string, body
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("x-opencode-session", c.sessionID)
 	if c.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
@@ -153,9 +161,9 @@ func (c *opencodeClient) doOnceDigest(ctx context.Context, endpoint string, body
 // chatCompletionRequest mirrors the small subset of the OpenAI-compatible
 // /v1/chat/completions request body that we actually populate.
 type opencodeChatRequest struct {
-	Model       string                  `json:"model"`
-	Messages    []opencodeChatMessage   `json:"messages"`
-	Temperature float64                 `json:"temperature"`
+	Model       string                `json:"model"`
+	Messages    []opencodeChatMessage `json:"messages"`
+	Temperature float64               `json:"temperature"`
 }
 
 type opencodeChatMessage struct {
@@ -229,6 +237,7 @@ func (c *opencodeClient) doOnce(ctx context.Context, endpoint string, body []byt
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("x-opencode-session", c.sessionID)
 	if c.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}

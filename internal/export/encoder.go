@@ -23,6 +23,7 @@ var CSVHeader = []string{
 	"id", "channel_name", "author_handle", "body",
 	"posted_at", "category", "actionable_insights",
 	"topic", "confidence", "processed_at",
+	"video_id", "video_title",
 }
 
 // rowValues converts a feed row into the documented CSV column order.
@@ -51,6 +52,14 @@ func rowValues(r *db.FeedRow) []string {
 	if r.ProcessedAt != nil {
 		processedAt = r.ProcessedAt.UTC().Format(time.RFC3339)
 	}
+	videoID := ""
+	if r.VideoID != nil {
+		videoID = *r.VideoID
+	}
+	videoTitle := ""
+	if r.VideoTitle != nil {
+		videoTitle = *r.VideoTitle
+	}
 	return []string{
 		r.ID,
 		r.ChannelName,
@@ -62,6 +71,8 @@ func rowValues(r *db.FeedRow) []string {
 		topic,
 		confidence,
 		processedAt,
+		videoID,
+		videoTitle,
 	}
 }
 
@@ -92,32 +103,36 @@ func EncodeCSV(w io.Writer, rows <-chan *db.FeedRow) (int64, error) {
 
 // jsonExportRow mirrors the /feed object shape MINUS is_starred. Task 10.2.
 type jsonExportRow struct {
-	ID                string     `json:"id"`
-	PlatformChannelID string     `json:"platform_channel_id"`
-	ChannelName       string     `json:"channel_name"`
-	AuthorHandle      *string    `json:"author_handle,omitempty"`
-	Body              string     `json:"body"`
-	PostedAt          time.Time  `json:"posted_at"`
-	Category          *string    `json:"category,omitempty"`
-	ActionableInsights []byte    `json:"actionable_insights,omitempty"`
-	Topic             *string    `json:"topic,omitempty"`
-	Confidence        *float64   `json:"confidence,omitempty"`
-	ProcessedAt       *time.Time `json:"processed_at,omitempty"`
+	ID                 string     `json:"id"`
+	PlatformChannelID  string     `json:"platform_channel_id"`
+	ChannelName        string     `json:"channel_name"`
+	AuthorHandle       *string    `json:"author_handle,omitempty"`
+	Body               string     `json:"body"`
+	PostedAt           time.Time  `json:"posted_at"`
+	Category           *string    `json:"category,omitempty"`
+	ActionableInsights json.RawMessage `json:"actionable_insights,omitempty"`
+	Topic              *string    `json:"topic,omitempty"`
+	Confidence         *float64   `json:"confidence,omitempty"`
+	VideoID            *string    `json:"video_id,omitempty"`
+	VideoTitle         *string    `json:"video_title,omitempty"`
+	ProcessedAt        *time.Time `json:"processed_at,omitempty"`
 }
 
 func toJSONRow(r *db.FeedRow) jsonExportRow {
 	return jsonExportRow{
-		ID:                r.ID,
-		PlatformChannelID: r.PlatformChannelID,
-		ChannelName:       r.ChannelName,
-		AuthorHandle:      r.AuthorHandle,
-		Body:              r.Body,
-		PostedAt:          r.PostedAt,
-		Category:          r.Category,
+		ID:                 r.ID,
+		PlatformChannelID:  r.PlatformChannelID,
+		ChannelName:        r.ChannelName,
+		AuthorHandle:       r.AuthorHandle,
+		Body:               r.Body,
+		PostedAt:           r.PostedAt,
+		Category:           r.Category,
 		ActionableInsights: r.ActionableInsights,
-		Topic:             r.Topic,
-		Confidence:        r.Confidence,
-		ProcessedAt:       r.ProcessedAt,
+		Topic:              r.Topic,
+		Confidence:         r.Confidence,
+		VideoID:            r.VideoID,
+		VideoTitle:         r.VideoTitle,
+		ProcessedAt:        r.ProcessedAt,
 	}
 }
 
@@ -151,6 +166,18 @@ func EncodeJSON(w io.Writer, rows <-chan *db.FeedRow) (int64, error) {
 	return count, nil
 }
 
+// parseFeedTime converts a SQLite TEXT timestamp (RFC3339, as stored by
+// strftime('%Y-%m-%dT%H:%M:%SZ')) into time.Time. The modernc driver
+// returns the column as a string; parsing explicitly keeps the export
+// cursor independent of driver time-format pragmas.
+func parseFeedTime(s sql.NullString) time.Time {
+	if !s.Valid {
+		return time.Time{}
+	}
+	t, _ := time.Parse(time.RFC3339, s.String)
+	return t
+}
+
 // StreamExport opens a SQLite query with BuildFeedQuery(ModeStream),
 // fans rows into a channel, and dispatches to the requested encoder. The
 // row channel decouples the DB cursor from the encoder so the encoder can
@@ -169,14 +196,38 @@ func StreamExport(ctx context.Context, pool *sql.DB, userID string, filters db.F
 		defer close(rowCh)
 		for rows.Next() {
 			r := &db.FeedRow{}
+			var isStarredInt int
+			var actionableInsights sql.NullString
+			var postedAt, processedAt, createdAt sql.NullString
+			var videoID, videoTitle sql.NullString
 			if err := rows.Scan(
-				&r.ID, &r.PlatformChannelID, &r.PlatformCommentID, &r.ParentCommentID,
-				&r.AuthorHandle, &r.Body, &r.PostedAt, &r.Category, &r.ActionableInsights,
-				&r.Topic, &r.Confidence, &r.ProcessedAt, &r.CreatedAt,
-				&r.ChannelName, &r.IsStarred,
+				&r.ID, &r.PlatformChannelID, &r.PlatformCommentID, &r.ParentCommentID, &r.ReplyDepth,
+				&r.AuthorHandle, &r.Body, &postedAt, &r.Category, &actionableInsights,
+				&r.Topic, &r.Confidence, &videoID, &videoTitle, &processedAt, &createdAt,
+				&r.ChannelName, &r.PlatformID, &isStarredInt,
 			); err != nil {
 				errCh <- err
 				return
+			}
+			if actionableInsights.Valid {
+				r.ActionableInsights = []byte(actionableInsights.String)
+			}
+			if videoID.Valid {
+				v := videoID.String
+				r.VideoID = &v
+			}
+			if videoTitle.Valid {
+				v := videoTitle.String
+				r.VideoTitle = &v
+			}
+			r.IsStarred = isStarredInt != 0
+			r.PostedAt = parseFeedTime(postedAt)
+			if processedAt.Valid {
+				t := parseFeedTime(processedAt)
+				r.ProcessedAt = &t
+			}
+			if createdAt.Valid {
+				r.CreatedAt = parseFeedTime(createdAt)
 			}
 			select {
 			case rowCh <- r:
@@ -189,8 +240,8 @@ func StreamExport(ctx context.Context, pool *sql.DB, userID string, filters db.F
 	}()
 
 	var (
-		count   int64
-		encErr  error
+		count  int64
+		encErr error
 	)
 	switch format {
 	case "csv":

@@ -22,19 +22,19 @@ import (
 // author the body. The pipeline's render path validates the id is in
 // the registry before any DB write.
 const (
-	TemplateEmailVerification  = "email_verification"
-	TemplatePasswordReset      = "password_reset"
-	TemplateLoginLockout       = "login_lockout"
-	TemplateTokenExpiry        = "token_expiry"
-	TemplatePaymentFailed      = "payment_failed"
-	TemplatePaymentGraceFinal  = "payment_grace_final"
-	TemplateTrialExpiry        = "trial_expiry"
-	TemplateWeeklyDigest       = "weekly_digest"
-	TemplateDigestDelayed      = "digest_delayed"
-	TemplateExportReady        = "export_ready"
-	TemplateDeletionScheduled  = "deletion_scheduled"
-	TemplateDeletionCompleted  = "deletion_completed"
-	TemplatePlanDowngrade      = "plan_downgrade"
+	TemplateEmailVerification = "email_verification"
+	TemplatePasswordReset     = "password_reset"
+	TemplateLoginLockout      = "login_lockout"
+	TemplateTokenExpiry       = "token_expiry"
+	TemplatePaymentFailed     = "payment_failed"
+	TemplatePaymentGraceFinal = "payment_grace_final"
+	TemplateTrialExpiry       = "trial_expiry"
+	TemplateWeeklyDigest      = "weekly_digest"
+	TemplateDigestDelayed     = "digest_delayed"
+	TemplateExportReady       = "export_ready"
+	TemplateDeletionScheduled = "deletion_scheduled"
+	TemplateDeletionCompleted = "deletion_completed"
+	TemplatePlanDowngrade     = "plan_downgrade"
 )
 
 var TemplateIDs = []string{
@@ -63,11 +63,11 @@ type templateDef struct {
 }
 
 var (
-	templateMu      sync.RWMutex
-	templates       map[string]templateDef
-	parsedHTML      map[string]*html.Template
-	parsedSubject   map[string]*text.Template
-	parsedText      map[string]*text.Template
+	templateMu    sync.RWMutex
+	templates     map[string]templateDef
+	parsedHTML    map[string]*html.Template
+	parsedSubject map[string]*text.Template
+	parsedText    map[string]*text.Template
 )
 
 func ensureTemplatesLoaded() error {
@@ -169,6 +169,7 @@ func htmlLayout(body string) string {
 ` + body + `
 <div style="margin-top: 32px; padding-top: 16px; border-top: 1px solid #e5e5e5; font-size: 12px; color: #888;">
 <p>You received this email because you have an account at <a href="{{.AppBaseURL}}">{{.AppBaseURL}}</a>.</p>
+{{if .UnsubscribeURL}}<p><a href="{{.UnsubscribeURL}}">Unsubscribe from these emails</a></p>{{end}}
 <p>Questions? Reply to this email or contact <a href="mailto:{{.AppSupportEmail}}">{{.AppSupportEmail}}</a>.</p>
 </div>
 </body></html>`
@@ -181,7 +182,8 @@ func textLayout(body string) string {
 
 —
 You received this email because you have an account at {{.AppBaseURL}}.
-Questions? Reply to this email or contact {{.AppSupportEmail}}.
+{{if .UnsubscribeURL}}Unsubscribe from these emails: {{.UnsubscribeURL}}
+{{end}}Questions? Reply to this email or contact {{.AppSupportEmail}}.
 `
 }
 
@@ -287,7 +289,7 @@ To keep your channels syncing without interruption, choose a plan now: {{.Upgrad
 			html: `<p>Here's what happened across your tracked channels for the week of <strong>{{.WeekRange}}</strong>:</p>
 {{if .TopIdeas}}<h3>Top ideas</h3><ul>{{range .TopIdeas}}<li>{{.}}</li>{{end}}</ul>{{end}}
 {{if .TopQuestions}}<h3>Top questions</h3><ul>{{range .TopQuestions}}<li>{{.}}</li>{{end}}</ul>{{end}}
-<p><strong>Sentiment trend:</strong> {{.SentimentDirection}} ({{.SentimentChangePct}}% week-over-week)</p>
+{{if .SentimentDirection}}<p><strong>Sentiment trend:</strong> {{.SentimentDirection}} ({{.SentimentChangePct}}% week-over-week)</p>{{end}}
 <p><a href="{{.AppBaseURL}}/dashboard">View full digest →</a></p>`,
 			textRaw: `Here's what happened across your tracked channels for the week of {{.WeekRange}}:
 
@@ -297,7 +299,7 @@ To keep your channels syncing without interruption, choose a plan now: {{.Upgrad
 {{if .TopQuestions}}TOP QUESTIONS:
 {{range .TopQuestions}}- {{.}}
 {{end}}{{end}}
-Sentiment trend: {{.SentimentDirection}} ({{.SentimentChangePct}}% week-over-week)
+{{if .SentimentDirection}}Sentiment trend: {{.SentimentDirection}} ({{.SentimentChangePct}}% week-over-week){{end}}
 
 View full digest: {{.AppBaseURL}}/dashboard`,
 		},

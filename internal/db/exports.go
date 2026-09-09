@@ -121,6 +121,33 @@ func (q *SQLiteQuery) GetExport(ctx context.Context, userID, exportID string) (*
 	return exp, err
 }
 
+// ListExports returns the caller's most recent comment exports (newest
+// first). Backs the "Recent exports" list on the Account page
+// (fix-frontend-plumbing).
+func (q *SQLiteQuery) ListExports(ctx context.Context, userID string, limit int) ([]*Export, error) {
+	const sqlStr = `
+		SELECT id, user_id, format, filters, status, row_count, file_path, error, retry_count, created_at, started_at, completed_at, expires_at
+		FROM comment_exports
+		WHERE user_id = ?
+		ORDER BY created_at DESC
+		LIMIT ?
+	`
+	rows, err := q.db.QueryContext(ctx, sqlStr, userID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Export
+	for rows.Next() {
+		exp, err := scanExportRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, exp)
+	}
+	return out, rows.Err()
+}
+
 func (q *SQLiteQuery) ListExpiredExports(ctx context.Context) ([]*Export, error) {
 	const sqlStr = `
 		SELECT id, user_id, format, filters, status, row_count, file_path, error, retry_count, created_at, started_at, completed_at, expires_at

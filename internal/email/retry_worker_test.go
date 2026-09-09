@@ -75,30 +75,93 @@ func (s *fakeLogStore) ClaimPendingEmails(_ context.Context, _ time.Time, _ int)
 	s.rows = nil // claim once
 	return out, nil
 }
+func (s *fakeLogStore) GetEmailRowByIdempotencyKey(context.Context, string) (*db.EmailLogRow, error) {
+	return nil, nil
+}
 
-// TestRetryWorker_BudgetExhaustion verifies the 3-attempt cap: a row at
-// AttemptCount=2 is the LAST chance, so the next retry attempt becomes
-// attempt=3 and transitions the row to 'failed' instead of incrementing.
-//
-// 14.4: backoff timing is enforced by the DB query (next_attempt_at) and
-// is not the worker's responsibility — the worker only decides
-// increment-vs-fail based on the count it observes.
-func TestRetryWorker_BudgetExhaustion(t *testing.T) {
-	store := &fakeLogStore{}
-	// row currently at AttemptCount=2 → next attempt would be 3 → fail
-	store.rows = []*db.EmailLogRow{{
-		ID:           "row-fail",
-		Template:     TemplateLoginLockout,
-		AttemptCount: 2, // attempt+1=3 → cap reached
-	}}
+// stubSender records every Send invocation; failErr makes it fail.
+type stubSender struct {
+	mu    sync.Mutex
+	calls []sendCall
+	fail  error
+}
 
-	w := &RetryWorker{
+type sendCall struct {
+	to, subject, html, text string
+	headers                 []string
+}
+
+func (s *stubSender) Send(_ context.Context, _ string, to, subject, htmlBody, textBody string, headers []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, sendCall{to, subject, htmlBody, textBody, headers})
+	return s.fail
+}
+
+func newRetryWorker(store *fakeLogStore, sender *stubSender) *RetryWorker {
+	return &RetryWorker{
 		Queries: store,
+		Sender:  sender,
 		Logger:  log.New(io.Discard, "", 0),
 		Now:     func() time.Time { return time.Unix(0, 0) },
 	}
+}
+
+// Task 1.4: a pending row with a persisted recipient + body is actually
+// re-sent (stub sender), and success flips the row to sent.
+func TestRetryWorker_SendsPersistedBody(t *testing.T) {
+	store := &fakeLogStore{}
+	store.rows = []*db.EmailLogRow{{
+		ID:             "row-ok",
+		Template:       TemplateWeeklyDigest,
+		IdempotencyKey: "weekly_digest:dig-1",
+		AttemptCount:   1,
+		ToAddress:      "user@example.com",
+		Subject:        "Your weekly digest",
+		HTMLBody:       "<p>digest</p>",
+		TextBody:       "digest\n",
+	}}
+	sender := &stubSender{}
+	w := newRetryWorker(store, sender)
 	w.tickOnce(context.Background())
 
+	if len(sender.calls) != 1 {
+		t.Fatalf("expected 1 Send call, got %d", len(sender.calls))
+	}
+	c := sender.calls[0]
+	if c.to != "user@example.com" || c.subject != "Your weekly digest" ||
+		c.html != "<p>digest</p>" || c.text != "digest\n" {
+		t.Errorf("Send got unexpected payload: %+v", c)
+	}
+	if len(store.sentCalls) != 1 || store.sentCalls[0] != "row-ok" {
+		t.Errorf("expected MarkEmailSent(row-ok), got %v", store.sentCalls)
+	}
+	if len(store.failedCalls) != 0 || len(store.incCalls) != 0 {
+		t.Errorf("unexpected failed/inc calls: failed=%v inc=%v", store.failedCalls, store.incCalls)
+	}
+}
+
+// Task 1.5: repeated send failures exhaust the 3-attempt budget and the
+// row transitions to failed (terminal metric via recordEmailSent).
+func TestRetryWorker_BudgetExhaustion(t *testing.T) {
+	store := &fakeLogStore{}
+	// row at AttemptCount=2 → next attempt = 3 → cap reached
+	store.rows = []*db.EmailLogRow{{
+		ID:           "row-fail",
+		Template:     TemplateLoginLockout,
+		AttemptCount: 2,
+		ToAddress:    "user@example.com",
+		Subject:      "lockout",
+		HTMLBody:     "<p>locked</p>",
+		TextBody:     "locked",
+	}}
+	sender := &stubSender{fail: context.DeadlineExceeded}
+	w := newRetryWorker(store, sender)
+	w.tickOnce(context.Background())
+
+	if len(sender.calls) != 1 {
+		t.Fatalf("expected 1 Send attempt, got %d", len(sender.calls))
+	}
 	if len(store.failedCalls) != 1 {
 		t.Fatalf("expected 1 MarkEmailFailed call, got %d", len(store.failedCalls))
 	}
@@ -108,17 +171,37 @@ func TestRetryWorker_BudgetExhaustion(t *testing.T) {
 	if len(store.incCalls) != 0 {
 		t.Errorf("expected no IncrementEmailAttempt, got %d", len(store.incCalls))
 	}
+	if len(store.sentCalls) != 0 {
+		t.Errorf("expected no MarkEmailSent, got %v", store.sentCalls)
+	}
 }
 
-// TestRetryWorker_MissingRecipient verifies the early-return path: a row
-// with no recoverable recipient (UserID=nil) is short-circuited to
-// 'failed' without incrementing the attempt counter — operators must
-// re-trigger the originating event for a fresh log row.
-//
-// Note: the current implementation also marks failed when UserID IS
-// non-nil (the in-place "_ = ..." block falls through). This test
-// captures the actual current behavior; if future work adds real
-// recipient lookup, this test will need to be reconsidered.
+// Non-terminal failure bumps the attempt count instead of failing the row.
+func TestRetryWorker_DefersWithinBudget(t *testing.T) {
+	store := &fakeLogStore{}
+	store.rows = []*db.EmailLogRow{{
+		ID:           "row-defer",
+		Template:     TemplatePasswordReset,
+		AttemptCount: 1,
+		ToAddress:    "user@example.com",
+		Subject:      "reset",
+		HTMLBody:     "<p>reset</p>",
+		TextBody:     "reset",
+	}}
+	sender := &stubSender{fail: context.DeadlineExceeded}
+	w := newRetryWorker(store, sender)
+	w.tickOnce(context.Background())
+
+	if len(store.incCalls) != 1 || store.incCalls[0].Attempt != 2 {
+		t.Errorf("expected IncrementEmailAttempt to attempt 2, got %v", store.incCalls)
+	}
+	if len(store.failedCalls) != 0 {
+		t.Errorf("expected no MarkEmailFailed, got %v", store.failedCalls)
+	}
+}
+
+// Legacy rows without a persisted recipient cannot be re-sent; they are
+// marked failed so an operator can re-trigger the originating event.
 func TestRetryWorker_MissingRecipient(t *testing.T) {
 	uid := "user-1"
 	store := &fakeLogStore{}
@@ -126,16 +209,19 @@ func TestRetryWorker_MissingRecipient(t *testing.T) {
 		ID:           "row-norecip",
 		Template:     TemplatePasswordReset,
 		AttemptCount: 0,
-		UserID:       &uid, // takes the UserID-set early-return branch
+		UserID:       &uid,
 	}}
-	w := &RetryWorker{
-		Queries: store,
-		Logger:  log.New(io.Discard, "", 0),
-		Now:     func() time.Time { return time.Unix(0, 0) },
-	}
+	sender := &stubSender{}
+	w := newRetryWorker(store, sender)
 	w.tickOnce(context.Background())
 
+	if len(sender.calls) != 0 {
+		t.Errorf("expected no Send call, got %d", len(sender.calls))
+	}
 	if len(store.failedCalls) != 1 {
 		t.Fatalf("expected 1 MarkEmailFailed (no recipient), got %d", len(store.failedCalls))
+	}
+	if got := store.failedCalls[0].LastErr; got != "retry-without-recipient: original Send dropped recipient context" {
+		t.Errorf("unexpected LastErr: %q", got)
 	}
 }

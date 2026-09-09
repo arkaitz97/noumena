@@ -18,11 +18,14 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 
+	"noumena/internal/auth"
 	"noumena/internal/billing"
 	"noumena/internal/config"
 	"noumena/internal/db"
@@ -93,11 +96,11 @@ func (h *AccountHandler) DeleteAccount(w http.ResponseWriter, r *http.Request) {
 	// done here — it would lock the user out of cancelling) is left to
 	// the deletion worker once it actually starts deleting.
 	if user.DeletionRequestedAt == nil {
-		if _, err := h.exec(r, `UPDATE users SET deletion_requested_at = NOW() WHERE id = $1`, userID); err != nil {
+		if _, err := h.exec(r, `UPDATE users SET deletion_requested_at = `+db.NowUTC()+` WHERE id = ?`, userID); err != nil {
 			http.Error(w, "failed to mark deletion", http.StatusInternalServerError)
 			return
 		}
-		_ = h.Queries.InsertAuditLog(r.Context(), userID, "deletion_requested", `{"user_id":"`+userID+`"}`, r.RemoteAddr)
+		_ = h.Queries.InsertAuditLog(r.Context(), userID, "deletion_requested", `{"user_id":"`+userID+`"}`, clientIP(r, h.Cfg))
 	}
 
 	// Cancel the live Stripe subscription, if any. Errors are logged
@@ -181,7 +184,7 @@ func (h *AccountHandler) CancelAccountDeletion(w http.ResponseWriter, r *http.Re
 		http.Error(w, "failed to cancel deletion", http.StatusInternalServerError)
 		return
 	}
-	_ = h.Queries.InsertAuditLog(r.Context(), userID, "deletion_cancelled", `{"user_id":"`+userID+`"}`, r.RemoteAddr)
+	_ = h.Queries.InsertAuditLog(r.Context(), userID, "deletion_cancelled", `{"user_id":"`+userID+`"}`, clientIP(r, h.Cfg))
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -227,7 +230,7 @@ func (h *AccountHandler) GetExportStatus(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Content-Type", "application/json")
 	resp := map[string]any{"job_id": job.ID, "status": job.Status}
 	if job.Status == "completed" {
-		resp["download_url"] = job.DownloadURL
+		resp["download_url"] = job.ExportURL
 		resp["expires_at"] = job.ExpiresAt
 	}
 	_ = json.NewEncoder(w).Encode(resp)
@@ -253,7 +256,7 @@ func (h *AccountHandler) DownloadExport(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	job, err := h.Queries.GetDataExportJob(r.Context(), jobID)
-	if err != nil || job == nil || job.StoragePath == nil {
+	if err != nil || job == nil || job.ExportURL == nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
@@ -261,7 +264,10 @@ func (h *AccountHandler) DownloadExport(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "invalid or expired signature", http.StatusForbidden)
 		return
 	}
-	f, err := os.Open(*job.StoragePath)
+	// The DB stores only the signed URL; the local file path derives
+	// deterministically (see export_worker.go's layout).
+	zipPath := filepath.Join(h.Cfg.ExportStorageDir, job.UserID, jobID+".zip")
+	f, err := os.Open(zipPath)
 	if err != nil {
 		http.Error(w, "file not found", http.StatusNotFound)
 		return
@@ -270,6 +276,113 @@ func (h *AccountHandler) DownloadExport(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="noumena-export-%s.zip"`, jobID))
 	_, _ = io.Copy(w, f)
+}
+
+// ----------------------------------------------------------------------------
+// PATCH /api/user/me  (email change, fix-frontend-plumbing)
+// ----------------------------------------------------------------------------
+
+// emailRe is a simplified RFC-5322 lower bound — same shape the frontend
+// validates with.
+var emailRe = regexp.MustCompile(`^[^\s@]+@[^\s@]+\.[^\s@]+$`)
+
+// PatchProfile changes the caller's email. Contract:
+//   - Body: `{"email": "..."}`. Format must pass emailRe, and the address
+//     must not belong to another account (409 email_in_use).
+//   - The OLD email stays active until the NEW one verifies: we store a
+//     pending email-change token (email_change_tokens) and email the link
+//     to the new address. POST /auth/verify-email consumes either an
+//     account-verification token or an email-change token.
+//   - token_version is bumped (all sessions, incl. this one, are revoked)
+//     and email_verified_at is cleared, so the user re-authenticates with
+//     the old email and completes the change from the new inbox.
+func (h *AccountHandler) PatchProfile(w http.ResponseWriter, r *http.Request) {
+	userID, ok := r.Context().Value(UserIDKey).(string)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	var req struct {
+		Email string `json:"email"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	newEmail := strings.ToLower(strings.TrimSpace(req.Email))
+	if newEmail == "" {
+		http.Error(w, "email is required", http.StatusBadRequest)
+		return
+	}
+	if !emailRe.MatchString(newEmail) {
+		http.Error(w, "invalid email address", http.StatusBadRequest)
+		return
+	}
+
+	user, err := h.Queries.GetUserByID(r.Context(), userID)
+	if err != nil || user == nil {
+		http.Error(w, "user not found", http.StatusNotFound)
+		return
+	}
+	if strings.EqualFold(newEmail, user.Email) {
+		http.Error(w, "that is already your email", http.StatusBadRequest)
+		return
+	}
+	if existing, _ := h.Queries.GetUserByEmail(r.Context(), newEmail); existing != nil && existing.ID != userID {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"code":  "email_in_use",
+			"error": "that email is already in use",
+		})
+		return
+	}
+
+	// Revoke all existing sessions: the user re-authenticates with the old
+	// email until the new one verifies (consistent with password reset).
+	if err := h.Queries.IncrementTokenVersion(r.Context(), userID); err != nil {
+		http.Error(w, "failed to invalidate sessions", http.StatusInternalServerError)
+		return
+	}
+	// Account is unverified until the new address confirms.
+	if _, err := h.exec(r, `UPDATE users SET email_verified_at = NULL WHERE id = ?`, userID); err != nil {
+		http.Error(w, "failed to update profile", http.StatusInternalServerError)
+		return
+	}
+
+	// Replace any previous pending change, then store the new one.
+	if err := h.Queries.InvalidateEmailChangeTokensForUser(r.Context(), userID); err != nil {
+		http.Error(w, "failed to update profile", http.StatusInternalServerError)
+		return
+	}
+	raw, hash, err := auth.GenerateRefreshToken()
+	if err != nil {
+		http.Error(w, "failed to issue verification token", http.StatusInternalServerError)
+		return
+	}
+	expiresAt := time.Now().Add(config.Default.EmailVerificationTTL)
+	if err := h.Queries.InsertEmailChangeToken(r.Context(), userID, newEmail, hash, expiresAt); err != nil {
+		http.Error(w, "failed to store verification token", http.StatusInternalServerError)
+		return
+	}
+
+	if h.Pipeline != nil {
+		_ = h.Pipeline.Send(r.Context(), email.Message{
+			Template:       email.TemplateEmailVerification,
+			ToUserID:       userID,
+			ToAddress:      newEmail,
+			IdempotencyKey: "email_change:" + userID + ":" + newEmail,
+			Variables:      map[string]any{"VerifyURL": emailLink("/verify-email", raw)},
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":                  user.ID,
+		"email":               user.Email,
+		"email_verified":      false,
+		"pending_email":       newEmail,
+		"subscription_plan":   user.SubscriptionPlan,
+		"subscription_status": user.SubscriptionStatus,
+		"created_at":          user.CreatedAt,
+	})
 }
 
 // ----------------------------------------------------------------------------
@@ -292,11 +405,16 @@ func (h *AccountHandler) GetProfile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+	pendingEmail := ""
+	if ec, err := h.Queries.GetActiveEmailChange(r.Context(), userID); err == nil && ec != nil {
+		pendingEmail = ec.PendingEmail
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"id":                     user.ID,
 		"email":                  user.Email,
 		"email_verified":         user.EmailVerifiedAt != nil,
+		"pending_email":          pendingEmail,
 		"subscription_plan":      user.SubscriptionPlan,
 		"subscription_status":    user.SubscriptionStatus,
 		"deletion_requested_at":  user.DeletionRequestedAt,

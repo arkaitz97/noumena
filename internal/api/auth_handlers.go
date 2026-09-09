@@ -18,14 +18,21 @@ import (
 
 // AuthHandler bundles the dependencies for the /auth/* routes.
 type AuthHandler struct {
-	Queries     db.DBQuery
-	EmailClient email.Client
+	Queries      db.DBQuery
+	EmailClient  email.Client
 	CookieSecure bool
 
 	// OAuthExchanger lets tests inject a fake Google token-exchange + ID-token
 	// verifier in place of the real Google calls. Production code leaves this
 	// nil; auth_handlers.go falls back to oauth.ExchangeAndVerifyWithRedirect.
-	OAuthExchanger func(ctx context.Context, code, codeVerifier, redirectURI string) (*oauth.IDClaims, error)
+	// It returns the raw (server-verified) ID token plus its claims.
+	OAuthExchanger func(ctx context.Context, code, codeVerifier, redirectURI string) (string, *oauth.IDClaims, error)
+
+	// IDTokenVerifier verifies a client-supplied Google ID token (RS256, aud,
+	// iss, exp) for the account-linking endpoint. Production code leaves this
+	// nil; auth_handlers.go falls back to oauth.VerifyIDToken. Tests inject a
+	// fake to avoid live JWKS lookups.
+	IDTokenVerifier func(ctx context.Context, idToken string) (*oauth.IDClaims, error)
 
 	// DefaultWorkspaceCreator is called after a new user registers to create
 	// their default workspace (multi-seat workspaces change). Nil skips.
@@ -149,14 +156,18 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 	}
 	setRefreshTokenCookie(w, refreshRaw, refreshExp, h.CookieSecure)
 
-	// Issue verification token + email.
-	if h.EmailClient != nil {
-		if vRaw, vHash, err := auth.GenerateRefreshToken(); err == nil {
-			expiresAt := time.Now().Add(config.Default.EmailVerificationTTL)
-			if err := h.Queries.InsertEmailVerificationToken(r.Context(), user.ID, vHash, expiresAt); err == nil {
-				_ = h.EmailClient.SendVerificationEmail(req.Email, emailLink("/verify-email", vRaw))
+	// Issue verification token + email (only when verification is required).
+	if config.Default.EmailVerificationRequired {
+		if h.EmailClient != nil {
+			if vRaw, vHash, err := auth.GenerateRefreshToken(); err == nil {
+				expiresAt := time.Now().Add(config.Default.EmailVerificationTTL)
+				if err := h.Queries.InsertEmailVerificationToken(r.Context(), user.ID, vHash, expiresAt); err == nil {
+					_ = h.EmailClient.SendVerificationEmail(req.Email, emailLink("/verify-email", vRaw))
+				}
 			}
 		}
+	} else {
+		_ = h.Queries.SetEmailVerified(r.Context(), user.ID)
 	}
 
 	writeJSON(w, http.StatusCreated, map[string]string{
@@ -232,7 +243,11 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 	c, err := r.Cookie(refreshCookieName)
 	if err != nil || c.Value == "" {
 		clearRefreshTokenCookie(w, h.CookieSecure)
-		writeError(w, http.StatusUnauthorized, "missing refresh token")
+		// 204 rather than 401: unauthenticated page loads pollute the
+		// browser console with a resource error on every silent-refresh
+		// probe. The frontend treats a missing access_token the same way
+		// it treats a 401 (fail fast, no retry).
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	newRaw, newExp, userID, err := auth.RotateRefreshToken(r.Context(), refreshStore{h.Queries}, c.Value)
@@ -291,14 +306,35 @@ func (h *AuthHandler) VerifyEmail(w http.ResponseWriter, r *http.Request) {
 	}
 	hash := auth.HashRefreshToken(raw)
 	userID, err := h.Queries.ConsumeEmailVerificationToken(r.Context(), hash)
-	if err != nil || userID == "" {
+	if err == nil && userID != "" {
+		if err := h.Queries.SetEmailVerified(r.Context(), userID); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to mark verified")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"message": "email verified"})
+		return
+	}
+
+	// Email-change path (fix-frontend-plumbing): the token belongs to an
+	// email_change_tokens row. Commit the pending address, revoke all
+	// sessions (token_version bump happened at PATCH time and the refresh
+	// cookie is cleared here), and let the client re-authenticate.
+	changeUserID, pendingEmail, err := h.Queries.ConsumeEmailChangeToken(r.Context(), hash)
+	if err != nil || changeUserID == "" || pendingEmail == "" {
 		writeError(w, http.StatusGone, "invalid or expired token")
 		return
 	}
-	if err := h.Queries.SetEmailVerified(r.Context(), userID); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to mark verified")
+	// Uniqueness re-check — the address may have been claimed meanwhile.
+	if existing, _ := h.Queries.GetUserByEmail(r.Context(), pendingEmail); existing != nil && existing.ID != changeUserID {
+		writeError(w, http.StatusConflict, "that email is already in use")
 		return
 	}
+	if err := h.Queries.ApplyEmailChange(r.Context(), changeUserID, pendingEmail); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to update email")
+		return
+	}
+	_ = h.Queries.DeleteAllRefreshTokensForUser(r.Context(), changeUserID)
+	clearRefreshTokenCookie(w, h.CookieSecure)
 	writeJSON(w, http.StatusOK, map[string]string{"message": "email verified"})
 }
 
@@ -322,6 +358,28 @@ func (h *AuthHandler) ResendVerification(w http.ResponseWriter, r *http.Request)
 	count, _ := h.Queries.CountVerificationResendsInWindow(r.Context(), userID, since)
 	if count >= 3 {
 		writeError(w, http.StatusTooManyRequests, "too many requests; try again later")
+		return
+	}
+
+	// Email-change pending (fix-frontend-plumbing): the user asked to switch
+	// addresses; the verification link lives in the NEW inbox. The old email
+	// stays live until the new one verifies.
+	if ec, err := h.Queries.GetActiveEmailChange(r.Context(), userID); err == nil && ec != nil && ec.PendingEmail != "" {
+		_ = h.Queries.InvalidateEmailChangeTokensForUser(r.Context(), userID)
+		vRaw, vHash, err := auth.GenerateRefreshToken()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to issue token")
+			return
+		}
+		expiresAt := time.Now().Add(config.Default.EmailVerificationTTL)
+		if err := h.Queries.InsertEmailChangeToken(r.Context(), userID, ec.PendingEmail, vHash, expiresAt); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to issue token")
+			return
+		}
+		if h.EmailClient != nil {
+			_ = h.EmailClient.SendVerificationEmail(ec.PendingEmail, emailLink("/verify-email", vRaw))
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"message": "verification email sent"})
 		return
 	}
 
@@ -443,6 +501,91 @@ func (h *AuthHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"message": "password updated"})
 }
 
+// --- Password change --------------------------------------------------------
+
+// ChangePassword implements POST /auth/password (implement-missing-product-features
+// 2.1): verifies the current password, enforces the same password policy as
+// register/reset, bumps token_version (killing every other session), then
+// reissues the current session — a fresh refresh-token row + access token +
+// HttpOnly cookie — so the browser that made the request stays signed in.
+func (h *AuthHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
+	userID, ok := r.Context().Value(UserIDKey).(string)
+	if !ok || userID == "" {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	user, err := h.Queries.GetUserByID(r.Context(), userID)
+	if err != nil || user == nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if user.PasswordHash == nil {
+		writeError(w, http.StatusBadRequest, "this account has no password set")
+		return
+	}
+
+	var req struct {
+		CurrentPassword string `json:"current_password"`
+		NewPassword     string `json:"new_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.CurrentPassword == "" || req.NewPassword == "" {
+		writeError(w, http.StatusBadRequest, "current_password and new_password are required")
+		return
+	}
+	if err := auth.ValidatePasswordPolicy(req.NewPassword); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !auth.VerifyPassword(*user.PasswordHash, req.CurrentPassword) {
+		writeError(w, http.StatusUnauthorized, "current password is incorrect")
+		return
+	}
+
+	newHash, err := auth.HashPassword(req.NewPassword)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to process password")
+		return
+	}
+	if err := h.Queries.UpdatePasswordHash(r.Context(), user.ID, newHash); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to update password")
+		return
+	}
+	// Invalidate every other session; the current one is reissued below.
+	if err := h.Queries.IncrementTokenVersion(r.Context(), user.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to revoke sessions")
+		return
+	}
+	_ = h.Queries.DeleteAllRefreshTokensForUser(r.Context(), user.ID)
+
+	// Reissue the current session with the new token_version so the access
+	// token stays valid and the browser receives a fresh refresh cookie.
+	cur, err := h.Queries.GetUserByID(r.Context(), user.ID)
+	if err != nil || cur == nil {
+		writeError(w, http.StatusInternalServerError, "failed to refresh session")
+		return
+	}
+	accessTok, _, err := auth.IssueAccessToken(cur.ID, cur.TokenVersion)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to issue access token")
+		return
+	}
+	refreshRaw, refreshExp, err := auth.IssueRefreshToken(r.Context(), refreshStore{h.Queries}, cur.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to issue refresh token")
+		return
+	}
+	setRefreshTokenCookie(w, refreshRaw, refreshExp, h.CookieSecure)
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"message":      "password updated",
+		"access_token": accessTok,
+	})
+}
+
 // --- Google SSO -------------------------------------------------------------
 
 const googleStateCookieName = "google_oauth_state"
@@ -523,10 +666,10 @@ func (h *AuthHandler) GoogleStart(w http.ResponseWriter, r *http.Request) {
 type googleCallbackOutcome int
 
 const (
-	googleOutcomeReturningUser     googleCallbackOutcome = iota // sub matched OR same-email-google-only re-link
-	googleOutcomeNewUser                                        // brand-new sub + brand-new email
-	googleOutcomeLinkRequired                                   // email collides with a password-only account
-	googleOutcomeLinkExistingGoogle                             // email matched, sub differed, sub re-bound
+	googleOutcomeReturningUser      googleCallbackOutcome = iota // sub matched OR same-email-google-only re-link
+	googleOutcomeNewUser                                         // brand-new sub + brand-new email
+	googleOutcomeLinkRequired                                    // email collides with a password-only account
+	googleOutcomeLinkExistingGoogle                              // email matched, sub differed, sub re-bound
 )
 
 // googleCallbackResult is the discriminated union returned by
@@ -537,6 +680,10 @@ type googleCallbackResult struct {
 	User    *db.User // returning_user, new_user, link_existing_google
 	Email   string   // link_required (also populated for the others, for logging/parity)
 	Sub     string   // link_required, link_existing_google
+	// IDToken is the raw, server-verified Google ID token from the code
+	// exchange. It is surfaced to the client on the link_required outcome so
+	// the link-confirmation flow can present it back to /auth/google/link.
+	IDToken string
 }
 
 // processGoogleCallback runs the full server-side OAuth callback pipeline:
@@ -564,7 +711,7 @@ func (h *AuthHandler) processGoogleCallback(ctx context.Context, code, state str
 	if exchanger == nil {
 		exchanger = oauth.ExchangeAndVerifyWithRedirect
 	}
-	claims, err := exchanger(ctx, code, cookieValue.Verifier, redirectURI)
+	idToken, claims, err := exchanger(ctx, code, cookieValue.Verifier, redirectURI)
 	if err != nil {
 		return nil, fmt.Errorf("invalid id token: %w", err)
 	}
@@ -578,6 +725,7 @@ func (h *AuthHandler) processGoogleCallback(ctx context.Context, code, state str
 			User:    user,
 			Email:   emailAddr,
 			Sub:     claims.Sub,
+			IDToken: idToken,
 		}, nil
 	}
 
@@ -589,6 +737,7 @@ func (h *AuthHandler) processGoogleCallback(ctx context.Context, code, state str
 				Outcome: googleOutcomeLinkRequired,
 				Email:   emailAddr,
 				Sub:     claims.Sub,
+				IDToken: idToken,
 			}, nil
 		}
 		// Existing google-only user with same email but the sub didn't match —
@@ -601,6 +750,7 @@ func (h *AuthHandler) processGoogleCallback(ctx context.Context, code, state str
 			User:    existing,
 			Email:   emailAddr,
 			Sub:     claims.Sub,
+			IDToken: idToken,
 		}, nil
 	}
 
@@ -617,6 +767,7 @@ func (h *AuthHandler) processGoogleCallback(ctx context.Context, code, state str
 		User:    user,
 		Email:   emailAddr,
 		Sub:     claims.Sub,
+		IDToken: idToken,
 	}, nil
 }
 
@@ -758,9 +909,10 @@ func (h *AuthHandler) GoogleCallbackJSON(w http.ResponseWriter, r *http.Request)
 	switch result.Outcome {
 	case googleOutcomeLinkRequired:
 		writeJSON(w, http.StatusConflict, map[string]string{
-			"error": "link_required",
-			"email": result.Email,
-			"sub":   result.Sub,
+			"error":    "link_required",
+			"email":    result.Email,
+			"sub":      result.Sub,
+			"id_token": result.IDToken,
 		})
 		return
 	case googleOutcomeReturningUser, googleOutcomeNewUser, googleOutcomeLinkExistingGoogle:
@@ -802,13 +954,19 @@ func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-
 // LinkGoogleConfirm sets google_sub on the existing password account once the
 // user confirms the link from the link-confirmation view.
+//
+// Security (fix-auth-critical-security): the endpoint requires an
+// authenticated session for the account being linked, and the Google identity
+// must be cryptographically proven by a server-verified Google ID token whose
+// `sub` matches the requested `sub`. No account mutation or token issuance
+// happens unless every check passes.
 func (h *AuthHandler) LinkGoogleConfirm(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Email string `json:"email"`
-		Sub   string `json:"sub"`
+		Email   string `json:"email"`
+		Sub     string `json:"sub"`
+		IDToken string `json:"id_token"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -816,12 +974,46 @@ func (h *AuthHandler) LinkGoogleConfirm(w http.ResponseWriter, r *http.Request) 
 	}
 	req.Email = normalizeEmail(req.Email)
 
-	user, err := h.Queries.GetUserByEmail(r.Context(), req.Email)
-	if err != nil || user == nil {
-		writeError(w, http.StatusBadRequest, "no matching account")
+	// Authenticated session required — reject unauthenticated link attempts.
+	sessionUserID, ok := r.Context().Value(UserIDKey).(string)
+	if !ok || sessionUserID == "" {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	if err := h.Queries.LinkGoogleSub(r.Context(), user.ID, req.Sub); err != nil {
+
+	// The session must own the account being linked.
+	user, err := h.Queries.GetUserByID(r.Context(), sessionUserID)
+	if err != nil || user == nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if normalizeEmail(user.Email) != req.Email {
+		writeError(w, http.StatusForbidden, "cannot link a Google identity to another account")
+		return
+	}
+
+	// The Google identity must be verified server-side (RS256, aud, iss, exp)
+	// and its subject must match the requested sub.
+	if req.IDToken == "" {
+		writeError(w, http.StatusUnauthorized, "missing id_token")
+		return
+	}
+	verify := h.IDTokenVerifier
+	if verify == nil {
+		verify = oauth.VerifyIDToken
+	}
+	claims, err := verify(r.Context(), req.IDToken)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid id_token")
+		return
+	}
+	if claims.Sub == "" || claims.Sub != req.Sub {
+		writeError(w, http.StatusForbidden, "google identity does not match requested sub")
+		return
+	}
+
+	// All checks passed: mutate and issue tokens.
+	if err := h.Queries.LinkGoogleSub(r.Context(), user.ID, claims.Sub); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to link account")
 		return
 	}

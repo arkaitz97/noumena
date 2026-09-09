@@ -5,13 +5,13 @@
 //
 // Stage machine — mirrors the spec's status enum:
 //
-//   pending (grace window, > DELETION_REVERSIBLE_HOURS)
-//      ↓ ClaimNextDeletionJob (atomic UPDATE→exporting)
-//   exporting (request GDPR bundle, wait up to EXPORT_PRE_DELETE_TIMEOUT)
-//      ↓ MarkDeletionStage('deleting')
-//   deleting (per-channel detach + chunked comment delete + final wipe)
-//      ↓ MarkDeletionCompletedJobOnly
-//   completed
+//	pending (grace window, > DELETION_REVERSIBLE_HOURS)
+//	   ↓ ClaimNextDeletionJob (atomic UPDATE→exporting)
+//	exporting (request GDPR bundle, wait up to EXPORT_PRE_DELETE_TIMEOUT)
+//	   ↓ MarkDeletionStage('deleting')
+//	deleting (per-channel detach + chunked comment delete + final wipe)
+//	   ↓ MarkDeletionCompletedJobOnly
+//	completed
 //
 // Failure paths transition to 'failed' with last_error populated; the
 // row stays around for human triage. We deliberately do NOT auto-retry
@@ -26,7 +26,6 @@ import (
 	"sync"
 	"time"
 
-	"noumena/internal/auth"
 	"noumena/internal/billing"
 	"noumena/internal/config"
 	"noumena/internal/db"
@@ -190,10 +189,10 @@ func (w *DeletionWorker) runExportStage(ctx context.Context, job *db.AccountDele
 				// stage. We piggyback on MarkDeletionStage to avoid a
 				// dedicated method for one boolean.
 				_, _ = w.Pool.ExecContext(ctx,
-					`UPDATE account_deletion_jobs SET gdpr_export_generated=true WHERE id=$1`, job.ID)
+					`UPDATE account_deletion_jobs SET gdpr_export_generated=true WHERE id=?`, job.ID)
 				return nil
 			case "failed":
-				return fmt.Errorf("export failed: %s", deref(cur.LastError))
+				return fmt.Errorf("export failed: %s", deref(cur.ErrorMessage))
 			}
 			if w.Now().After(deadline) {
 				return fmt.Errorf("export timeout after %s", w.Cfg.ExportPreDeleteTimeout)
@@ -227,14 +226,15 @@ func (w *DeletionWorker) runDeletingStage(ctx context.Context, job *db.AccountDe
 }
 
 func (w *DeletionWorker) deleteOneChannel(ctx context.Context, job *db.AccountDeletionJob, ch *db.UserChannelTrackingRow) error {
-	// 1. OAuth revocation (best-effort, see revoke.go).
-	if ch.AccessTokenEnc != "" {
-		plain, derr := auth.Decrypt(ch.AccessTokenEnc)
-		if derr != nil {
-			w.Logger.Printf("deletion_worker_decrypt_warn channel=%s err=%v", ch.PlatformChannelID, derr)
-		} else if rerr := RevokeWithRetry(ctx, ch.Platform, plain, w.Logger); rerr != nil {
-			// non-fatal
+	// 1. OAuth revocation (bounded best-effort — refresh token first,
+	//    then access). Failure is recorded on the job for the out-of-band
+	//    sweeper (sweeper.go) and does not block the deletion.
+	if ch.AccessTokenEnc != "" || ch.RefreshTokenEnc != "" {
+		if rerr := revokeChannelTokens(ctx, ch, w.Logger); rerr != nil {
 			w.Logger.Printf("deletion_worker_revoke_failed channel=%s err=%v", ch.PlatformChannelID, rerr)
+			_ = w.Queries.MarkDeletionRevokeStatus(ctx, job.ID, true, rerr.Error())
+		} else {
+			_ = w.Queries.MarkDeletionRevokeStatus(ctx, job.ID, true, "")
 		}
 	}
 
@@ -324,14 +324,8 @@ func (w *DeletionWorker) runFinalStage(ctx context.Context, job *db.AccountDelet
 			_ = tx.Rollback()
 		}
 	}()
-	if err := w.Queries.DeleteUserDigests(ctx, tx, job.UserID); err != nil {
-		return fmt.Errorf("delete digests: %w", err)
-	}
-	if err := w.Queries.DeleteUserStarsAll(ctx, tx, job.UserID); err != nil {
-		return fmt.Errorf("delete stars: %w", err)
-	}
-	if err := w.Queries.DeleteUserAuthTokens(ctx, tx, job.UserID); err != nil {
-		return fmt.Errorf("delete auth tokens: %w", err)
+	if err := w.Queries.DeleteUserGDPRData(ctx, tx, job.UserID); err != nil {
+		return fmt.Errorf("GDPR wipe: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return err

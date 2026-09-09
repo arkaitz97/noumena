@@ -59,17 +59,20 @@ func (q *SQLiteQuery) ConnectChannelTx(ctx context.Context, userID, platform, pl
 	if tokenExpiresAt != nil {
 		expiresAtStr = tokenExpiresAt.Format(time.RFC3339)
 	}
+	var activeWorkspaceID sql.NullString
+	_ = tx.QueryRowContext(ctx, `SELECT active_workspace_id FROM users WHERE id = ?`, userID).Scan(&activeWorkspaceID)
 	queryUCT := `
-		INSERT INTO user_channel_tracking (id, user_id, platform_channel_id, access_token_enc, refresh_token_enc, token_expires_at, tracking_status, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, 'active', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+		INSERT INTO user_channel_tracking (id, user_id, platform_channel_id, workspace_id, access_token_enc, refresh_token_enc, token_expires_at, tracking_status, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 'active', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 		ON CONFLICT (user_id, platform_channel_id) DO UPDATE SET
 			access_token_enc = excluded.access_token_enc,
 			refresh_token_enc = excluded.refresh_token_enc,
 			token_expires_at = excluded.token_expires_at,
 			tracking_status = 'active',
-			token_expiry_notified_at = NULL
+			token_expiry_notified_at = NULL,
+			workspace_id = COALESCE(user_channel_tracking.workspace_id, excluded.workspace_id)
 	`
-	_, err = tx.ExecContext(ctx, queryUCT, generateUUID(), userID, pcID, accessTokenEnc, refreshTokenEnc, expiresAtStr)
+	_, err = tx.ExecContext(ctx, queryUCT, generateUUID(), userID, pcID, activeWorkspaceID, accessTokenEnc, refreshTokenEnc, expiresAtStr)
 	if err != nil {
 		return err
 	}

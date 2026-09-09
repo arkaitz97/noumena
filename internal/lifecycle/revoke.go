@@ -27,7 +27,23 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+
+	"noumena/internal/auth"
+	"noumena/internal/db"
 )
+
+// revokeHTTPClient is the HTTP client used for provider revocation
+// calls. Package-level so tests can inject a transport without
+// constructing a whole worker.
+var revokeHTTPClient = &http.Client{Timeout: 10 * time.Second}
+
+// revokeEndpoint is the Google OAuth revocation endpoint. Package-level
+// so tests can point it at an httptest server.
+var revokeEndpoint = "https://oauth2.googleapis.com/revoke"
+
+// revokeBackoffs is the bounded retry schedule (3 attempts total).
+// Package-level so tests can shrink the waits.
+var revokeBackoffs = []time.Duration{0, 10 * time.Second, 20 * time.Second}
 
 // RevokeOAuthToken asks the provider to invalidate the supplied access
 // token. Returns nil on success OR on a documented "skip" path (non-
@@ -60,20 +76,18 @@ func RevokeOAuthToken(ctx context.Context, platform, accessToken string, logger 
 }
 
 func revokeGoogleToken(ctx context.Context, accessToken string, logger *log.Logger) error {
-	endpoint := "https://oauth2.googleapis.com/revoke"
 	form := url.Values{"token": {accessToken}}
 
 	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpoint+"?"+form.Encode(), nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, revokeEndpoint+"?"+form.Encode(), nil)
 	if err != nil {
 		return fmt.Errorf("oauth revoke: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := revokeHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("oauth revoke: %w", err)
 	}
@@ -94,19 +108,19 @@ func revokeGoogleToken(ctx context.Context, accessToken string, logger *log.Logg
 	}
 }
 
-// RevokeWithRetry wraps RevokeOAuthToken with the spec-mandated
-// 1m / 1h / 6h backoff (three attempts total). On final failure it
-// emits a structured log line and returns the last error so the caller
-// can decide whether to fail the deletion job (the deletion worker
-// chooses to PROCEED — see deletion_worker.go).
+// RevokeWithRetry wraps RevokeOAuthToken with a SHORT bounded retry
+// (three attempts over ~30s total) so provider revocation never blocks
+// the deletion worker's tick for hours. On final failure it returns the
+// last error so the caller can record it on the job and let the
+// out-of-band sweeper retry later (see sweeper.go).
 //
 // The loop honors ctx cancellation between attempts; if the worker is
 // shutting down we give up immediately rather than burning a sleep.
-func RevokeWithRetry(ctx context.Context, platform, accessToken string, logger *log.Logger) error {
+func RevokeWithRetry(ctx context.Context, platform, token string, logger *log.Logger) error {
 	if logger == nil {
 		logger = log.Default()
 	}
-	backoffs := []time.Duration{0, time.Minute, time.Hour, 6 * time.Hour}
+	backoffs := revokeBackoffs
 	var lastErr error
 	for attempt, wait := range backoffs {
 		if wait > 0 {
@@ -116,7 +130,7 @@ func RevokeWithRetry(ctx context.Context, platform, accessToken string, logger *
 			case <-time.After(wait):
 			}
 		}
-		err := RevokeOAuthToken(ctx, platform, accessToken, logger)
+		err := RevokeOAuthToken(ctx, platform, token, logger)
 		if err == nil {
 			return nil
 		}
@@ -125,4 +139,32 @@ func RevokeWithRetry(ctx context.Context, platform, accessToken string, logger *
 	}
 	logger.Printf("oauth_revoke_giving_up platform=%s err=%v", platform, lastErr)
 	return lastErr
+}
+
+// revokeChannelTokens decrypts and revokes a channel's OAuth credentials
+// provider-side. The refresh token is the durable credential and is
+// revoked FIRST; the access token second. A missing/undecryptable token
+// is logged and skipped — never fatal to the deletion job. Returns an
+// error only when a provider revoke itself fails after retries.
+func revokeChannelTokens(ctx context.Context, ch *db.UserChannelTrackingRow, logger *log.Logger) error {
+	if logger == nil {
+		logger = log.Default()
+	}
+	if ch.RefreshTokenEnc != "" {
+		plain, err := auth.Decrypt(ch.RefreshTokenEnc)
+		if err != nil {
+			logger.Printf("oauth_revoke_refresh_decrypt_warn channel=%s err=%v", ch.PlatformChannelID, err)
+		} else if err := RevokeWithRetry(ctx, ch.Platform, plain, logger); err != nil {
+			return fmt.Errorf("revoke refresh token: %w", err)
+		}
+	}
+	if ch.AccessTokenEnc != "" {
+		plain, err := auth.Decrypt(ch.AccessTokenEnc)
+		if err != nil {
+			logger.Printf("oauth_revoke_access_decrypt_warn channel=%s err=%v", ch.PlatformChannelID, err)
+		} else if err := RevokeWithRetry(ctx, ch.Platform, plain, logger); err != nil {
+			return fmt.Errorf("revoke access token: %w", err)
+		}
+	}
+	return nil
 }

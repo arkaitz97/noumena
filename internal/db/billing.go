@@ -38,19 +38,19 @@ func (q *SQLiteQuery) InsertProcessedStripeEvent(ctx context.Context, tx *sql.Tx
 }
 
 type SubscriptionUpdate struct {
-	UserID                 string
-	SubscriptionPlan       *string
-	BillingInterval        *string
-	StripeCustomerID       *string
-	CommentQuotaMonthly    *int
-	CommentsUsedThisPeriod *int
-	SubscriptionStatus     *string
-	CurrentPeriodEnd       *time.Time
-	QuotaResetAt           *time.Time
-	PastDueSince           *time.Time
-	PastDueSinceClear      bool
-	BillingIntervalClear   bool
-	StripeSubscriptionID   *string
+	UserID                    string
+	SubscriptionPlan          *string
+	BillingInterval           *string
+	StripeCustomerID          *string
+	CommentQuotaMonthly       *int
+	CommentsUsedThisPeriod    *int
+	SubscriptionStatus        *string
+	CurrentPeriodEnd          *time.Time
+	QuotaResetAt              *time.Time
+	PastDueSince              *time.Time
+	PastDueSinceClear         bool
+	BillingIntervalClear      bool
+	StripeSubscriptionID      *string
 	StripeSubscriptionIDClear bool
 }
 
@@ -264,6 +264,184 @@ type TrialReminderUser struct {
 	ID          string
 	Email       string
 	TrialEndsAt time.Time
+}
+
+// BillingUsage is one row of billing_usage: a per-user per-period snapshot
+// of comments_used vs quota (implement-missing-product-features 3.x).
+type BillingUsage struct {
+	UserID       string
+	PeriodStart  time.Time
+	PeriodEnd    time.Time
+	CommentsUsed int
+	Quota        int
+}
+
+// UpsertBillingUsage records (or refreshes) a user's current-period usage
+// snapshot. Idempotent per (user_id, period_start).
+func (q *SQLiteQuery) UpsertBillingUsage(ctx context.Context, u BillingUsage) error {
+	_, err := q.db.ExecContext(ctx,
+		`INSERT INTO billing_usage (id, user_id, period_start, period_end, comments_used, quota)
+		 VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(user_id, period_start) DO UPDATE SET
+		     period_end = excluded.period_end,
+		     comments_used = excluded.comments_used,
+		     quota = excluded.quota`,
+		generateUUID(), u.UserID, u.PeriodStart.Format(time.RFC3339),
+		u.PeriodEnd.Format(time.RFC3339), u.CommentsUsed, u.Quota)
+	return err
+}
+
+// RecordCurrentPeriodUsage snapshots the current period for every user who
+// has a quota schedule (quota_reset_at NOT NULL). The period is anchored at
+// quota_reset_at — the next reset — so period_end = quota_reset_at and
+// period_start = one month earlier, mirroring the overage-log convention
+// (periodStart = periodEnd − 1 month). Returns the number of rows written.
+//
+// Callers run this BEFORE ResetFreeTierQuotas so the just-finished period's
+// usage is captured before the reset zeroes comments_used_this_period.
+func (q *SQLiteQuery) RecordCurrentPeriodUsage(ctx context.Context) (int64, error) {
+	rows, err := q.db.QueryContext(ctx,
+		`SELECT id, comments_used_this_period, comment_quota_monthly, quota_reset_at
+		   FROM users
+		  WHERE quota_reset_at IS NOT NULL`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	type snap struct {
+		userID    string
+		used      int
+		quota     int
+		periodEnd time.Time
+	}
+	var snaps []snap
+	for rows.Next() {
+		var s snap
+		var resetAt string
+		if err := rows.Scan(&s.userID, &s.used, &s.quota, &resetAt); err != nil {
+			return 0, err
+		}
+		s.periodEnd = parseTime(resetAt)
+		snaps = append(snaps, s)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	var written int64
+	for _, s := range snaps {
+		if s.periodEnd.IsZero() {
+			continue
+		}
+		if err := q.UpsertBillingUsage(ctx, BillingUsage{
+			UserID:       s.userID,
+			PeriodStart:  s.periodEnd.AddDate(0, -1, 0),
+			PeriodEnd:    s.periodEnd,
+			CommentsUsed: s.used,
+			Quota:        s.quota,
+		}); err != nil {
+			return written, err
+		}
+		written++
+	}
+	return written, nil
+}
+
+// GetBillingUsage returns the user's most recent usage periods, newest
+// first. limit must be >= 1.
+func (q *SQLiteQuery) GetBillingUsage(ctx context.Context, userID string, limit int) ([]BillingUsage, error) {
+	rows, err := q.db.QueryContext(ctx,
+		`SELECT user_id, period_start, period_end, comments_used, quota
+		   FROM billing_usage
+		  WHERE user_id = ?
+		  ORDER BY period_start DESC
+		  LIMIT ?`,
+		userID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []BillingUsage
+	for rows.Next() {
+		var u BillingUsage
+		var ps, pe string
+		if err := rows.Scan(&u.UserID, &ps, &pe, &u.CommentsUsed, &u.Quota); err != nil {
+			return nil, err
+		}
+		u.PeriodStart = parseTime(ps)
+		u.PeriodEnd = parseTime(pe)
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// OverageGroup is one uninvoiced (user, period) overage bucket, aggregated
+// from comment_usage_logs (implement-missing-product-features 8.x).
+type OverageGroup struct {
+	UserID      string
+	Plan        string
+	PeriodStart time.Time
+	PeriodEnd   time.Time
+	Overage     int
+}
+
+// ListOverageGroups returns overage totals grouped by (user, period) for
+// plans that track overage (creator/studio), excluding periods already
+// recorded in overage_invoices. Exactly-once invoicing relies on this
+// exclusion plus the UNIQUE(user_id, period_start) guard.
+func (q *SQLiteQuery) ListOverageGroups(ctx context.Context) ([]OverageGroup, error) {
+	rows, err := q.db.QueryContext(ctx,
+		`SELECT u.id, u.subscription_plan, l.period_start, l.period_end, SUM(l.count) AS overage
+		   FROM comment_usage_logs l
+		   JOIN users u ON u.id = l.user_id
+		   LEFT JOIN overage_invoices oi
+		     ON oi.user_id = l.user_id AND oi.period_start = l.period_start
+		  WHERE u.subscription_plan IN ('creator', 'studio')
+		    AND oi.id IS NULL
+		  GROUP BY u.id, u.subscription_plan, l.period_start, l.period_end`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []OverageGroup
+	for rows.Next() {
+		var g OverageGroup
+		var ps, pe string
+		if err := rows.Scan(&g.UserID, &g.Plan, &ps, &pe, &g.Overage); err != nil {
+			return nil, err
+		}
+		g.PeriodStart = parseTime(ps)
+		g.PeriodEnd = parseTime(pe)
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+// MarkOverageInvoiced records the exactly-once guard row for a charged
+// (user, period). Idempotent: a second call for the same key is a no-op.
+func (q *SQLiteQuery) MarkOverageInvoiced(ctx context.Context, userID, periodStart, stripeInvoiceID string, amountCents int) error {
+	_, err := q.db.ExecContext(ctx,
+		`INSERT INTO overage_invoices (id, user_id, period_start, stripe_invoice_id, amount_cents)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(user_id, period_start) DO NOTHING`,
+		generateUUID(), userID, periodStart, stripeInvoiceID, amountCents)
+	return err
+}
+
+// IsOverageInvoiced reports whether a (user, period) already has a guard row.
+func (q *SQLiteQuery) IsOverageInvoiced(ctx context.Context, userID, periodStart string) (bool, error) {
+	var n int
+	err := q.db.QueryRowContext(ctx,
+		`SELECT 1 FROM overage_invoices WHERE user_id = ? AND period_start = ?`,
+		userID, periodStart).Scan(&n)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (q *SQLiteQuery) ListUsersForTrialExpiryReminder(ctx context.Context, lo, hi time.Time) ([]TrialReminderUser, error) {

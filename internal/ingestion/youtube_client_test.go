@@ -11,6 +11,86 @@ import (
 	"time"
 )
 
+func TestParseYouTubeChannelRef(t *testing.T) {
+	cases := []struct {
+		in        string
+		handle    string
+		channelID string
+	}{
+		{"@MrBeast", "MrBeast", ""},
+		{"https://www.youtube.com/@MrBeast", "MrBeast", ""},
+		{"https://www.youtube.com/@MrBeast/videos", "MrBeast", ""},
+		{"https://www.youtube.com/channel/UCX6OQ3DkcsbYNE6H8uQQuVA", "", "UCX6OQ3DkcsbYNE6H8uQQuVA"},
+		{"UCX6OQ3DkcsbYNE6H8uQQuVA", "", "UCX6OQ3DkcsbYNE6H8uQQuVA"},
+		{"  @  spaced  ", "spaced", ""},
+		{"", "", ""},
+		{"just a name", "", ""},
+	}
+	for _, c := range cases {
+		h, id := ParseYouTubeChannelRef(c.in)
+		if h != c.handle || id != c.channelID {
+			t.Errorf("ParseYouTubeChannelRef(%q) = handle %q, id %q; want %q, %q", c.in, h, id, c.handle, c.channelID)
+		}
+	}
+}
+
+func TestYouTubeClient_ResolveChannelRefByHandle(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("forHandle"); got != "MrBeast" {
+			t.Errorf("forHandle = %q, want MrBeast", got)
+		}
+		if got := r.URL.Query().Get("key"); got != "test-key" {
+			t.Errorf("key = %q, want test-key", got)
+		}
+		_, _ = w.Write([]byte(`{"items":[{"id":"UCX6OQ3DkcsbYNE6H8uQQuVA","snippet":{"title":"MrBeast"}}]}`))
+	}))
+	defer srv.Close()
+	c := &YouTubeClient{HTTP: srv.Client(), BaseURL: srv.URL, APIKey: "test-key"}
+	info, err := c.ResolveChannelRef(context.Background(), "https://www.youtube.com/@MrBeast/videos")
+	if err != nil {
+		t.Fatalf("ResolveChannelRef: %v", err)
+	}
+	if info.ID != "UCX6OQ3DkcsbYNE6H8uQQuVA" || info.DisplayName != "MrBeast" {
+		t.Fatalf("got %+v", info)
+	}
+}
+
+func TestYouTubeClient_ResolveChannelRefByID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("id"); got != "UCX6OQ3DkcsbYNE6H8uQQuVA" {
+			t.Errorf("id = %q, want UCX6OQ3DkcsbYNE6H8uQQuVA", got)
+		}
+		_, _ = w.Write([]byte(`{"items":[{"id":"UCX6OQ3DkcsbYNE6H8uQQuVA","snippet":{"title":"MrBeast"}}]}`))
+	}))
+	defer srv.Close()
+	c := &YouTubeClient{HTTP: srv.Client(), BaseURL: srv.URL, APIKey: "test-key"}
+	info, err := c.ResolveChannelRef(context.Background(), "https://www.youtube.com/channel/UCX6OQ3DkcsbYNE6H8uQQuVA")
+	if err != nil {
+		t.Fatalf("ResolveChannelRef: %v", err)
+	}
+	if info.ID != "UCX6OQ3DkcsbYNE6H8uQQuVA" {
+		t.Fatalf("got %+v", info)
+	}
+}
+
+func TestYouTubeClient_ResolveChannelRefNoKey(t *testing.T) {
+	c := &YouTubeClient{HTTP: http.DefaultClient, BaseURL: "https://example.invalid"}
+	if _, err := c.ResolveChannelRef(context.Background(), "@MrBeast"); err == nil {
+		t.Fatal("expected error when APIKey unset")
+	}
+}
+
+func TestYouTubeClient_ResolveChannelRefNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"items":[]}`))
+	}))
+	defer srv.Close()
+	c := &YouTubeClient{HTTP: srv.Client(), BaseURL: srv.URL, APIKey: "test-key"}
+	if _, err := c.ResolveChannelRef(context.Background(), "@doesnotexist"); err == nil {
+		t.Fatal("expected error when channel not found")
+	}
+}
+
 func TestYouTubeClient_TokenInvalid(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)

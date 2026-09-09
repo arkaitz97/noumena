@@ -288,3 +288,38 @@ func TestGetCommentThread_AccessControl(t *testing.T) {
 		t.Fatalf("expected at least 1 comment, got %d", len(comments))
 	}
 }
+
+func TestActionableInsights_DaysClamped(t *testing.T) {
+	q, userID := setupInsightsDB(t)
+	h := &api.InsightsHandler{Queries: q}
+
+	call := func(days string) (int, string) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/api/insights/actionable?channel_id=all&days="+days, nil)
+		ctx := context.WithValue(req.Context(), api.UserIDKey, userID)
+		w := httptest.NewRecorder()
+		h.ActionableInsights(w, req.WithContext(ctx))
+		return w.Code, w.Body.String()
+	}
+
+	codeClamped, bodyClamped := call("10000")
+	if codeClamped != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", codeClamped, bodyClamped)
+	}
+
+	code30, body30 := call("30")
+	if code30 != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", code30, body30)
+	}
+	if bodyClamped != body30 {
+		t.Fatalf("expected identical body for days=10000 and days=30, got %q vs %q", bodyClamped, body30)
+	}
+
+	codeABC, bodyABC := call("abc")
+	if codeABC != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", codeABC, bodyABC)
+	}
+	if bodyABC != body30 {
+		t.Fatalf("expected identical body for days=abc and days=30, got %q vs %q", bodyABC, body30)
+	}
+}

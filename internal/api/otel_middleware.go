@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -9,7 +10,9 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // httpMeter is the package-level meter handle for HTTP server metrics.
@@ -20,6 +23,11 @@ import (
 // instruments below resolve their final providers lazily at first use
 // via the meter's caching layer.
 var httpMeter = otel.Meter("noumena/http")
+
+// httpTracerName is the tracer name used for HTTP server spans. The
+// tracer is resolved per-request (not bound at init) so tests that swap
+// the global TracerProvider after package init still get recording spans.
+const httpTracerName = "noumena/http"
 
 var (
 	httpRequestsTotal   metric.Int64Counter
@@ -77,20 +85,28 @@ func (sr *statusRecorder) Write(b []byte) (int, error) {
 	return sr.ResponseWriter.Write(b)
 }
 
+// routeFor resolves the chi route pattern after the handler ran; chi
+// populates RouteContext during routing.
+func routeFor(r *http.Request) string {
+	if rc := chi.RouteContext(r.Context()); rc != nil && rc.RoutePattern() != "" {
+		return rc.RoutePattern()
+	}
+	return "unknown"
+}
+
 // OtelMiddleware records noumena_http_requests_total and
-// noumena_http_request_duration_seconds for every chi-routed request.
-// The `route` attribute is the chi route pattern (e.g.
-// `/api/channels/{id}`), never the raw URL — see spec
-// "HTTP server instruments and spans". When telemetry is disabled the
-// underlying instruments are no-ops, so the only overhead is the
-// time.Since() call and the statusRecorder allocation.
+// noumena_http_request_duration_seconds for every chi-routed request,
+// and emits one HTTP server span per request. The `route` attribute is
+// the chi route pattern (e.g. `/api/channels/{id}`), never the raw URL.
 //
-// Spans (when traces are enabled) are NOT started here because the
-// recommended `otelhttp.NewMiddleware` integration runs BEFORE chi has
-// resolved the route, which makes the chi route pattern unavailable to
-// the span. Operators who want HTTP server spans can mount
-// `otelhttp.NewMiddleware("noumena-api")` themselves; this middleware
-// focuses on the metric contract documented in the spec.
+// Query-string redaction (fix-crypto-http-hardening): the span's
+// `http.target` attribute is set to the URL path only (never the query
+// string), so `?token=...` from verify/reset links cannot reach OTLP.
+// This middleware is the single source of HTTP spans — it replaces the
+// upstream otelhttp.NewMiddleware mount which would otherwise record the
+// raw request target. When telemetry is disabled the underlying
+// instruments are no-ops and the tracer is non-recording, so the only
+// overhead is the statusRecorder allocation.
 func OtelMiddleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -102,25 +118,36 @@ func OtelMiddleware() func(http.Handler) http.Handler {
 
 			// Slow request logging (>1000ms threshold).
 			if elapsed > 1000*time.Millisecond {
-				route := "unknown"
-				if rc := chi.RouteContext(r.Context()); rc != nil && rc.RoutePattern() != "" {
-					route = rc.RoutePattern()
-				}
-				log.Printf("[slow-request] %s %s took %s", r.Method, route, elapsed)
+				log.Printf("[slow-request] %s %s took %s", r.Method, routeFor(r), elapsed)
 			}
 
-			// Resolve the chi route pattern AFTER the handler ran;
-			// chi populates RouteContext during routing.
-			route := "unknown"
-			if rc := chi.RouteContext(r.Context()); rc != nil && rc.RoutePattern() != "" {
-				route = rc.RoutePattern()
-			}
+			route := routeFor(r)
 			status := sr.status
 			if status == 0 {
 				// Handler returned without writing anything; this is
 				// effectively a 200 per net/http semantics.
 				status = http.StatusOK
 			}
+
+			// HTTP server span. Created after the handler so the route
+			// pattern is available; StartTimestamp/EndTimestamp keep the
+			// timing honest. http.target is the path only — no query.
+			_, span := otel.Tracer(httpTracerName).Start(
+				r.Context(),
+				fmt.Sprintf("%s %s", r.Method, route),
+				trace.WithTimestamp(start),
+				trace.WithAttributes(
+					attribute.String("http.method", r.Method),
+					attribute.String("http.route", route),
+					attribute.String("http.target", r.URL.Path),
+					attribute.Int("http.status_code", status),
+				),
+			)
+			if status >= 500 {
+				span.SetStatus(codes.Error, "http status >= 500")
+			}
+			span.End(trace.WithTimestamp(time.Now()))
+
 			attrs := metric.WithAttributes(
 				attribute.String("method", r.Method),
 				attribute.String("route", route),

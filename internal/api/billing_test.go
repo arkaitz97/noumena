@@ -35,6 +35,7 @@ func setupBillingRouter(queries *MockQuery, billingClient billing.Client) *chi.M
 		r.Post("/billing/checkout", billingHandler.CreateCheckoutSession)
 		r.Get("/billing/portal", billingHandler.CreatePortalSession)
 		r.Get("/billing/status", billingHandler.Status)
+		r.Get("/billing/usage", billingHandler.Usage)
 	})
 
 	r.Route("/webhooks", func(r chi.Router) {

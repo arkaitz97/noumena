@@ -19,6 +19,7 @@ import (
 	"noumena/internal/billing"
 	"noumena/internal/config"
 	"noumena/internal/db"
+	"noumena/internal/ingestion"
 	"noumena/internal/oauth"
 )
 
@@ -36,6 +37,16 @@ type ChannelHandler struct {
 	// It is satisfied by *db.PostgresQuery in production and stubbed in tests.
 	// May be nil; the handler returns 501 in that case.
 	SyncStatusReader SyncStatusReader
+	// YouTubeResolver resolves public channels by @handle/URL for OAuth-free
+	// competitor tracking. May be nil; ConnectYouTubeByName returns 503 then.
+	YouTubeResolver YouTubeChannelResolver
+}
+
+// YouTubeChannelResolver resolves a public YouTube channel from a user
+// supplied handle or URL reference. Satisfied by *ingestion.YouTubeClient
+// with an API key configured.
+type YouTubeChannelResolver interface {
+	ResolveChannelRef(ctx context.Context, ref string) (*ingestion.ChannelInfo, error)
 }
 
 // SyncStatusReader exposes the per-channel ingestion sync status. The real
@@ -65,6 +76,45 @@ func generateOAuthState() (raw, hashHex string, err error) {
 func hashOAuthState(raw string) string {
 	sum := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(sum[:])
+}
+
+// planChannelLimit returns the user's active channel cap; 0 means unlimited
+// (Agency or unknown user — enforcement degrades open, never bricks).
+func planChannelLimit(ctx context.Context, q db.DBQuery, userID string) int {
+	u, err := q.GetUserByID(ctx, userID)
+	if err != nil || u == nil {
+		return 0
+	}
+	plan := u.SubscriptionPlan
+	if plan == "" {
+		plan = billing.PlanFree
+	}
+	if lim := billing.LimitsFor(plan); !lim.ChannelsUnlimited {
+		return lim.ChannelLimit
+	}
+	return 0
+}
+
+// insertTrackingRow creates a tracking row, enforcing the plan cap
+// atomically at write time via CreateUserChannelTrackingWithLimit. It
+// retries once with token_priority=1 when a concurrent insert grabbed
+// prio==0 first. Returns db.ErrChannelLimitExceeded when over cap.
+func insertTrackingRow(ctx context.Context, q db.DBQuery, userID, pcID, accessEnc, refreshEnc string, expiresAt time.Time, backfillDays, prio, channelLimit int) (*db.UserChannelTracking, error) {
+	create := func(p int) (*db.UserChannelTracking, error) {
+		if channelLimit > 0 {
+			if ql, ok := q.(interface {
+				CreateUserChannelTrackingWithLimit(ctx context.Context, userID, platformChannelID, encryptedAccess, encryptedRefresh string, expiresAt time.Time, backfillDays, tokenPriority, limit int) (*db.UserChannelTracking, error)
+			}); ok {
+				return ql.CreateUserChannelTrackingWithLimit(ctx, userID, pcID, accessEnc, refreshEnc, expiresAt, backfillDays, p, channelLimit)
+			}
+		}
+		return q.CreateUserChannelTracking(ctx, userID, pcID, accessEnc, refreshEnc, expiresAt, backfillDays, p)
+	}
+	tracking, err := create(prio)
+	if err != nil && isUniqueConstraintViolation(err) && prio == 0 {
+		tracking, err = create(1)
+	}
+	return tracking, err
 }
 
 // ============================================================================
@@ -235,24 +285,21 @@ func (h *ChannelHandler) ExchangeYouTubeCode(w http.ResponseWriter, r *http.Requ
 		expires = time.Now().Add(1 * time.Hour)
 	}
 
-	tracking, err := h.Queries.CreateUserChannelTracking(
-		r.Context(), userID, pcID, accessEnc, refreshEnc, expires,
-		req.BackfillDays, prio,
-	)
+	// Atomic plan-limit guard at write time (single-statement
+	// INSERT...SELECT...WHERE). Unlimited plans pass channelLimit=0 and
+	// skip the guarded insert.
+	tracking, err := insertTrackingRow(r.Context(), h.Queries, userID, pcID,
+		accessEnc, refreshEnc, expires, req.BackfillDays, prio,
+		planChannelLimit(r.Context(), h.Queries, userID))
+	if errors.Is(err, db.ErrChannelLimitExceeded) {
+		writeChannelError(w, http.StatusPaymentRequired, "plan_limit_reached",
+			"channel limit reached for the current plan; upgrade to add more channels")
+		return
+	}
 	if err != nil {
-		// Race: a concurrent insert may have grabbed token_priority=0
-		// before us. Retry once with the next available priority.
-		if isUniqueConstraintViolation(err) && prio == 0 {
-			tracking, err = h.Queries.CreateUserChannelTracking(
-				r.Context(), userID, pcID, accessEnc, refreshEnc, expires,
-				req.BackfillDays, 1,
-			)
-		}
-		if err != nil {
-			writeChannelError(w, http.StatusInternalServerError, "tracking_create_failed",
-				"could not create tracking row")
-			return
-		}
+		writeChannelError(w, http.StatusInternalServerError, "tracking_create_failed",
+			"could not create tracking row")
+		return
 	}
 
 	if inserted && h.BackfillEnqueuer != nil {
@@ -269,6 +316,263 @@ func (h *ChannelHandler) ExchangeYouTubeCode(w http.ResponseWriter, r *http.Requ
 		"token_priority":      tracking.TokenPriority,
 		"backfill_days":       tracking.BackfillDays,
 		"token_expires_at":    tracking.TokenExpiresAt,
+	})
+}
+
+// ============================================================================
+// POST /api/channels/connect/youtube/by-name — connect a public channel by
+// @handle or full URL (competitor tracking). OAuth-free; requires
+// YOUTUBE_API_KEY on the server.
+// ============================================================================
+
+type connectByNameRequest struct {
+	Ref          string `json:"ref"`
+	BackfillDays int    `json:"backfill_days,omitempty"`
+}
+
+func (h *ChannelHandler) ConnectYouTubeByName(w http.ResponseWriter, r *http.Request) {
+	userID, _ := r.Context().Value(UserIDKey).(string)
+
+	var req connectByNameRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeChannelError(w, http.StatusBadRequest, "invalid_body", "could not decode request body")
+		return
+	}
+	if strings.TrimSpace(req.Ref) == "" {
+		writeChannelError(w, http.StatusBadRequest, "invalid_ref", "ref is required (a @handle or channel URL)")
+		return
+	}
+	if req.BackfillDays == 0 {
+		req.BackfillDays = 90
+	}
+	if !validBackfillDaysAPI(req.BackfillDays) {
+		writeChannelError(w, http.StatusBadRequest, "invalid_backfill_days", "backfill_days must be 30, 60, 90, or 180")
+		return
+	}
+	if h.YouTubeResolver == nil {
+		writeChannelError(w, http.StatusServiceUnavailable, "resolver_unavailable",
+			"public channel tracking is not configured on this server")
+		return
+	}
+
+	// Plan-limit guard: same semantics as the OAuth exchange, before any
+	// external resolution work.
+	if blocked, _ := checkChannelLimit(r.Context(), h.Queries, userID); blocked {
+		writeChannelError(w, http.StatusPaymentRequired, "plan_limit_reached",
+			"channel limit reached for the current plan; upgrade to add more channels")
+		return
+	}
+
+	info, err := h.YouTubeResolver.ResolveChannelRef(r.Context(), req.Ref)
+	if err != nil {
+		writeChannelError(w, http.StatusBadRequest, "resolve_failed", err.Error())
+		return
+	}
+
+	// Upsert shared channel and create / update tracking (same shared-row
+	// semantics as the OAuth flow; tokenless rows are ingestion-key-driven).
+	pcID, inserted, err := h.Queries.UpsertPlatformChannel(r.Context(), "youtube", info.ID, info.DisplayName)
+	if err != nil {
+		writeChannelError(w, http.StatusInternalServerError, "channel_upsert_failed", "could not upsert channel")
+		return
+	}
+
+	existing, err := h.Queries.GetUserTracking(r.Context(), userID, pcID)
+	if err != nil && !errors.Is(err, db.ErrNotFound) {
+		writeChannelError(w, http.StatusInternalServerError, "tracking_lookup_failed", "could not check existing tracking")
+		return
+	}
+	if existing != nil {
+		writeChannelError(w, http.StatusConflict, "already_tracked", "channel is already tracked")
+		return
+	}
+
+	maxPrio, err := h.Queries.GetMaxTokenPriority(r.Context(), pcID)
+	if err != nil {
+		writeChannelError(w, http.StatusInternalServerError, "priority_lookup_failed", "could not compute token priority")
+		return
+	}
+	prio := 0
+	if maxPrio >= 0 {
+		prio = maxPrio + 1
+	}
+
+	// Tokenless row: empty tokens + zero expiry. Ingestion reads public
+	// data via the server API key; sweeper/revoke skip empty-token rows.
+	tracking, err := insertTrackingRow(r.Context(), h.Queries, userID, pcID,
+		"", "", time.Time{}, req.BackfillDays, prio,
+		planChannelLimit(r.Context(), h.Queries, userID))
+	if errors.Is(err, db.ErrChannelLimitExceeded) {
+		writeChannelError(w, http.StatusPaymentRequired, "plan_limit_reached",
+			"channel limit reached for the current plan; upgrade to add more channels")
+		return
+	}
+	if err != nil {
+		writeChannelError(w, http.StatusInternalServerError, "tracking_create_failed",
+			"could not create tracking row")
+		return
+	}
+
+	if inserted && h.BackfillEnqueuer != nil {
+		if err := h.BackfillEnqueuer.EnqueueBackfill(r.Context(), pcID, req.BackfillDays); err != nil {
+			log.Printf("backfill enqueue failed for channel %s: %v", pcID, err)
+		}
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		"id":                  tracking.ID,
+		"platform_channel_id": pcID,
+		"display_name":        info.DisplayName,
+		"tracking_status":     tracking.TrackingStatus,
+		"token_priority":      tracking.TokenPriority,
+		"backfill_days":       tracking.BackfillDays,
+		"token_expires_at":    tracking.TokenExpiresAt,
+	})
+}
+
+// ============================================================================
+// POST /api/channels/{id}/reauthorize  (fix-frontend-plumbing)
+// ============================================================================
+
+// Reauthorize starts the YouTube OAuth flow for an EXISTING tracking row
+// whose token expired or was revoked. Same state-cookie machinery as
+// ConnectYouTube; the exchange below links the new token to the existing
+// row instead of creating a channel.
+func (h *ChannelHandler) Reauthorize(w http.ResponseWriter, r *http.Request) {
+	userID, _ := r.Context().Value(UserIDKey).(string)
+	pcID := chi.URLParam(r, "id")
+
+	tracking, err := h.Queries.GetUserTracking(r.Context(), userID, pcID)
+	if err != nil && !errors.Is(err, db.ErrNotFound) {
+		writeChannelError(w, http.StatusInternalServerError, "lookup_failed", "could not check tracking")
+		return
+	}
+	if tracking == nil {
+		writeChannelError(w, http.StatusNotFound, "not_found", "channel not tracked")
+		return
+	}
+
+	raw, hash, err := generateOAuthState()
+	if err != nil {
+		writeChannelError(w, http.StatusInternalServerError, "state_generation_failed", "could not generate state")
+		return
+	}
+	ttl := config.Default.OAuthStateTTL
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	if err := h.Queries.InsertOAuthState(r.Context(), hash, userID, time.Now().Add(ttl)); err != nil {
+		writeChannelError(w, http.StatusInternalServerError, "state_persist_failed", "could not persist state")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"auth_url":   oauth.BuildAuthURL(raw),
+		"state":      raw,
+		"channel_id": pcID,
+	})
+}
+
+type reauthorizeExchangeRequest struct {
+	Code      string `json:"code"`
+	State     string `json:"state"`
+	ChannelID string `json:"channel_id"`
+}
+
+// ExchangeReauthorize completes the reauthorize handshake: consumes the CSRF
+// state, swaps the code for fresh tokens, and stores them on the EXISTING
+// tracking row (never a new channel). The old access token is revoked
+// best-effort.
+func (h *ChannelHandler) ExchangeReauthorize(w http.ResponseWriter, r *http.Request) {
+	userID, _ := r.Context().Value(UserIDKey).(string)
+
+	var req reauthorizeExchangeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeChannelError(w, http.StatusBadRequest, "invalid_body", "could not decode request body")
+		return
+	}
+	if req.Code == "" || req.State == "" || req.ChannelID == "" {
+		writeChannelError(w, http.StatusBadRequest, "invalid_request", "code, state, and channel_id are required")
+		return
+	}
+
+	hash := hashOAuthState(req.State)
+	ok, err := h.Queries.ConsumeOAuthState(r.Context(), hash, userID)
+	if err != nil {
+		writeChannelError(w, http.StatusInternalServerError, "state_check_failed", "could not validate state")
+		return
+	}
+	if !ok {
+		writeChannelError(w, http.StatusBadRequest, "invalid_state", "state is missing, expired, or already used")
+		return
+	}
+
+	tracking, err := h.Queries.GetUserTracking(r.Context(), userID, req.ChannelID)
+	if err != nil && !errors.Is(err, db.ErrNotFound) {
+		writeChannelError(w, http.StatusInternalServerError, "lookup_failed", "could not check tracking")
+		return
+	}
+	if tracking == nil {
+		writeChannelError(w, http.StatusNotFound, "not_found", "channel not tracked")
+		return
+	}
+
+	token, info, err := oauth.ExchangeAndFetchChannel(r.Context(), req.Code)
+	if err != nil {
+		if errors.Is(err, oauth.ErrNoRefreshToken) {
+			writeChannelError(w, http.StatusBadRequest, "no_refresh_token",
+				"google did not return a refresh token; revoke the app at myaccount.google.com/permissions and try again")
+			return
+		}
+		writeChannelError(w, http.StatusBadRequest, "exchange_failed", err.Error())
+		return
+	}
+
+	// The freshly authorized identity must own the channel being re-linked;
+	// otherwise the user signed in as a different YouTube account.
+	if info.ID != tracking.PlatformChannelID {
+		writeChannelError(w, http.StatusConflict, "channel_mismatch",
+			"the authorized account does not match this channel")
+		return
+	}
+
+	accessEnc, err := auth.Encrypt(token.AccessToken)
+	if err != nil {
+		writeChannelError(w, http.StatusInternalServerError, "encryption_failed", "could not encrypt access token")
+		return
+	}
+	refreshEnc, err := auth.Encrypt(token.RefreshToken)
+	if err != nil {
+		writeChannelError(w, http.StatusInternalServerError, "encryption_failed", "could not encrypt refresh token")
+		return
+	}
+
+	expires := token.Expiry
+	if expires.IsZero() {
+		expires = time.Now().Add(1 * time.Hour)
+	}
+	if err := h.Queries.UpdateTokenAndExpiry(r.Context(), tracking.ID, accessEnc, refreshEnc, expires); err != nil {
+		writeChannelError(w, http.StatusInternalServerError, "update_failed", "could not store new token")
+		return
+	}
+
+	// Revoke the previous access token (best-effort hygiene).
+	if tracking.AccessTokenEnc != "" {
+		if oldRaw, derr := auth.Decrypt(tracking.AccessTokenEnc); derr == nil && oldRaw != "" {
+			if rerr := oauth.RevokeToken(r.Context(), oldRaw); rerr != nil {
+				log.Printf("reauthorize: revoke old token channel=%s err=%v", req.ChannelID, rerr)
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"id":                  tracking.ID,
+		"platform_channel_id": tracking.PlatformChannelID,
+		"display_name":        info.DisplayName,
+		"tracking_status":     tracking.TrackingStatus,
+		"token_priority":      tracking.TokenPriority,
+		"backfill_days":       tracking.BackfillDays,
+		"token_expires_at":    expires,
 	})
 }
 

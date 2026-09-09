@@ -19,8 +19,8 @@ import (
 var billingMeter = otel.Meter("noumena/billing")
 
 var (
-	stripeWebhookTotal    metric.Int64Counter
-	quotaUsage            metric.Int64UpDownCounter
+	stripeWebhookTotal     metric.Int64Counter
+	quotaUsage             metric.Int64UpDownCounter
 	webhookDurationSeconds metric.Float64Histogram
 )
 

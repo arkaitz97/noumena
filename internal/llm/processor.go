@@ -16,21 +16,21 @@ import (
 // Processor is the always-on batch worker that drives every classified
 // comment through an LLM. It implements the two-transaction lifecycle from
 // the spec:
-//   1. Tx1: SELECT FOR UPDATE SKIP LOCKED + enqueue llm_processing_jobs
-//      row (currently a single transaction at the DB level via the helper
-//      methods; the row-locks are implicit in the claim query and released
-//      at function return).
-//   2. LLM call (no DB locks held).
-//   3. Tx2: write classification results, increment quota, mark job done.
+//  1. Tx1: SELECT FOR UPDATE SKIP LOCKED + enqueue llm_processing_jobs
+//     row (currently a single transaction at the DB level via the helper
+//     methods; the row-locks are implicit in the claim query and released
+//     at function return).
+//  2. LLM call (no DB locks held).
+//  3. Tx2: write classification results, increment quota, mark job done.
 //
 // The LLM call is performed entirely outside any DB transaction.
 type Processor struct {
-	Client       LLMClient
-	Q            db.DBQuery
-	TickInterval time.Duration
-	BatchSize    int
-	BatchTimeout time.Duration
-	ShutdownGrace time.Duration
+	Client              LLMClient
+	Q                   db.DBQuery
+	TickInterval        time.Duration
+	BatchSize           int
+	BatchTimeout        time.Duration
+	ShutdownGrace       time.Duration
 	ConfidenceThreshold float64
 
 	// inflight tracks Tx2 work-in-progress so graceful shutdown can wait.
@@ -58,6 +58,10 @@ func (p *Processor) Run(ctx context.Context) {
 		log.Println("LLM Processor: missing client or db, exiting")
 		return
 	}
+	// Boot sweep: a restart can leave 'processing' rows that shadow the
+	// dedupe forever (event=batch_deduped). Single processor instance, so
+	// olderThan=0 is safe — no live batch can exist before Run starts.
+	p.sweepOrphanedLLMJobs(ctx, 0)
 	ticker := time.NewTicker(p.TickInterval)
 	defer ticker.Stop()
 
@@ -70,8 +74,44 @@ func (p *Processor) Run(ctx context.Context) {
 			p.shutdown()
 			return
 		case <-ticker.C:
+			// Sweep orphans older than the LLM batch age bound before
+			// claiming, so a corpse can never dedupe-shadow a live batch.
+			p.sweepOrphanedLLMJobs(ctx, 10*time.Minute)
 			p.tickOnce(ctx)
 		}
+	}
+}
+
+// sweepOrphanedLLMJobs marks llm_processing_jobs rows stuck in 'processing'
+// older than olderThan as failed (see RecoverStaleLLMJobs: failed, never
+// pending, so they cannot shadow the dedupe again). RecoverStaleLLMJobs is
+// declared on db.DBQuery, so the type-assert is belt-and-braces: fakes that
+// embed a nil db.DBQuery promote the method but panic on call (see
+// enqueueLLMJobDeduped), and a recovered panic keeps them a silent no-op.
+func (p *Processor) sweepOrphanedLLMJobs(ctx context.Context, olderThan time.Duration) {
+	defer func() {
+		if r := recover(); r != nil {
+			// Nil-embedded db.DBQuery test double: treat as no reaper.
+			return
+		}
+	}()
+	reaper, ok := p.Q.(interface {
+		RecoverStaleLLMJobs(context.Context, time.Duration) (int64, error)
+	})
+	if !ok {
+		return
+	}
+	n, err := reaper.RecoverStaleLLMJobs(ctx, olderThan)
+	if err != nil {
+		log.Printf("LLM Processor: orphan sweep failed: %v", err)
+		return
+	}
+	if olderThan == 0 {
+		log.Printf("LLM Processor: startup reaper expired %d orphaned jobs", n)
+		return
+	}
+	if n > 0 {
+		log.Printf("LLM Processor: reaper expired %d orphaned jobs", n)
 	}
 }
 
@@ -95,6 +135,12 @@ func (p *Processor) shutdown() {
 // horizontal scaling comes from running multiple processor instances (the
 // FOR UPDATE SKIP LOCKED claim guarantees disjoint subsets).
 func (p *Processor) tickOnce(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("LLM Processor: PANIC recovered in tick: %v", r)
+			recordLLMRequest(ctx, "unknown", "unknown", time.Now(), errors.New("panic"))
+		}
+	}()
 	grouped, err := p.Q.GetUnprocessedCommentsByChannel(ctx, p.BatchSize)
 	if err != nil {
 		log.Printf("LLM Processor: claim failed: %v", err)
@@ -144,14 +190,18 @@ func (p *Processor) processChannelBatch(ctx context.Context, channelID string, b
 		return
 	}
 
-	// Enqueue the job row for observability.
+	// Enqueue the job row for observability with dedupe.
 	commentIDs := make([]string, 0, len(batch))
 	for _, c := range batch {
 		commentIDs = append(commentIDs, c.ID)
 	}
-	jobID, err := p.Q.EnqueueLLMJob(ctx, commentIDs, p.Client.ProviderName())
+	jobID, created, err := enqueueLLMJobDeduped(ctx, p.Q, commentIDs, p.Client.ProviderName())
 	if err != nil {
 		log.Printf("LLM Processor: EnqueueLLMJob failed channel=%s: %v", channelID, err)
+		return
+	}
+	if !created {
+		log.Printf("event=batch_deduped channel_id=%s job_id=%s batch_size=%d", channelID, jobID, len(batch))
 		return
 	}
 	if err := p.Q.MarkLLMJobProcessing(ctx, jobID); err != nil {
@@ -161,6 +211,10 @@ func (p *Processor) processChannelBatch(ctx context.Context, channelID string, b
 
 	log.Printf("event=batch_started channel_id=%s job_id=%s batch_size=%d provider=%s model=%s",
 		channelID, jobID, len(batch), p.Client.ProviderName(), p.Client.ModelName())
+
+	// inflight covers the LLM call so graceful shutdown waits for it.
+	p.inflight.Add(1)
+	defer p.inflight.Done()
 
 	// Build prompt input. The LLM call happens outside any DB transaction.
 	customPrompt := ""
@@ -203,8 +257,6 @@ func (p *Processor) processChannelBatch(ctx context.Context, channelID string, b
 	results = ApplyConfidenceThreshold(results, p.ConfidenceThreshold)
 
 	// Persist results, increment quota, mark job complete.
-	p.inflight.Add(1)
-	defer p.inflight.Done()
 	if err := p.persistBatch(ctx, batch, results, primary, jobID); err != nil {
 		msg := truncate(fmt.Sprintf("%v", err), 4000)
 		_ = p.Q.MarkLLMJobFailed(ctx, jobID, msg)
@@ -214,6 +266,24 @@ func (p *Processor) processChannelBatch(ctx context.Context, channelID string, b
 
 	log.Printf("event=batch_completed channel_id=%s job_id=%s batch_size=%d primary_user_id=%s",
 		channelID, jobID, len(batch), primary.ID)
+}
+
+func enqueueLLMJobDeduped(ctx context.Context, q db.DBQuery, commentIDs []string, provider string) (id string, created bool, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			// Embedded nil DBQuery double (test fakes) promoted the method
+			// set but panics on call — fall back to plain enqueue.
+			id, err = q.EnqueueLLMJob(ctx, commentIDs, provider)
+			created = true
+		}
+	}()
+	if deduper, ok := q.(interface {
+		EnqueueLLMJobIfNotExists(context.Context, []string, string) (string, bool, error)
+	}); ok {
+		return deduper.EnqueueLLMJobIfNotExists(ctx, commentIDs, provider)
+	}
+	id, err = q.EnqueueLLMJob(ctx, commentIDs, provider)
+	return id, true, err
 }
 
 // persistBatch writes every classification result, increments the primary
@@ -237,6 +307,9 @@ func (p *Processor) persistBatch(ctx context.Context, batch []*db.Comment, resul
 		}
 		if err := p.Q.UpdateCommentLLMData(ctx, c.ID, r.Category, r.Topic, p.Client.ProviderName(), p.Client.ModelName(), mustMarshalInsights(r.ActionableInsights), r.Confidence); err != nil {
 			return fmt.Errorf("update comment %s: %w", c.ID, err)
+		}
+		if err := p.updateCommentSentiment(ctx, c.ID, SentimentScore(r.Sentiment)); err != nil {
+			return fmt.Errorf("update comment %s sentiment: %w", c.ID, err)
 		}
 	}
 	if err := p.Q.IncrementCommentsUsed(ctx, primary.ID, len(batch)); err != nil {
@@ -283,6 +356,20 @@ func max2(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// updateCommentSentiment persists the LLM sentiment score. The DBQuery
+// interface does not declare this method (it lives on the concrete
+// SQLiteQuery), so we type-assert like enqueueLLMJobDeduped; DBs that lack
+// it (test fakes) are skipped gracefully.
+func (p *Processor) updateCommentSentiment(ctx context.Context, commentID string, score int) error {
+	su, ok := p.Q.(interface {
+		UpdateCommentSentiment(context.Context, string, int) error
+	})
+	if !ok {
+		return nil
+	}
+	return su.UpdateCommentSentiment(ctx, commentID, score)
 }
 
 func truncate(s string, n int) string {

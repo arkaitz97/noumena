@@ -314,7 +314,12 @@ func isUUID(s string) bool {
 
 // --- Insights aggregates ----------------------------------------------------
 
-// ActionableInsights handles GET /api/insights/actionable-insights.
+// ActionableInsights handles GET /api/insights/actionable-insights. Returns
+// the dashboard aggregate (window, distribution, top insights, total) in one
+// payload matching the frontend contract; the /top and /distribution
+// sub-endpoints remain available for lighter consumers. Window may come as
+// `window=7d|30d|90d` (frontend) or `days=7|30|90` (clamped like the other
+// aggregate endpoints; invalid values fall back to 30).
 func (h *InsightsHandler) ActionableInsights(w http.ResponseWriter, r *http.Request) {
 	userID, ok := r.Context().Value(UserIDKey).(string)
 	if !ok || userID == "" {
@@ -328,17 +333,65 @@ func (h *InsightsHandler) ActionableInsights(w http.ResponseWriter, r *http.Requ
 	}
 	q := r.URL.Query()
 	days := 30
+	switch q.Get("window") {
+	case "7d":
+		days = 7
+	case "30d":
+		days = 30
+	case "90d":
+		days = 90
+	}
 	if v := q.Get("days"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		if n, err := strconv.Atoi(v); err == nil && (n == 7 || n == 30 || n == 90) {
 			days = n
 		}
 	}
-	insights, err := h.Queries.GetTopInsights(r.Context(), userID, channelID, time.Now().Add(-time.Duration(days)*24*time.Hour), 50)
+	window := "30d"
+	switch days {
+	case 7:
+		window = "7d"
+	case 90:
+		window = "90d"
+	}
+	since := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
+	top, err := h.Queries.GetTopInsights(r.Context(), userID, channelID, since, 50)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "aggregate_failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, insights)
+	dist, err := h.Queries.GetInsightDistribution(r.Context(), userID, channelID, since)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "aggregate_failed")
+		return
+	}
+	if top == nil {
+		top = []db.TopInsight{}
+	}
+	if dist == nil {
+		dist = []db.InsightTypeCount{}
+	}
+	var total int64
+	for _, d := range dist {
+		total += d.Count
+	}
+	var channelIDOut *string
+	if channelID != nil {
+		s := *channelID
+		channelIDOut = &s
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Window        string                `json:"window"`
+		ChannelID     *string               `json:"channel_id"`
+		Distribution  []db.InsightTypeCount `json:"distribution"`
+		TopInsights   []db.TopInsight       `json:"top_insights"`
+		TotalInsights int64                 `json:"total_insights"`
+	}{
+		Window:        window,
+		ChannelID:     channelIDOut,
+		Distribution:  dist,
+		TopInsights:   top,
+		TotalInsights: total,
+	})
 }
 
 // TopInsights handles GET /api/insights/actionable-insights/top.
@@ -356,7 +409,7 @@ func (h *InsightsHandler) TopInsights(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	days := 30
 	if v := q.Get("days"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		if n, err := strconv.Atoi(v); err == nil && (n == 7 || n == 30 || n == 90) {
 			days = n
 		}
 	}
@@ -395,7 +448,7 @@ func (h *InsightsHandler) InsightDistribution(w http.ResponseWriter, r *http.Req
 	q := r.URL.Query()
 	days := 30
 	if v := q.Get("days"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		if n, err := strconv.Atoi(v); err == nil && (n == 7 || n == 30 || n == 90) {
 			days = n
 		}
 	}
@@ -417,12 +470,9 @@ func (h *InsightsHandler) RefreshInsightsView(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusOK, map[string]string{"status": "refreshed"})
 }
 
-type toxicityResponse struct {
-	ChannelID string                          `json:"channel_id"`
-	Windows   map[string]db.ToxicityBucket    `json:"windows"`
-}
-
 // ToxicityShield handles GET /api/insights/toxicity-shield. Task 7.4.
+// Returns the requested window's toxicity aggregate in the flat shape the
+// dashboard shield card renders (window defaults to 7d).
 func (h *InsightsHandler) ToxicityShield(w http.ResponseWriter, r *http.Request) {
 	userID, ok := r.Context().Value(UserIDKey).(string)
 	if !ok || userID == "" {
@@ -434,33 +484,43 @@ func (h *InsightsHandler) ToxicityShield(w http.ResponseWriter, r *http.Request)
 		writeJSONError(w, code, "not_tracked")
 		return
 	}
-	now := time.Now()
-	resp := toxicityResponse{
-		ChannelID: "all",
-		Windows:   map[string]db.ToxicityBucket{},
+	window := "7d"
+	if v := r.URL.Query().Get("window"); v == "30d" {
+		window = "30d"
 	}
+	days := 7
+	if window == "30d" {
+		days = 30
+	}
+	b, err := h.Queries.GetToxicityShield(r.Context(), userID, channelID, time.Now().Add(-time.Duration(days)*24*time.Hour))
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "aggregate_failed")
+		return
+	}
+	channelIDOut := "all"
 	if channelID != nil {
-		resp.ChannelID = *channelID
+		channelIDOut = *channelID
 	}
-	for label, dur := range map[string]time.Duration{
-		"7d":  7 * 24 * time.Hour,
-		"30d": 30 * 24 * time.Hour,
-	} {
-		b, err := h.Queries.GetToxicityShield(r.Context(), userID, channelID, now.Add(-dur))
-		if err != nil {
-			writeJSONError(w, http.StatusInternalServerError, "aggregate_failed")
-			return
-		}
-		resp.Windows[label] = b
-	}
-	writeJSON(w, http.StatusOK, resp)
+	writeJSON(w, http.StatusOK, struct {
+		Window           string  `json:"window"`
+		ChannelID        string  `json:"channel_id"`
+		FilteredPct      float64 `json:"filtered_pct"`
+		FilteredComments int64   `json:"filtered_comments"`
+		TotalComments    int64   `json:"total_comments"`
+	}{
+		Window:           window,
+		ChannelID:        channelIDOut,
+		FilteredPct:      b.FilteredPct,
+		FilteredComments: b.FilteredCount,
+		TotalComments:    b.TotalComments,
+	})
 }
 
 type trendsResponse struct {
-	ChannelID     string             `json:"channel_id"`
-	Days          int                `json:"days"`
-	TopTopics     []db.TopicRow      `json:"top_topics"`
-	TopCategories []db.CategoryRow   `json:"top_categories"`
+	ChannelID     string           `json:"channel_id"`
+	Days          int              `json:"days"`
+	TopTopics     []db.TopicRow    `json:"top_topics"`
+	TopCategories []db.CategoryRow `json:"top_categories"`
 }
 
 // Trends handles GET /api/insights/trends. Task 7.5.
@@ -532,6 +592,58 @@ func (h *InsightsHandler) validateChannelID(r *http.Request) (*string, int) {
 		return nil, http.StatusForbidden
 	}
 	return &v, 0
+}
+
+// sentimentResponse is the documented shape for GET /api/insights/sentiment
+// (contract with the dashboard SentimentChart).
+type sentimentResponse struct {
+	Days   int               `json:"days"`
+	Series []db.SentimentDay `json:"series"`
+}
+
+// Sentiment handles GET /api/insights/sentiment?channel_id=&days=.
+// channel_id is optional: when absent, the series aggregates across every
+// channel the caller tracks (global trend). When present it must be a
+// channel the user tracks (403 otherwise); days is limited to {7,30,90} and
+// defaults to 7. Per-day aggregates are computed at the SQL layer joined on
+// the caller's channel access, so untracked channels never leak rows.
+func (h *InsightsHandler) Sentiment(w http.ResponseWriter, r *http.Request) {
+	userID, ok := r.Context().Value(UserIDKey).(string)
+	if !ok || userID == "" {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	channelID, code := h.validateChannelID(r)
+	if code == http.StatusBadRequest {
+		writeJSONError(w, http.StatusBadRequest, "invalid_channel_id")
+		return
+	}
+	if code != 0 {
+		writeJSONError(w, code, "not_tracked")
+		return
+	}
+	days := 7
+	if v := r.URL.Query().Get("days"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || (n != 7 && n != 30 && n != 90) {
+			writeJSONError(w, http.StatusBadRequest, "invalid_days")
+			return
+		}
+		days = n
+	}
+	scoped := ""
+	if channelID != nil {
+		scoped = *channelID
+	}
+	series, err := h.Queries.GetSentimentSeries(r.Context(), userID, scoped, days)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "sentiment_failed")
+		return
+	}
+	if series == nil {
+		series = []db.SentimentDay{}
+	}
+	writeJSON(w, http.StatusOK, sentimentResponse{Days: days, Series: series})
 }
 
 // --- Export lifecycle -------------------------------------------------------
@@ -637,7 +749,7 @@ func (h *InsightsHandler) CreateExport(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "open_failed")
 		return
 	}
-	rowCount, eerr := export.StreamExport(r.Context(), h.Queries.DB(), userID, filters, req.Format, f)
+	rowCount, eerr := export.StreamExport(r.Context(), h.Queries.ExportReadDB(), userID, filters, req.Format, f)
 	if eerr != nil {
 		_ = f.Close()
 		_ = h.Queries.MarkExportFailed(context.Background(), exp.ID, eerr.Error(), false)
@@ -662,6 +774,51 @@ func (h *InsightsHandler) CreateExport(w http.ResponseWriter, r *http.Request) {
 		"expires_at":   expiresAt.Format(time.RFC3339),
 		"row_count":    rowCount,
 	})
+}
+
+// ListRecentExports handles GET /api/comments/export/recent (fix-frontend-
+// plumbing). Returns the caller's most recent comment exports, newest first.
+func (h *InsightsHandler) ListRecentExports(w http.ResponseWriter, r *http.Request) {
+	userID, ok := r.Context().Value(UserIDKey).(string)
+	if !ok || userID == "" {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	limit := 10
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 50 {
+			limit = n
+		}
+	}
+	exports, err := h.Queries.ListExports(r.Context(), userID, limit)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "list_failed")
+		return
+	}
+	out := make([]map[string]any, 0, len(exports))
+	for _, exp := range exports {
+		row := map[string]any{
+			"job_id":     exp.ID,
+			"format":     exp.Format,
+			"status":     exp.Status,
+			"row_count":  exp.RowCount,
+			"created_at": exp.CreatedAt.Format(time.RFC3339),
+		}
+		if exp.CompletedAt != nil {
+			row["completed_at"] = exp.CompletedAt.Format(time.RFC3339)
+		}
+		if exp.ExpiresAt != nil {
+			row["expires_at"] = exp.ExpiresAt.Format(time.RFC3339)
+		}
+		if exp.Status == "completed" {
+			row["download_url"] = "/api/comments/export/" + exp.ID + "/download"
+		}
+		if exp.Error != nil {
+			row["error"] = *exp.Error
+		}
+		out = append(out, row)
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // ExportStatus handles GET /api/comments/export/{job_id}/status. Task 8.5.

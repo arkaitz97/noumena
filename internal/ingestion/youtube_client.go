@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"noumena/internal/db"
@@ -40,6 +41,17 @@ func (e *RateLimitError) Error() string {
 		e.StatusCode, e.Reason, e.RetryAfter)
 }
 
+// CommentsDisabledError indicates the target video has comments disabled
+// (HTTP 403, reason=commentsDisabled). Permanent per-video condition: callers
+// should skip the video, not retry.
+type CommentsDisabledError struct {
+	Path string
+}
+
+func (e *CommentsDisabledError) Error() string {
+	return fmt.Sprintf("youtube comments disabled: %s", e.Path)
+}
+
 // ============================================================================
 // YouTubeClient
 // ============================================================================
@@ -50,6 +62,11 @@ func (e *RateLimitError) Error() string {
 type YouTubeClient struct {
 	HTTP    *http.Client
 	BaseURL string // override for tests; default https://www.googleapis.com/youtube/v3
+	// APIKey, when non-empty, authenticates via ?key= instead of the
+	// Authorization bearer header. Enables OAuth-free reads of public data
+	// (search/commentThreads/comments). OAuth-only endpoints (channels?mine)
+	// still require a token.
+	APIKey string
 }
 
 // NewYouTubeClient returns a client with sensible defaults.
@@ -87,6 +104,8 @@ type CommentThread struct {
 	AuthorHandle    string
 	Body            string
 	PostedAt        time.Time
+	VideoID         string
+	VideoTitle      string
 }
 
 func (t *CommentThread) ToDBComment(platformChannelID string) *db.Comment {
@@ -94,6 +113,15 @@ func (t *CommentThread) ToDBComment(platformChannelID string) *db.Comment {
 	if t.AuthorHandle != "" {
 		a := t.AuthorHandle
 		author = &a
+	}
+	var videoID, videoTitle *string
+	if t.VideoID != "" {
+		v := t.VideoID
+		videoID = &v
+	}
+	if t.VideoTitle != "" {
+		v := t.VideoTitle
+		videoTitle = &v
 	}
 	rd := t.ReplyDepth
 	return &db.Comment{
@@ -104,6 +132,8 @@ func (t *CommentThread) ToDBComment(platformChannelID string) *db.Comment {
 		AuthorHandle:      author,
 		Body:              t.Body,
 		PostedAt:          t.PostedAt,
+		VideoID:           videoID,
+		VideoTitle:        videoTitle,
 	}
 }
 
@@ -114,6 +144,7 @@ func (t *CommentThread) ToDBComment(platformChannelID string) *db.Comment {
 // VideoRef is the pair (id, publishedAt) yielded by ListVideos.
 type VideoRef struct {
 	ID          string
+	Title       string
 	PublishedAt time.Time
 }
 
@@ -125,6 +156,7 @@ type searchListResponse struct {
 		} `json:"id"`
 		Snippet struct {
 			PublishedAt string `json:"publishedAt"`
+			Title       string `json:"title"`
 		} `json:"snippet"`
 	} `json:"items"`
 }
@@ -168,7 +200,7 @@ func (c *YouTubeClient) ListVideos(ctx context.Context, accessToken, channelID s
 				continue
 			}
 			pubAt, _ := time.Parse(time.RFC3339, it.Snippet.PublishedAt)
-			buffer = append(buffer, VideoRef{ID: it.ID.VideoID, PublishedAt: pubAt})
+			buffer = append(buffer, VideoRef{ID: it.ID.VideoID, Title: it.Snippet.Title, PublishedAt: pubAt})
 		}
 		bufferIdx = 0
 		pageToken = parsed.NextPageToken
@@ -210,6 +242,7 @@ type commentSnippet struct {
 	TextOriginal      string `json:"textOriginal"`
 	PublishedAt       string `json:"publishedAt"`
 	ParentID          string `json:"parentId"`
+	VideoID           string `json:"videoId"`
 }
 
 type ytComment struct {
@@ -283,6 +316,7 @@ func (c *YouTubeClient) ListReplies(ctx context.Context, accessToken, parentComm
 				AuthorHandle:    c.Snippet.AuthorDisplayName,
 				Body:            rBody,
 				PostedAt:        rPosted,
+				VideoID:         c.Snippet.VideoID,
 			})
 		}
 		idx = 0
@@ -359,6 +393,7 @@ func (c *YouTubeClient) ListCommentThreads(ctx context.Context, accessToken, vid
 				AuthorHandle:    tlc.Snippet.AuthorDisplayName,
 				Body:            body,
 				PostedAt:        topPosted,
+				VideoID:         tlc.Snippet.VideoID,
 			})
 			if item.Replies != nil {
 				for _, reply := range item.Replies.Comments {
@@ -382,6 +417,7 @@ func (c *YouTubeClient) ListCommentThreads(ctx context.Context, accessToken, vid
 						AuthorHandle:    reply.Snippet.AuthorDisplayName,
 						Body:            rBody,
 						PostedAt:        rPosted,
+						VideoID:         reply.Snippet.VideoID,
 					})
 				}
 			}
@@ -417,19 +453,105 @@ func (c *YouTubeClient) ListCommentThreads(ctx context.Context, accessToken, vid
 }
 
 // ============================================================================
+// Channel resolution (OAuth-free, public)
+// ============================================================================
+
+// ParseYouTubeChannelRef extracts a @handle or a bare channel id from raw
+// user input. Accepts: `@handle`, `https://www.youtube.com/@handle[/...]`,
+// `https://www.youtube.com/channel/UC...`, or a bare `UC...` id. Legacy
+// /c/ and /user/ URLs are not supported (YouTube deprecated forUsername).
+func ParseYouTubeChannelRef(ref string) (handle, channelID string) {
+	s := strings.TrimSpace(ref)
+	if s == "" {
+		return "", ""
+	}
+	if u, err := url.Parse(s); err == nil && u.Host != "" {
+		s = u.Path
+	}
+	s = strings.Trim(s, "/")
+	if strings.HasPrefix(s, "channel/") {
+		id := strings.TrimPrefix(s, "channel/")
+		if j := strings.IndexAny(id, "/?#"); j >= 0 {
+			id = id[:j]
+		}
+		return "", id
+	}
+	if i := strings.LastIndex(s, "@"); i >= 0 {
+		h := strings.TrimSpace(s[i+1:])
+		if j := strings.IndexAny(h, "/?#"); j >= 0 {
+			h = strings.TrimSpace(h[:j])
+		}
+		return h, ""
+	}
+	if strings.HasPrefix(s, "UC") && len(s) >= 24 {
+		return "", s
+	}
+	return "", ""
+}
+
+// ResolveChannelRef resolves a public channel from a handle/URL/bare-id ref
+// via `channels.list` authenticated with the API key (OAuth-free). Returns
+// canonical channel id + display name. Requires APIKey to be set.
+func (c *YouTubeClient) ResolveChannelRef(ctx context.Context, ref string) (*ChannelInfo, error) {
+	handle, channelID := ParseYouTubeChannelRef(ref)
+	if handle == "" && channelID == "" {
+		return nil, fmt.Errorf("unsupported channel reference %q: use a @handle or channel URL", ref)
+	}
+	if c.APIKey == "" {
+		return nil, fmt.Errorf("public channel tracking not configured on this server (YOUTUBE_API_KEY)")
+	}
+	q := url.Values{}
+	q.Set("part", "snippet")
+	if channelID != "" {
+		q.Set("id", channelID)
+	} else {
+		q.Set("forHandle", handle)
+	}
+	body, err := c.doGET(ctx, "", "/channels?"+q.Encode())
+	if err != nil {
+		return nil, err
+	}
+	var parsed struct {
+		Items []struct {
+			ID      string `json:"id"`
+			Snippet struct {
+				Title string `json:"title"`
+			} `json:"snippet"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("decode channels.list: %w", err)
+	}
+	if len(parsed.Items) == 0 {
+		return nil, fmt.Errorf("no youtube channel found for %q", ref)
+	}
+	item := parsed.Items[0]
+	return &ChannelInfo{ID: item.ID, DisplayName: item.Snippet.Title, Title: item.Snippet.Title}, nil
+}
+
+// ============================================================================
 // HTTP plumbing — error classification, no internal retries.
 // ============================================================================
 
-// doGET issues a GET to baseURL+path with bearer auth and returns the body.
-// It surfaces typed errors for 401 and rate-limit conditions; all other
-// non-2xx responses become a plain error. There are NO internal retries —
-// retry policy is owned by the worker.
+// doGET issues a GET to baseURL+path with either bearer auth or an API key
+// and returns the body. It surfaces typed errors for 401 and rate-limit
+// conditions; all other non-2xx responses become a plain error. There are NO
+// internal retries — retry policy is owned by the worker.
 func (c *YouTubeClient) doGET(ctx context.Context, accessToken, path string) ([]byte, error) {
+	if c.APIKey != "" {
+		sep := "?"
+		if strings.Contains(path, "?") {
+			sep = "&"
+		}
+		path += sep + "key=" + url.QueryEscape(c.APIKey)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base()+path, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
+	if c.APIKey == "" {
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+	}
 	req.Header.Set("Accept", "application/json")
 	resp, err := c.http().Do(req)
 	if err != nil {
@@ -472,6 +594,9 @@ func (c *YouTubeClient) doGET(ctx context.Context, accessToken, path string) ([]
 					ra = 1 * time.Hour
 				}
 				return nil, &RateLimitError{StatusCode: resp.StatusCode, RetryAfter: ra, Reason: e.Reason}
+			}
+			if e.Reason == "commentsDisabled" {
+				return nil, &CommentsDisabledError{Path: path}
 			}
 		}
 	}

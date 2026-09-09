@@ -91,8 +91,8 @@ type IDClaims struct {
 
 // ExchangeAndVerify exchanges the authorization code for tokens (using the
 // PKCE verifier) and verifies the resulting ID token's `aud`, `iss`, `exp`,
-// and signature. Returns the verified claims on success.
-func ExchangeAndVerify(ctx context.Context, code, codeVerifier string) (*IDClaims, error) {
+// and signature. Returns the raw (verified) ID token and its claims.
+func ExchangeAndVerify(ctx context.Context, code, codeVerifier string) (string, *IDClaims, error) {
 	return ExchangeAndVerifyWithRedirect(ctx, code, codeVerifier, config.Default.GoogleSSORedirectURL)
 }
 
@@ -101,7 +101,7 @@ func ExchangeAndVerify(ctx context.Context, code, codeVerifier string) (*IDClaim
 // requires the redirect_uri sent with the code exchange to match the one used
 // in the original authorization request, so the popup JSON flow must echo its
 // SPA-side redirect URI here.
-func ExchangeAndVerifyWithRedirect(ctx context.Context, code, codeVerifier, redirectURI string) (*IDClaims, error) {
+func ExchangeAndVerifyWithRedirect(ctx context.Context, code, codeVerifier, redirectURI string) (string, *IDClaims, error) {
 	form := url.Values{}
 	form.Set("code", code)
 	form.Set("client_id", config.Default.GoogleSSOClientID)
@@ -113,29 +113,33 @@ func ExchangeAndVerifyWithRedirect(ctx context.Context, code, codeVerifier, redi
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		"https://oauth2.googleapis.com/token", strings.NewReader(form.Encode()))
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	c := &http.Client{Timeout: 10 * time.Second}
 	resp, err := c.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("google token exchange: %w", err)
+		return "", nil, fmt.Errorf("google token exchange: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("google token exchange failed: %d %s", resp.StatusCode, string(body))
+		return "", nil, fmt.Errorf("google token exchange failed: %d %s", resp.StatusCode, string(body))
 	}
 	var tok struct {
 		IDToken string `json:"id_token"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&tok); err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	if tok.IDToken == "" {
-		return nil, errors.New("no id_token in google response")
+		return "", nil, errors.New("no id_token in google response")
 	}
-	return VerifyIDToken(ctx, tok.IDToken)
+	claims, err := VerifyIDToken(ctx, tok.IDToken)
+	if err != nil {
+		return "", nil, err
+	}
+	return tok.IDToken, claims, nil
 }
 
 // VerifyIDToken verifies a Google ID token's signature against Google's

@@ -10,9 +10,9 @@ import (
 	"sort"
 	"time"
 
-	_ "modernc.org/sqlite"
 	"github.com/stripe/stripe-go/v76"
 	stripesub "github.com/stripe/stripe-go/v76/subscription"
+	_ "modernc.org/sqlite"
 )
 
 func main() {

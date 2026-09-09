@@ -2,6 +2,7 @@ package email
 
 import (
 	"fmt"
+	html "html"
 	"log"
 	"time"
 
@@ -151,17 +152,24 @@ func (c *ResendClient) SendTokenExpiryEmail(to, channelName string, expiresAt ti
 		From:    c.from,
 		To:      []string{to},
 		Subject: fmt.Sprintf("Reconnect %s before its access expires", channelName),
-		Html: fmt.Sprintf(
-			`<p>The OAuth access for <strong>%s</strong> will expire on <strong>%s</strong>.</p>`+
-				`<p>To keep ingestion running, please reconnect the channel from your <a href="%s">channel settings</a>.</p>`+
-				`<p>If you no longer want to track this channel, you can ignore this email and the channel will simply stop syncing.</p>`,
-			channelName, expiresHuman, settingsURL),
+		Html:    tokenExpiryHTML(channelName, expiresHuman, settingsURL),
 	}
 	_, err := c.client.Emails.Send(params)
 	if err != nil {
 		return fmt.Errorf("failed to send token-expiry email: %w", err)
 	}
 	return nil
+}
+
+// tokenExpiryHTML builds the token-expiry body. channelName is
+// YouTube-supplied content, so it MUST be escaped before interpolation
+// into HTML (fix-email-delivery 6.x: HTML injection in mail).
+func tokenExpiryHTML(channelName, expiresHuman, settingsURL string) string {
+	return fmt.Sprintf(
+		`<p>The OAuth access for <strong>%s</strong> will expire on <strong>%s</strong>.</p>`+
+			`<p>To keep ingestion running, please reconnect the channel from your <a href="%s">channel settings</a>.</p>`+
+			`<p>If you no longer want to track this channel, you can ignore this email and the channel will simply stop syncing.</p>`,
+		html.EscapeString(channelName), html.EscapeString(expiresHuman), html.EscapeString(settingsURL))
 }
 
 // MockClient implements the Client interface for local testing

@@ -15,6 +15,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"net/smtp"
 	"strings"
@@ -34,6 +35,12 @@ type NetSMTPSender struct {
 	// DialTimeout caps the TCP dial. Defaults to 10s.
 	DialTimeout time.Duration
 
+	// CmdTimeout bounds each SMTP command (MAIL/RCPT/DATA/QUIT and the
+	// DATA body write). Defaults to 10s. A stalled relay fails the send
+	// within this bound instead of hanging the goroutine forever
+	// (fix-email-delivery 3.x). Configurable via SMTP_CMD_TIMEOUT.
+	CmdTimeout time.Duration
+
 	// AllowInsecure is true when the caller has confirmed the host is a
 	// local/dev relay. Production deployments should leave it false.
 	AllowInsecure bool
@@ -44,10 +51,14 @@ type NetSMTPSender struct {
 // Transient/permanent classification is left to the caller — the caller
 // (the pipeline) treats *any* error as transient and lets the retry
 // worker decide when to give up after attempt_count >= 3.
-func (s *NetSMTPSender) Send(ctx context.Context, from, to, subject, htmlBody, textBody string) error {
+func (s *NetSMTPSender) Send(ctx context.Context, from, to, subject, htmlBody, textBody string, headers []string) error {
 	timeout := s.DialTimeout
 	if timeout == 0 {
 		timeout = 10 * time.Second
+	}
+	cmdTimeout := s.CmdTimeout
+	if cmdTimeout == 0 {
+		cmdTimeout = 10 * time.Second
 	}
 	addr := fmt.Sprintf("%s:%d", s.Host, s.Port)
 
@@ -64,6 +75,19 @@ func (s *NetSMTPSender) Send(ctx context.Context, from, to, subject, htmlBody, t
 		conn = tls.Client(conn, &tls.Config{ServerName: s.Host, MinVersion: tls.VersionTLS12})
 	}
 
+	// withDeadline bounds a single command (or body write) against a
+	// stalled relay, then clears the deadline so the next command gets a
+	// fresh window. The net/smtp client reads/writes on this same conn,
+	// so setting the deadline on it covers every command round-trip.
+	withDeadline := func(fn func() error) error {
+		if err := conn.SetDeadline(time.Now().Add(cmdTimeout)); err != nil {
+			return err
+		}
+		err := fn()
+		_ = conn.SetDeadline(time.Time{})
+		return err
+	}
+
 	c, err := smtp.NewClient(conn, s.Host)
 	if err != nil {
 		_ = conn.Close()
@@ -74,41 +98,52 @@ func (s *NetSMTPSender) Send(ctx context.Context, from, to, subject, htmlBody, t
 	// STARTTLS upgrade for port 587 (or any port other than 465 when
 	// AllowInsecure is false).
 	if s.Port != 465 && !s.AllowInsecure {
-		if ok, _ := c.Extension("STARTTLS"); !ok {
-			return fmt.Errorf("smtp server %s does not advertise STARTTLS", s.Host)
-		}
-		if err := c.StartTLS(&tls.Config{ServerName: s.Host, MinVersion: tls.VersionTLS12}); err != nil {
+		if err := withDeadline(func() error {
+			if ok, _ := c.Extension("STARTTLS"); !ok {
+				return fmt.Errorf("smtp server %s does not advertise STARTTLS", s.Host)
+			}
+			return c.StartTLS(&tls.Config{ServerName: s.Host, MinVersion: tls.VersionTLS12})
+		}); err != nil {
 			return fmt.Errorf("smtp starttls: %w", err)
 		}
 	}
 
 	if s.Username != "" {
 		auth := smtp.PlainAuth("", s.Username, s.Password, s.Host)
-		if err := c.Auth(auth); err != nil {
+		if err := withDeadline(func() error { return c.Auth(auth) }); err != nil {
 			return fmt.Errorf("smtp auth: %w", err)
 		}
 	}
 
-	if err := c.Mail(extractAddr(from)); err != nil {
+	if err := withDeadline(func() error { return c.Mail(extractAddr(from)) }); err != nil {
 		return fmt.Errorf("smtp MAIL FROM: %w", err)
 	}
-	if err := c.Rcpt(to); err != nil {
+	if err := withDeadline(func() error { return c.Rcpt(to) }); err != nil {
 		return fmt.Errorf("smtp RCPT TO: %w", err)
 	}
 
-	wc, err := c.Data()
-	if err != nil {
+	var wc io.WriteCloser
+	if err := withDeadline(func() error {
+		var werr error
+		wc, werr = c.Data()
+		return werr
+	}); err != nil {
 		return fmt.Errorf("smtp DATA: %w", err)
 	}
-	msg := buildMIMEMessage(from, to, subject, htmlBody, textBody)
-	if _, err := wc.Write([]byte(msg)); err != nil {
-		_ = wc.Close()
+	msg := buildMIMEMessage(from, to, subject, htmlBody, textBody, headers)
+	if err := withDeadline(func() error {
+		if _, werr := wc.Write([]byte(msg)); werr != nil {
+			_ = wc.Close()
+			return werr
+		}
+		return nil
+	}); err != nil {
 		return fmt.Errorf("smtp write body: %w", err)
 	}
-	if err := wc.Close(); err != nil {
+	if err := withDeadline(func() error { return wc.Close() }); err != nil {
 		return fmt.Errorf("smtp close data: %w", err)
 	}
-	if err := c.Quit(); err != nil {
+	if err := withDeadline(func() error { return c.Quit() }); err != nil {
 		// Quit() failures are usually harmless (server closed connection
 		// after 250 OK on the DATA close); log but do not fail the send.
 		return nil
@@ -118,13 +153,18 @@ func (s *NetSMTPSender) Send(ctx context.Context, from, to, subject, htmlBody, t
 
 // buildMIMEMessage produces a multipart/alternative payload with the text
 // body first, HTML body second (the recommended order so RFC-compliant
-// readers prefer the richer HTML view).
-func buildMIMEMessage(from, to, subject, htmlBody, textBody string) string {
+// readers prefer the richer HTML view). headers carries optional
+// pre-formatted MIME header lines (e.g. "List-Unsubscribe: <url>").
+func buildMIMEMessage(from, to, subject, htmlBody, textBody string, headers []string) string {
 	boundary := "noumena_boundary_" + boundarySalt()
 	var b strings.Builder
 	fmt.Fprintf(&b, "From: %s\r\n", from)
 	fmt.Fprintf(&b, "To: %s\r\n", to)
 	fmt.Fprintf(&b, "Subject: %s\r\n", encodeSubject(subject))
+	for _, h := range headers {
+		b.WriteString(h)
+		b.WriteString("\r\n")
+	}
 	b.WriteString("MIME-Version: 1.0\r\n")
 	fmt.Fprintf(&b, "Content-Type: multipart/alternative; boundary=%q\r\n\r\n", boundary)
 

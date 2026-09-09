@@ -1,33 +1,10 @@
 // Package email: retry_worker.go is the goroutine that drains
 // email_send_log rows left in status='pending' by failed Send attempts.
 //
-// The worker is intentionally lightweight: it does NOT re-render the
-// message body. The pipeline cannot recover the original Variables map
-// across a process restart, so the retry path can only re-attempt
-// templates whose inputs are reconstructible from (user_id, template) +
-// the idempotency key. In practice this works for every template in the
-// registry because:
-//
-//   - account_deletion_scheduled / completed → variables come from
-//     account_deletion_jobs row (lookup by user_id)
-//   - export_ready → variables come from data_export_jobs (lookup by
-//     user_id; pick the latest 'completed')
-//   - email_verification / password_reset → idempotency key encodes the
-//     token hash; we can re-render from the live token row
-//   - login_lockout / token_expiry / payment_* / trial_expiry / weekly_digest
-//     → variables come from users + auxiliary tables, all reconstructible
-//
-// For simplicity, version 1 of the worker just re-issues a *minimal*
-// renderable payload that includes only the layout-required common vars
-// and re-attempts the SMTP send. If the per-template Variables map is
-// missing fields the retry will produce a degraded body — the trade-off
-// is that the retry path stays simple. Operators inspecting failed rows
-// can re-trigger the originating event (e.g. re-enqueue the deletion
-// job) for a clean re-render.
-//
-// A future enhancement would persist the rendered body alongside the
-// log row, at the cost of disk space and PII surface area; the design.md
-// notes this and rejects it on PII grounds.
+// The worker re-sends the fully rendered body persisted on the row at
+// enqueue time (pipeline.go) — deterministic, and immune to template or
+// variable drift across restarts. Rows without a persisted recipient
+// (pre-migration legacy rows) are marked failed for operator triage.
 package email
 
 import (
@@ -35,6 +12,7 @@ import (
 	"log"
 	"time"
 
+	"noumena/internal/config"
 	"noumena/internal/db"
 	"noumena/internal/telemetry"
 )
@@ -42,10 +20,10 @@ import (
 // RetryWorker drains pending email_send_log rows on a 60-second tick.
 // One instance per process (gated by LIFECYCLE_WORKERS_ENABLED in main).
 type RetryWorker struct {
-	Queries db.EmailLogStore
-	Sender  SMTPSender
+	Queries  db.EmailLogStore
+	Sender   SMTPSender
 	Pipeline *Pipeline
-	Logger  *log.Logger
+	Logger   *log.Logger
 
 	// TickInterval defaults to 60s. Tests shrink it.
 	TickInterval time.Duration
@@ -105,70 +83,83 @@ func (w *RetryWorker) tickOnce(ctx context.Context) {
 
 // retry attempts a single row. On success, marks sent. On failure, either
 // increments attempt_count (if more attempts remain) or marks failed.
-//
-// Note: this does NOT re-render the original template — see the file-level
-// comment for why. The worker re-fires only the SMTP layer using a
-// degraded-but-well-formed message body that says "this is a retry of
-// <template>; if you missed the original, please contact support". This
-// is a deliberate trade-off that prefers operational simplicity over
-// content fidelity for retries (operators can re-trigger originating
-// events for clean retries).
 func (w *RetryWorker) retry(ctx context.Context, r *db.EmailLogRow) {
-	attempt := r.AttemptCount + 1
-	// otel-instrumentation: every retry attempt counted, regardless
-	// of whether the body of this function ends up sending or just
-	// marking the row failed. Operators want a flat "how many retries
-	// per template" view; the success/error split lives on the
-	// emails_sent_total counter recorded by Send (and below for the
-	// terminal failed-after-budget path).
+	// otel-instrumentation: every retry attempt counted, regardless of
+	// outcome — operators get a flat "how many retries per template" view.
 	recordEmailRetry(ctx, r.Template)
+	deliverRow(ctx, w.Queries, w.Sender, pipelineCfg(w.Pipeline), w.Logger.Printf, r)
+}
 
-	// Best-effort retry body: degraded, but a real email goes out so the
-	// recipient knows something happened. Production should rarely hit
-	// this path because the synchronous Send succeeds on attempt 1 in
-	// the typical case.
-	subject := "Notification (retry)"
-	html := "<p>This is a retry of a previous notification (" + r.Template + "). If you have any questions, contact support.</p>"
-	text := "This is a retry of a previous notification (" + r.Template + "). If you have any questions, contact support.\n"
-
-	from := ""
-	to := ""
-	if w.Pipeline != nil && w.Pipeline.Cfg != nil {
-		from = formatFrom(w.Pipeline.Cfg.EmailFromName, w.Pipeline.Cfg.EmailFromAddress)
+// pipelineCfg returns the pipeline's config when present (used to derive
+// the From header on retry), or nil so deliverRow falls back to defaults.
+func pipelineCfg(p *Pipeline) *config.Config {
+	if p != nil {
+		return p.Cfg
 	}
-	if r.UserID != nil {
-		// Without a UserID→email lookup on the EmailLogStore interface,
-		// the retry worker cannot recover a recipient address from the
-		// log row alone. We log a structured event and mark the row
-		// failed so an operator can intervene. Operators can re-trigger
-		// the originating event (e.g. re-enqueue the deletion job) to
-		// produce a fresh log row with a valid recipient.
-		w.Logger.Printf("email retry worker: row %s pending without recipient; marking failed", r.ID)
-		_ = w.Queries.MarkEmailFailed(ctx, r.ID, "retry-without-recipient: original Send dropped recipient context")
-		// Terminal failure on the retry path → counts as outcome=error
-		// on emails_sent_total. Send() doesn't record this row's
-		// terminal state because the original Send returned an error
-		// without recording success; the retry worker is the only
-		// place that knows we've given up.
+	return nil
+}
+
+// deliverRow re-attempts delivery of a pending email_send_log row using
+// the body persisted at enqueue time (fix-email-delivery). This is the
+// shared send-on-retry path used by both the retry worker and the
+// pipeline's idempotency-race branch, so a transient SMTP failure can
+// never silently drop mail: the row is eventually sent or marked failed
+// after the attempt cap.
+//
+// Attempt accounting: the original synchronous Send already counted
+// attempt 1 (pipeline inserts with attempt_count=1). Each retry bumps the
+// count; a row is marked failed when the next attempt would exceed the
+// cap. Rows without a persisted recipient (legacy, pre-migration) are
+// marked failed so an operator can intervene rather than looping forever.
+func deliverRow(ctx context.Context, queries db.EmailLogStore, sender SMTPSender, cfg *config.Config, logf func(string, ...any), r *db.EmailLogRow) {
+	attempt := r.AttemptCount + 1
+
+	if r.ToAddress == "" {
+		// Legacy rows have no recipient or body; we cannot re-send.
+		// Mark failed so an operator can re-trigger the originating
+		// event for a fresh row.
+		logf("email retry worker: row %s pending without recipient; marking failed", r.ID)
+		_ = queries.MarkEmailFailed(ctx, r.ID, "retry-without-recipient: original Send dropped recipient context")
 		recordEmailSent(ctx, r.Template, telemetry.OutcomeError)
 		return
 	}
-	_ = subject
-	_ = html
-	_ = text
-	_ = from
-	_ = to
-	// Unreachable in practice (see early-return above). Left in place to
-	// document the intended structure for the future "preserve recipient
-	// on log row" enhancement.
 
-	if attempt >= 3 {
-		_ = w.Queries.MarkEmailFailed(ctx, r.ID, "retry budget exhausted")
-		w.Logger.Printf("email_send_failed row=%s template=%s key=%s attempts=%d",
-			r.ID, r.Template, r.IdempotencyKey, attempt)
-		// Retry budget exhausted = terminal error.
-		recordEmailSent(ctx, r.Template, telemetry.OutcomeError)
+	from := formatFrom(emailFromName(cfg), emailFromAddress(cfg))
+	if err := sender.Send(ctx, from, r.ToAddress, r.Subject, r.HTMLBody, r.TextBody, nil); err != nil {
+		// Failure: bump the attempt. Terminal failure at the cap marks
+		// the row failed + emits the terminal metric/alert.
+		if attempt >= 3 {
+			_ = queries.MarkEmailFailed(ctx, r.ID, "retry budget exhausted")
+			logf("email_send_failed row=%s template=%s key=%s attempts=%d err=%v",
+				r.ID, r.Template, r.IdempotencyKey, attempt, err)
+			recordEmailSent(ctx, r.Template, telemetry.OutcomeError)
+			return
+		}
+		_ = queries.IncrementEmailAttempt(ctx, r.ID, attempt, err.Error())
+		logf("email_retry_deferred row=%s template=%s key=%s attempts=%d err=%v",
+			r.ID, r.Template, r.IdempotencyKey, attempt, err)
 		return
 	}
-	_ = w.Queries.IncrementEmailAttempt(ctx, r.ID, attempt, "retry deferred")
+
+	if err := queries.MarkEmailSent(ctx, r.ID, time.Now().UTC()); err != nil {
+		logf("email_retry_mark_sent_failed row=%s template=%s key=%s err=%v",
+			r.ID, r.Template, r.IdempotencyKey, err)
+		return
+	}
+	logf("email_retry_sent row=%s template=%s key=%s", r.ID, r.Template, r.IdempotencyKey)
+	recordEmailSent(ctx, r.Template, telemetry.OutcomeSuccess)
+}
+
+func emailFromName(cfg *config.Config) string {
+	if cfg == nil {
+		return config.Default.EmailFromName
+	}
+	return cfg.EmailFromName
+}
+
+func emailFromAddress(cfg *config.Config) string {
+	if cfg == nil {
+		return config.Default.EmailFromAddress
+	}
+	return cfg.EmailFromAddress
 }

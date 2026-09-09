@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,25 +17,37 @@ import (
 //go:embed schema.sql
 var schemaSQL string
 
-// ApplyMigrations executes the embedded schema.sql against the DB. It is
-// idempotent: every CREATE/ALTER uses IF NOT EXISTS guards, so it is safe to
-// run repeatedly at startup.
+// ApplyMigrations runs the versioned migration set (migration v1 is the
+// embedded schema.sql baseline) against the package-global DB. It is
+// idempotent: applied versions are recorded in schema_migrations and only
+// pending migrations run, so it is safe to call repeatedly at startup.
 func ApplyMigrations(ctx context.Context) error {
 	if DB == nil {
 		return fmt.Errorf("db not initialized")
 	}
-	if _, err := DB.ExecContext(ctx, schemaSQL); err != nil {
-		return fmt.Errorf("apply migrations: %w", err)
-	}
-	return nil
+	return Migrate(ctx, DB)
 }
 
 var DB *sql.DB
 
+// ExportDB is a second connection pool used only by long export reads
+// (fix-export-pipeline). It keeps the export cursor off the main pool's
+// single connection so a multi-minute stream cannot starve writers.
+// Connections are opened with _pragma=query_only(1): SQLite rejects any
+// write through them, making the handle safe for read-only sharing.
+// Nil for in-memory databases (a second handle would point at a
+// different private DB), in which case callers fall back to DB.
+var ExportDB *sql.DB
+
 // InitDB initializes the database connection to SQLite
 func InitDB(databasePath string) error {
+	// modernc.org/sqlite only honors the driver's DSN parameters
+	// (_pragma, _time_format, _txlock, ...); every other key is dropped
+	// silently. The old DSN (_journal_mode=/_busy_timeout=/_fk=/_loc=)
+	// therefore never applied WAL, busy_timeout or foreign keys in
+	// production. These pragmas are applied per connection.
 	var err error
-	DB, err = sql.Open("sqlite", databasePath+"?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate&_fk=true&_loc=UTC")
+	DB, err = sql.Open("sqlite", databasePath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
 	if err != nil {
 		return fmt.Errorf("unable to open sqlite database: %w", err)
 	}
@@ -48,7 +61,55 @@ func InitDB(databasePath string) error {
 	DB.SetMaxOpenConns(1) // SQLite serializes writes
 	DB.SetMaxIdleConns(1)
 
+	// Boot-time pragma assertions: a silently-ignored DSN was the root
+	// cause of WAL/FK/busy_timeout never being applied. Verify the
+	// connection actually runs with the required settings.
+	if err := assertPragmas(DB, databasePath); err != nil {
+		return fmt.Errorf("sqlite pragma check: %w", err)
+	}
+
+	if !strings.HasPrefix(databasePath, ":memory:") {
+		ExportDB, err = sql.Open("sqlite", databasePath+
+			"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=query_only(1)")
+		if err != nil {
+			return fmt.Errorf("unable to open export read database: %w", err)
+		}
+		// Two concurrent export streams (async worker + sync request)
+		// must both make progress; 2 connections covers that without
+		// letting exports monopolize the file.
+		ExportDB.SetMaxOpenConns(2)
+		ExportDB.SetMaxIdleConns(2)
+	}
+
 	log.Println("Successfully connected to the SQLite database")
+	return nil
+}
+
+// assertPragmas verifies the pragmas required by the storage-layer spec:
+// WAL journaling, foreign keys ON, and a >=5s busy timeout. In-memory
+// databases cannot use WAL (journal_mode stays 'memory'), so that check
+// is skipped for them.
+func assertPragmas(conn *sql.DB, databasePath string) error {
+	var journalMode string
+	if err := conn.QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil {
+		return fmt.Errorf("read journal_mode: %w", err)
+	}
+	if !strings.HasPrefix(databasePath, ":memory:") && journalMode != "wal" {
+		return fmt.Errorf("journal_mode=%q, want %q", journalMode, "wal")
+	}
+	var foreignKeys, busyTimeout int
+	if err := conn.QueryRow("PRAGMA foreign_keys").Scan(&foreignKeys); err != nil {
+		return fmt.Errorf("read foreign_keys: %w", err)
+	}
+	if foreignKeys != 1 {
+		return fmt.Errorf("foreign_keys=%d, want 1", foreignKeys)
+	}
+	if err := conn.QueryRow("PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
+		return fmt.Errorf("read busy_timeout: %w", err)
+	}
+	if busyTimeout < 5000 {
+		return fmt.Errorf("busy_timeout=%dms, want >=5000ms", busyTimeout)
+	}
 	return nil
 }
 
@@ -57,10 +118,25 @@ func CloseDB() {
 	if DB != nil {
 		DB.Close()
 	}
+	if ExportDB != nil {
+		ExportDB.Close()
+		ExportDB = nil
+	}
 }
 
 // ErrNotFound is returned by lookup helpers when a row is missing.
 var ErrNotFound = errors.New("not found")
+
+// NowUTC returns the SQLite expression for the current UTC timestamp in
+// the ISO-8601 TEXT format every table stores. Shared so the deletion
+// path (handler + worker) doesn't repeat the format string.
+func NowUTC() string { return "strftime('%Y-%m-%dT%H:%M:%SZ', 'now')" }
+
+// TrialDuration is the free-trial length granted to brand-new direct-signup
+// accounts (register + Google SSO). It is written as users.trial_ends_at at
+// user creation; invite-accepted members join an existing workspace and do
+// not get their own trial period.
+const TrialDuration = 14 * 24 * time.Hour
 
 // ErrNoPrimaryTracker is returned by GetPrimaryTracker when a channel has no
 // active tracker with token_priority = 0. The channel is effectively idle.
@@ -93,6 +169,16 @@ type DBQuery interface {
 	ConsumeEmailVerificationToken(ctx context.Context, tokenHash string) (userID string, err error)
 	InvalidateEmailVerificationTokensForUser(ctx context.Context, userID string) error
 	CountVerificationResendsInWindow(ctx context.Context, userID string, since time.Time) (int, error)
+
+	// Email-change tokens (fix-frontend-plumbing): pending-email switch with
+	// old email kept until the new one verifies.
+	InsertEmailChangeToken(ctx context.Context, userID, pendingEmail, tokenHash string, expiresAt time.Time) error
+	ConsumeEmailChangeToken(ctx context.Context, tokenHash string) (userID, pendingEmail string, err error)
+	GetActiveEmailChange(ctx context.Context, userID string) (*EmailChange, error)
+	InvalidateEmailChangeTokensForUser(ctx context.Context, userID string) error
+	// ApplyEmailChange commits a verified email change: sets the new email,
+	// marks it verified, and bumps token_version (forces re-auth).
+	ApplyEmailChange(ctx context.Context, userID, newEmail string) error
 
 	// Password-reset tokens
 	InsertPasswordResetToken(ctx context.Context, userID, tokenHash string, expiresAt time.Time) error
@@ -129,6 +215,8 @@ type DBQuery interface {
 
 	// llm_processing_jobs lifecycle
 	EnqueueLLMJob(ctx context.Context, commentIDs []string, provider string) (string, error)
+	EnqueueLLMJobIfNotExists(ctx context.Context, commentIDs []string, provider string) (string, bool, error)
+	RecoverStaleLLMJobs(ctx context.Context, olderThan time.Duration) (int64, error)
 	MarkLLMJobProcessing(ctx context.Context, jobID string) error
 	MarkLLMJobCompleted(ctx context.Context, jobID string) error
 	MarkLLMJobFailed(ctx context.Context, jobID string, errorMessage string) error
@@ -146,6 +234,9 @@ type DBQuery interface {
 	GetLatestDigestForUser(ctx context.Context, userID string) (*WeeklyDigest, error)
 	ListDigests(ctx context.Context, userID string, limit, offset int) ([]*WeeklyDigest, error)
 	GetStalePendingDigests(ctx context.Context, olderThan time.Time) ([]*WeeklyDigest, error)
+	GetDeferredDigestsDue(ctx context.Context, now time.Time, limit int) ([]*WeeklyDigest, error)
+	GetWeeklyDigestByID(ctx context.Context, digestID string) (*WeeklyDigest, error)
+	GetMissingDigestWeeks(ctx context.Context, userID string, weeks []time.Time) ([]time.Time, error)
 	UpdateUserDigestOptIn(ctx context.Context, userID string, optIn bool) error
 	// data-lifecycle (12.6): mark a digest as emailed; updates both
 	// weekly_digests.emailed_at and users.digest_email_sent_at.
@@ -213,6 +304,7 @@ type DBQuery interface {
 	DeleteWorkspace(ctx context.Context, workspaceID string) error
 	ListWorkspacesForUser(ctx context.Context, userID string) ([]*WorkspaceWithMembers, error)
 	GetWorkspaceMember(ctx context.Context, workspaceID, userID string) (*WorkspaceMember, error)
+	ListWorkspaceMembers(ctx context.Context, workspaceID string) ([]*WorkspaceMemberWithEmail, error)
 	AddWorkspaceMember(ctx context.Context, workspaceID, userID, role string) error
 	RemoveWorkspaceMember(ctx context.Context, workspaceID, userID string) error
 	UpdateWorkspaceMemberRole(ctx context.Context, workspaceID, userID, role string) error
@@ -225,6 +317,9 @@ type DBQuery interface {
 	SetUserActiveWorkspace(ctx context.Context, userID, workspaceID string) error
 	GetUserActiveWorkspaceID(ctx context.Context, userID string) (string, error)
 	IsWorkspaceOwner(ctx context.Context, workspaceID, userID string) (bool, error)
+	GrantChannel(ctx context.Context, workspaceID, channelID, grantedBy string) error
+	RevokeChannel(ctx context.Context, workspaceID, channelID string) error
+	ListGrantedChannels(ctx context.Context, workspaceID string) ([]string, error)
 
 	// --- Audit log (spec-gap-improvements) ---
 	InsertAuditLog(ctx context.Context, userID, action string, details string, ipAddress string) error
@@ -242,10 +337,30 @@ type DBQuery interface {
 // SQLiteQuery implements DBQuery using database/sql + SQLite
 type SQLiteQuery struct {
 	db *sql.DB
+	// ro is the optional query_only export handle (db.ExportDB). Long
+	// export reads run through it so they never hold the main pool's
+	// single connection; nil falls back to db (in-memory test DBs).
+	ro *sql.DB
 }
 
 func NewSQLiteQuery(d *sql.DB) DBQuery {
 	return &SQLiteQuery{db: d}
+}
+
+// SetExportReadDB attaches the dedicated query_only export handle (see
+// db.ExportDB). Call once after construction when the handle exists.
+func (q *SQLiteQuery) SetExportReadDB(d *sql.DB) {
+	q.ro = d
+}
+
+// ExportReadDB returns the query_only export handle when attached, else
+// the main DB. Read-only export streams should use this instead of DB()
+// so the export cursor never occupies the main pool's connection.
+func (q *SQLiteQuery) ExportReadDB() *sql.DB {
+	if q.ro != nil {
+		return q.ro
+	}
+	return q.db
 }
 
 // DB exposes the underlying *sql.DB for callers that need direct access.
@@ -318,13 +433,17 @@ func (q *SQLiteQuery) CreateUser(ctx context.Context, email, passwordHash string
 }
 
 func (q *SQLiteQuery) CreateUserWithPassword(ctx context.Context, email, passwordHash string) (*User, error) {
-	query := `INSERT INTO users (id, email, password_hash, created_at, updated_at) VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), strftime('%Y-%m-%dT%H:%M:%SZ', 'now')) RETURNING ` + userColumns
-	return scanUser(q.db.QueryRowContext(ctx, query, generateUUID(), email, passwordHash))
+	trialEndsAt := time.Now().UTC().Add(TrialDuration).Format(time.RFC3339)
+	query := `INSERT INTO users (id, email, password_hash, trial_ends_at, quota_reset_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '+30 days'), strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), strftime('%Y-%m-%dT%H:%M:%SZ', 'now')) RETURNING ` + userColumns
+	return scanUser(q.db.QueryRowContext(ctx, query, generateUUID(), email, passwordHash, trialEndsAt))
 }
 
 func (q *SQLiteQuery) CreateUserGoogle(ctx context.Context, email, googleSub string) (*User, error) {
-	query := `INSERT INTO users (id, email, google_sub, email_verified_at, created_at, updated_at) VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), strftime('%Y-%m-%dT%H:%M:%SZ', 'now')) RETURNING ` + userColumns
-	return scanUser(q.db.QueryRowContext(ctx, query, generateUUID(), email, googleSub))
+	trialEndsAt := time.Now().UTC().Add(TrialDuration).Format(time.RFC3339)
+	query := `INSERT INTO users (id, email, google_sub, email_verified_at, trial_ends_at, quota_reset_at, created_at, updated_at)
+		VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '+30 days'), strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), strftime('%Y-%m-%dT%H:%M:%SZ', 'now')) RETURNING ` + userColumns
+	return scanUser(q.db.QueryRowContext(ctx, query, generateUUID(), email, googleSub, trialEndsAt))
 }
 
 func (q *SQLiteQuery) GetUserByEmail(ctx context.Context, email string) (*User, error) {
@@ -433,12 +552,66 @@ func (q *SQLiteQuery) LinkGoogleSub(ctx context.Context, userID, sub string) err
 
 func (q *SQLiteQuery) DeleteStaleUnverifiedUsers(ctx context.Context, olderThan time.Duration) (int64, error) {
 	cutoff := time.Now().UTC().Add(-olderThan).Format(time.RFC3339)
-	result, err := q.db.ExecContext(ctx,
+	tx, err := q.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id FROM users
+		 WHERE email_verified_at IS NULL
+		   AND created_at < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if len(ids) == 0 {
+		return 0, tx.Commit()
+	}
+
+	// FK cascades are inert when foreign_keys=OFF, so orphan cleanup is
+	// explicit and identical under both enforcement states.
+	for _, sqlStr := range []string{
+		`DELETE FROM email_verification_tokens WHERE user_id = ?`,
+		`DELETE FROM password_reset_tokens WHERE user_id = ?`,
+		`DELETE FROM refresh_tokens WHERE user_id = ?`,
+		`DELETE FROM oauth_states WHERE user_id = ?`,
+		`DELETE FROM user_channel_tracking WHERE user_id = ?`,
+		`DELETE FROM comment_exports WHERE user_id = ?`,
+		`DELETE FROM rate_limit_buckets WHERE user_key = ?`,
+	} {
+		for _, id := range ids {
+			arg := any(id)
+			if sqlStr == `DELETE FROM rate_limit_buckets WHERE user_key = ?` {
+				arg = "u:" + id
+			}
+			if _, err := tx.ExecContext(ctx, sqlStr, arg); err != nil {
+				return 0, err
+			}
+		}
+	}
+
+	result, err := tx.ExecContext(ctx,
 		`DELETE FROM users
 		 WHERE email_verified_at IS NULL
-		   AND created_at < ?`,
-		cutoff)
+		   AND created_at < ?`, cutoff)
 	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	return result.RowsAffected()
@@ -482,6 +655,72 @@ func (q *SQLiteQuery) CountVerificationResendsInWindow(ctx context.Context, user
 		`SELECT COUNT(*) FROM email_verification_tokens
 		 WHERE user_id = ? AND created_at >= ?`, userID, since.Format(time.RFC3339)).Scan(&n)
 	return n, err
+}
+
+// --- Email-change tokens (fix-frontend-plumbing) ---------------------------
+
+func (q *SQLiteQuery) InsertEmailChangeToken(ctx context.Context, userID, pendingEmail, tokenHash string, expiresAt time.Time) error {
+	_, err := q.db.ExecContext(ctx,
+		`INSERT INTO email_change_tokens (id, user_id, pending_email, token_hash, expires_at) VALUES (?, ?, ?, ?, ?)`,
+		generateUUID(), userID, pendingEmail, tokenHash, expiresAt.Format(time.RFC3339))
+	return err
+}
+
+func (q *SQLiteQuery) ConsumeEmailChangeToken(ctx context.Context, tokenHash string) (string, string, error) {
+	var userID, pendingEmail string
+	err := q.db.QueryRowContext(ctx,
+		`UPDATE email_change_tokens
+		 SET used_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+		 WHERE token_hash = ?
+		   AND used_at IS NULL
+		   AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+		 RETURNING user_id, pending_email`,
+		tokenHash).Scan(&userID, &pendingEmail)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", ErrNotFound
+	}
+	return userID, pendingEmail, err
+}
+
+func (q *SQLiteQuery) GetActiveEmailChange(ctx context.Context, userID string) (*EmailChange, error) {
+	e := &EmailChange{}
+	var expiresAt, createdAt string
+	var usedAt *string
+	err := q.db.QueryRowContext(ctx,
+		`SELECT id, user_id, pending_email, token_hash, expires_at, used_at, created_at
+		 FROM email_change_tokens
+		 WHERE user_id = ? AND used_at IS NULL
+		 ORDER BY created_at DESC LIMIT 1`,
+		userID).Scan(&e.ID, &e.UserID, &e.PendingEmail, &e.TokenHash, &expiresAt, &usedAt, &createdAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	e.ExpiresAt = parseTime(expiresAt)
+	e.CreatedAt = parseTime(createdAt)
+	if usedAt != nil {
+		t := parseTime(*usedAt)
+		e.UsedAt = &t
+	}
+	return e, nil
+}
+
+func (q *SQLiteQuery) InvalidateEmailChangeTokensForUser(ctx context.Context, userID string) error {
+	_, err := q.db.ExecContext(ctx,
+		`UPDATE email_change_tokens SET used_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+		 WHERE user_id = ? AND used_at IS NULL`, userID)
+	return err
+}
+
+func (q *SQLiteQuery) ApplyEmailChange(ctx context.Context, userID, newEmail string) error {
+	_, err := q.db.ExecContext(ctx,
+		`UPDATE users
+		 SET email = ?, email_verified_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+		     token_version = token_version + 1
+		 WHERE id = ?`, newEmail, userID)
+	return err
 }
 
 func (q *SQLiteQuery) InsertPasswordResetToken(ctx context.Context, userID, tokenHash string, expiresAt time.Time) error {
@@ -570,8 +809,20 @@ func (q *SQLiteQuery) IncrementCommentsUsed(ctx context.Context, userID string, 
 }
 
 func (q *SQLiteQuery) GetPrimaryTracker(ctx context.Context, platformChannelID string) (*User, error) {
+	// Columns are explicitly u.-qualified: the JOIN with user_channel_tracking
+	// also carries an `id` column, and an unqualified list makes SQLite raise
+	// "ambiguous column name: id".
 	query := `
-		SELECT ` + userColumns + `
+		SELECT u.id, u.email, u.password_hash, u.google_sub, u.email_verified_at,
+		       u.subscription_plan, u.stripe_customer_id, u.comment_quota_monthly,
+		       u.comments_used_this_period, u.quota_reset_at, u.token_version,
+		       u.failed_login_attempts, u.locked_until, u.deletion_requested_at,
+		       u.deletion_completed_at, u.data_export_url, u.data_export_expires_at,
+		       u.digest_email_opt_in, u.digest_email_sent_at,
+		       u.trial_ends_at, u.subscription_status, u.current_period_end, u.billing_interval,
+		       u.stripe_subscription_id,
+		       u.past_due_since, u.active_workspace_id,
+		       u.created_at, u.updated_at
 		FROM users u
 		JOIN user_channel_tracking uct ON uct.user_id = u.id
 		WHERE uct.platform_channel_id = ?

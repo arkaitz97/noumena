@@ -21,6 +21,7 @@ type LifecycleStore interface {
 	ClaimNextDeletionJob(ctx context.Context, gracePeriod time.Duration) (*AccountDeletionJob, error)
 	MarkDeletionStage(ctx context.Context, jobID, status string) error
 	MarkDeletionFailed(ctx context.Context, jobID, errorMsg string) error
+	MarkDeletionRevokeStatus(ctx context.Context, jobID string, attempted bool, errorMsg string) error
 	IncrementChannelsProcessed(ctx context.Context, jobID string) error
 	MarkDeletionCompleted(ctx context.Context, jobID, userID string) error
 	MarkDeletionCompletedJobOnly(ctx context.Context, jobID string) error
@@ -33,7 +34,9 @@ type LifecycleStore interface {
 	DeleteUserStarsAll(ctx context.Context, tx *sql.Tx, userID string) error
 	DeleteUserDigests(ctx context.Context, tx *sql.Tx, userID string) error
 	DeleteUserAuthTokens(ctx context.Context, tx *sql.Tx, userID string) error
+	DeleteUserGDPRData(ctx context.Context, tx *sql.Tx, userID string) error
 	HardDeleteUser(ctx context.Context, tx *sql.Tx, userID string) error
+	ListJobsPendingRevoke(ctx context.Context) ([]*AccountDeletionJob, error)
 	EnqueueDataExport(ctx context.Context, userID string) (*DataExportJob, error)
 	GetDataExportJob(ctx context.Context, jobID string) (*DataExportJob, error)
 	ClaimNextExportJob(ctx context.Context) (*DataExportJob, error)
@@ -46,30 +49,30 @@ type LifecycleStore interface {
 }
 
 type AccountDeletionJob struct {
-	ID                   string
-	UserID               string
-	Status               string
-	TotalChannels        int
-	ChannelsProcessed    int
-	GDPRExportGenerated  bool
-	LastError            *string
-	CreatedAt            time.Time
-	StartedAt            *time.Time
-	CompletedAt          *time.Time
+	ID                  string
+	UserID              string
+	Status              string
+	TotalChannels       int
+	ChannelsProcessed   int
+	GDPRExportGenerated bool
+	RevokeAttempted     bool
+	RevokeError         *string
+	ErrorMessage        *string
+	CreatedAt           time.Time
+	StartedAt           *time.Time
+	CompletedAt         *time.Time
 }
 
 type DataExportJob struct {
-	ID            string
-	UserID        string
-	Status        string
-	StoragePath   *string
-	DownloadURL   *string
-	ExpiresAt     *time.Time
-	PartialExport bool
-	LastError     *string
-	CreatedAt     time.Time
-	StartedAt     *time.Time
-	CompletedAt   *time.Time
+	ID           string
+	UserID       string
+	Status       string
+	ExportURL    *string
+	ExpiresAt    *time.Time
+	ErrorMessage *string
+	CreatedAt    time.Time
+	StartedAt    *time.Time
+	CompletedAt  *time.Time
 }
 
 type UserChannelTrackingRow struct {
@@ -80,6 +83,7 @@ type UserChannelTrackingRow struct {
 	PlatformChannelKey string
 	DisplayName        string
 	AccessTokenEnc     string
+	RefreshTokenEnc    string
 	TokenExpiresAt     *time.Time
 }
 
@@ -158,8 +162,22 @@ func (q *SQLiteQuery) MarkDeletionStage(ctx context.Context, jobID, status strin
 func (q *SQLiteQuery) MarkDeletionFailed(ctx context.Context, jobID, errorMsg string) error {
 	_, err := q.db.ExecContext(ctx, `
 		UPDATE account_deletion_jobs
-		SET status = 'failed', last_error = ?, completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+		SET status = 'failed', error_message = ?, completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
 		WHERE id = ?`, errorMsg, jobID)
+	return err
+}
+
+// MarkDeletionRevokeStatus records the outcome of the provider-token
+// revocation attempt on the job. errorMsg "" clears any previous error
+// (a later, successful out-of-band retry). The out-of-band sweeper
+// picks up jobs with revoke_attempted=1 and a non-null revoke_error.
+func (q *SQLiteQuery) MarkDeletionRevokeStatus(ctx context.Context, jobID string, attempted bool, errorMsg string) error {
+	_, err := q.db.ExecContext(ctx, `
+		UPDATE account_deletion_jobs
+		SET revoke_attempted = ?,
+		    revoke_error = CASE WHEN ? = '' THEN NULL ELSE ? END
+		WHERE id = ?`,
+		attempted, errorMsg, errorMsg, jobID)
 	return err
 }
 
@@ -211,29 +229,71 @@ func (q *SQLiteQuery) findActiveDeletionJob(ctx context.Context, userID string) 
 	return job, err
 }
 
+// ListJobsPendingRevoke returns jobs still in the 'deleting' stage whose
+// provider-token revocation failed, so the out-of-band sweeper can retry
+// it while the user's credentials still exist in the DB.
+func (q *SQLiteQuery) ListJobsPendingRevoke(ctx context.Context) ([]*AccountDeletionJob, error) {
+	rows, err := q.db.QueryContext(ctx, `
+		SELECT `+accountDeletionJobColumns+`
+		FROM account_deletion_jobs
+		WHERE status = 'deleting'
+		  AND revoke_attempted = 1
+		  AND revoke_error IS NOT NULL
+		ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*AccountDeletionJob
+	for rows.Next() {
+		j := &AccountDeletionJob{}
+		var createdAt string
+		var revokeError, errorMessage, startedAt, completedAt sql.NullString
+		if err := rows.Scan(&j.ID, &j.UserID, &j.Status, &j.TotalChannels,
+			&j.ChannelsProcessed, &j.GDPRExportGenerated, &j.RevokeAttempted, &revokeError,
+			&errorMessage, &createdAt, &startedAt, &completedAt); err != nil {
+			return nil, err
+		}
+		if revokeError.Valid {
+			j.RevokeError = &revokeError.String
+		}
+		if errorMessage.Valid {
+			j.ErrorMessage = &errorMessage.String
+		}
+		j.CreatedAt = parseTime(createdAt)
+		j.StartedAt = scanTimePtr(startedAt)
+		j.CompletedAt = scanTimePtr(completedAt)
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
 const accountDeletionJobColumns = `id, user_id, status, total_channels,
-	channels_processed, gdpr_export_generated, last_error,
-	created_at, started_at, completed_at`
+	channels_processed, gdpr_export_generated, revoke_attempted, revoke_error,
+	error_message, created_at, started_at, completed_at`
 
 func scanAccountDeletionJob(row *sql.Row) (*AccountDeletionJob, error) {
 	j := &AccountDeletionJob{}
-	var createdAt, startedAt, completedAt string
-	var lastError sql.NullString
+	var createdAt string
+	var revokeError, errorMessage, startedAt, completedAt sql.NullString
 	err := row.Scan(&j.ID, &j.UserID, &j.Status, &j.TotalChannels,
-		&j.ChannelsProcessed, &j.GDPRExportGenerated, &lastError,
-		&createdAt, &startedAt, &completedAt)
+		&j.ChannelsProcessed, &j.GDPRExportGenerated, &j.RevokeAttempted, &revokeError,
+		&errorMessage, &createdAt, &startedAt, &completedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
-	if lastError.Valid {
-		j.LastError = &lastError.String
+	if revokeError.Valid {
+		j.RevokeError = &revokeError.String
+	}
+	if errorMessage.Valid {
+		j.ErrorMessage = &errorMessage.String
 	}
 	j.CreatedAt = parseTime(createdAt)
-	j.StartedAt = parseTimePtr(parseNullString(startedAt))
-	j.CompletedAt = parseTimePtr(parseNullString(completedAt))
+	j.StartedAt = scanTimePtr(startedAt)
+	j.CompletedAt = scanTimePtr(completedAt)
 	return j, nil
 }
 
@@ -241,7 +301,7 @@ func (q *SQLiteQuery) GetUserTrackingChannels(ctx context.Context, userID string
 	rows, err := q.db.QueryContext(ctx, `
 		SELECT t.id, t.user_id, t.platform_channel_id,
 		       p.platform, p.platform_channel_id, p.display_name,
-		       t.access_token_enc, t.token_expires_at
+		       t.access_token_enc, t.refresh_token_enc, t.token_expires_at
 		FROM user_channel_tracking t
 		JOIN platform_channels p ON p.id = t.platform_channel_id
 		WHERE t.user_id = ?
@@ -253,13 +313,13 @@ func (q *SQLiteQuery) GetUserTrackingChannels(ctx context.Context, userID string
 	var out []*UserChannelTrackingRow
 	for rows.Next() {
 		r := &UserChannelTrackingRow{}
-		var tokenExpiresAt string
+		var tokenExpiresAt sql.NullString
 		if err := rows.Scan(&r.TrackingID, &r.UserID, &r.PlatformChannelID,
 			&r.Platform, &r.PlatformChannelKey, &r.DisplayName,
-			&r.AccessTokenEnc, &tokenExpiresAt); err != nil {
+			&r.AccessTokenEnc, &r.RefreshTokenEnc, &tokenExpiresAt); err != nil {
 			return nil, err
 		}
-		r.TokenExpiresAt = parseTimePtr(parseNullString(tokenExpiresAt))
+		r.TokenExpiresAt = parseTimePtr(tokenExpiresAt)
 		out = append(out, r)
 	}
 	return out, rows.Err()
@@ -376,6 +436,46 @@ func (q *SQLiteQuery) DeleteUserAuthTokens(ctx context.Context, tx *sql.Tx, user
 	return nil
 }
 
+// DeleteUserGDPRData removes every row owned by the user across all
+// user-owned tables. It is written to be correct whether or not foreign
+// keys are enforced: it performs the DELETEs explicitly instead of
+// relying on cascades. Child tables are wiped in dependency order before
+// the caller removes the user row.
+//
+// Per-channel data (platform_channels, comments, ingestion_jobs) is NOT
+// deleted here — it is handled by the detach-only per-channel stage so a
+// shared channel's data survives for its other trackers.
+//
+// llm_processing_jobs has no user_id column and is intentionally not
+// covered. workspaces/workspace_invites are shared/multi-owner and are
+// handled by workspace deletion, not account deletion.
+func (q *SQLiteQuery) DeleteUserGDPRData(ctx context.Context, tx *sql.Tx, userID string) error {
+	// rate_limit_buckets keys on "u:"+userID (see api/rate_limit.go).
+	stmts := []struct {
+		sql string
+		arg any
+	}{
+		{`DELETE FROM email_verification_tokens WHERE user_id = ?`, userID},
+		{`DELETE FROM password_reset_tokens WHERE user_id = ?`, userID},
+		{`DELETE FROM refresh_tokens WHERE user_id = ?`, userID},
+		{`DELETE FROM oauth_states WHERE user_id = ?`, userID},
+		{`DELETE FROM user_comment_stars WHERE user_id = ?`, userID},
+		{`DELETE FROM comment_usage_logs WHERE user_id = ?`, userID},
+		{`DELETE FROM comment_exports WHERE user_id = ?`, userID},
+		{`DELETE FROM workspace_members WHERE user_id = ?`, userID},
+		{`DELETE FROM rate_limit_buckets WHERE user_key = ?`, "u:" + userID},
+		{`DELETE FROM user_channel_tracking WHERE user_id = ?`, userID},
+		{`DELETE FROM weekly_digests WHERE user_id = ?`, userID},
+		{`DELETE FROM data_export_jobs WHERE user_id = ?`, userID},
+	}
+	for _, s := range stmts {
+		if _, err := tx.ExecContext(ctx, s.sql, s.arg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (q *SQLiteQuery) HardDeleteUser(ctx context.Context, tx *sql.Tx, userID string) error {
 	_, err := tx.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, userID)
 	return err
@@ -436,6 +536,12 @@ func (q *SQLiteQuery) MarkExportStarted(ctx context.Context, jobID string) error
 	return err
 }
 
+// MarkDataExportCompleted flips the job to 'completed' and persists the
+// signed download URL in export_url (mirrored onto users.data_export_url).
+// The local ZIP path is not stored: it derives deterministically from the
+// storage dir + user id + job id. storagePath and partial are accepted for
+// interface stability but no longer persisted — the schema has no columns
+// for them.
 func (q *SQLiteQuery) MarkDataExportCompleted(ctx context.Context, jobID, userID, storagePath, downloadURL string, expiresAt time.Time, partial bool) error {
 	tx, err := q.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -444,9 +550,9 @@ func (q *SQLiteQuery) MarkDataExportCompleted(ctx context.Context, jobID, userID
 	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE data_export_jobs
-		SET status='completed', storage_path=?, download_url=?,
-		    expires_at=?, partial_export=?, completed_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-		WHERE id=?`, storagePath, downloadURL, expiresAt.Format(time.RFC3339), partial, jobID); err != nil {
+		SET status='completed', export_url=?,
+		    expires_at=?, completed_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+		WHERE id=?`, downloadURL, expiresAt.Format(time.RFC3339), jobID); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `
@@ -460,16 +566,74 @@ func (q *SQLiteQuery) MarkDataExportCompleted(ctx context.Context, jobID, userID
 
 func (q *SQLiteQuery) MarkDataExportFailed(ctx context.Context, jobID, errorMsg string) error {
 	_, err := q.db.ExecContext(ctx, `
-		UPDATE data_export_jobs SET status='failed', last_error=?, completed_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+		UPDATE data_export_jobs SET status='failed', error_message=?, completed_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
 		WHERE id=?`, errorMsg, jobID)
 	return err
+}
+
+// RequeueDataExport returns a job to 'queued' after a failed completion
+// mark. Only 'exporting' rows transition so a reaper reset or a
+// concurrent claim cannot be stomped. error_message is cleared: the
+// retried attempt is a fresh one and the failure was already logged.
+func (q *SQLiteQuery) RequeueDataExport(ctx context.Context, jobID string) error {
+	_, err := q.db.ExecContext(ctx, `
+		UPDATE data_export_jobs
+		SET status='queued', started_at=NULL, error_message=NULL, completed_at=NULL
+		WHERE id=? AND status='exporting'`, jobID)
+	return err
+}
+
+// ResetStuckDataExports reaps crash leftovers: rows still 'exporting'
+// past olderThan are retryable again. Mirrors the comment-exports reset
+// (ResetStuckProcessingExports); data_export_jobs has no retry budget,
+// so every stuck row is simply requeued. StartedAt NULL keeps the row
+// out of future sweeps until it is claimed again.
+func (q *SQLiteQuery) ResetStuckDataExports(ctx context.Context, olderThan time.Duration) (int, error) {
+	cutoff := time.Now().UTC().Add(-olderThan).Format(time.RFC3339)
+	result, err := q.db.ExecContext(ctx, `
+		UPDATE data_export_jobs
+		SET status='queued', started_at=NULL, error_message=NULL
+		WHERE status='exporting'
+		  AND started_at IS NOT NULL
+		  AND started_at < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := result.RowsAffected()
+	return int(n), nil
+}
+
+// ListExportJobsForSweep lists rows whose ZIP file must not survive on
+// disk: 'exporting' (crashed mid-write, partial file) and 'failed'
+// (legacy orphans from before the cleanup path existed). Completed and
+// queued rows keep their files — completed ones are downloadable, queued
+// ones never wrote a ZIP.
+func (q *SQLiteQuery) ListExportJobsForSweep(ctx context.Context) ([]*DataExportJob, error) {
+	rows, err := q.db.QueryContext(ctx, `
+		SELECT `+dataExportJobColumns+`
+		FROM data_export_jobs
+		WHERE status IN ('exporting','failed')
+		ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*DataExportJob
+	for rows.Next() {
+		j, err := scanDataExportJobRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
 }
 
 func (q *SQLiteQuery) ListExpiredDataExports(ctx context.Context, now time.Time) ([]*DataExportJob, error) {
 	rows, err := q.db.QueryContext(ctx, `
 		SELECT `+dataExportJobColumns+`
 		FROM data_export_jobs
-		WHERE expires_at IS NOT NULL AND expires_at < ? AND storage_path IS NOT NULL`, now.Format(time.RFC3339))
+		WHERE expires_at IS NOT NULL AND expires_at < ? AND export_url IS NOT NULL`, now.Format(time.RFC3339))
 	if err != nil {
 		return nil, err
 	}
@@ -488,21 +652,21 @@ func (q *SQLiteQuery) ListExpiredDataExports(ctx context.Context, now time.Time)
 func (q *SQLiteQuery) ClearExportStoragePath(ctx context.Context, jobID string) error {
 	_, err := q.db.ExecContext(ctx, `
 		UPDATE data_export_jobs
-		SET storage_path=NULL, download_url=NULL
+		SET export_url=NULL
 		WHERE id=?`, jobID)
 	return err
 }
 
-const dataExportJobColumns = `id, user_id, status, storage_path,
-	download_url, expires_at, partial_export, last_error,
+const dataExportJobColumns = `id, user_id, status, export_url,
+	expires_at, error_message,
 	created_at, started_at, completed_at`
 
 func scanDataExportJob(row *sql.Row) (*DataExportJob, error) {
 	j := &DataExportJob{}
-	var storagePath, downloadURL, expiresAt, lastError, createdAt, startedAt, completedAt string
-	var partialExport int
-	err := row.Scan(&j.ID, &j.UserID, &j.Status, &storagePath,
-		&downloadURL, &expiresAt, &partialExport, &lastError,
+	var createdAt string
+	var exportURL, expiresAt, errorMessage, startedAt, completedAt sql.NullString
+	err := row.Scan(&j.ID, &j.UserID, &j.Status, &exportURL,
+		&expiresAt, &errorMessage,
 		&createdAt, &startedAt, &completedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -510,53 +674,45 @@ func scanDataExportJob(row *sql.Row) (*DataExportJob, error) {
 		}
 		return nil, err
 	}
-	if storagePath != "" {
-		j.StoragePath = &storagePath
+	if exportURL.Valid {
+		j.ExportURL = &exportURL.String
 	}
-	if downloadURL != "" {
-		j.DownloadURL = &downloadURL
-	}
-	if expiresAt != "" {
-		t, _ := time.Parse(time.RFC3339, expiresAt)
+	if expiresAt.Valid {
+		t, _ := time.Parse(time.RFC3339, expiresAt.String)
 		j.ExpiresAt = &t
 	}
-	if lastError != "" {
-		j.LastError = &lastError
+	if errorMessage.Valid {
+		j.ErrorMessage = &errorMessage.String
 	}
-	j.PartialExport = partialExport != 0
 	j.CreatedAt = parseTime(createdAt)
-	j.StartedAt = parseTimePtr(parseNullString(startedAt))
-	j.CompletedAt = parseTimePtr(parseNullString(completedAt))
+	j.StartedAt = scanTimePtr(startedAt)
+	j.CompletedAt = scanTimePtr(completedAt)
 	return j, nil
 }
 
 func scanDataExportJobRows(rows *sql.Rows) (*DataExportJob, error) {
 	j := &DataExportJob{}
-	var storagePath, downloadURL, expiresAt, lastError, createdAt, startedAt, completedAt string
-	var partialExport int
-	err := rows.Scan(&j.ID, &j.UserID, &j.Status, &storagePath,
-		&downloadURL, &expiresAt, &partialExport, &lastError,
+	var createdAt string
+	var exportURL, expiresAt, errorMessage, startedAt, completedAt sql.NullString
+	err := rows.Scan(&j.ID, &j.UserID, &j.Status, &exportURL,
+		&expiresAt, &errorMessage,
 		&createdAt, &startedAt, &completedAt)
 	if err != nil {
 		return nil, err
 	}
-	if storagePath != "" {
-		j.StoragePath = &storagePath
+	if exportURL.Valid {
+		j.ExportURL = &exportURL.String
 	}
-	if downloadURL != "" {
-		j.DownloadURL = &downloadURL
-	}
-	if expiresAt != "" {
-		t, _ := time.Parse(time.RFC3339, expiresAt)
+	if expiresAt.Valid {
+		t, _ := time.Parse(time.RFC3339, expiresAt.String)
 		j.ExpiresAt = &t
 	}
-	if lastError != "" {
-		j.LastError = &lastError
+	if errorMessage.Valid {
+		j.ErrorMessage = &errorMessage.String
 	}
-	j.PartialExport = partialExport != 0
 	j.CreatedAt = parseTime(createdAt)
-	j.StartedAt = parseTimePtr(parseNullString(startedAt))
-	j.CompletedAt = parseTimePtr(parseNullString(completedAt))
+	j.StartedAt = scanTimePtr(startedAt)
+	j.CompletedAt = scanTimePtr(completedAt)
 	return j, nil
 }
 
@@ -567,7 +723,12 @@ func (q *SQLiteQuery) GetUserExportBundle(ctx context.Context, userID string) (*
 	}
 	bundle := &UserExportBundle{User: user}
 
-	trackingRows, err := q.db.QueryContext(ctx, `
+	// The bundle is the long read of the GDPR export flow; run it on the
+	// query_only export handle so it never occupies the main pool's
+	// single connection (fix-export-pipeline 2.x).
+	rd := q.ExportReadDB()
+
+	trackingRows, err := rd.QueryContext(ctx, `
 		SELECT `+trackingColumns+`
 		FROM user_channel_tracking WHERE user_id = ?`, userID)
 	if err != nil {
@@ -586,7 +747,7 @@ func (q *SQLiteQuery) GetUserExportBundle(ctx context.Context, userID string) (*
 		return nil, err
 	}
 
-	commentRows, err := q.db.QueryContext(ctx, `
+	commentRows, err := rd.QueryContext(ctx, `
 		SELECT c.id, c.platform_channel_id, c.platform_comment_id,
 		       c.parent_comment_id, c.reply_depth, c.author_handle, c.body, c.posted_at,
 		       c.category, c.actionable_insights, c.topic, c.confidence,
@@ -612,7 +773,7 @@ func (q *SQLiteQuery) GetUserExportBundle(ctx context.Context, userID string) (*
 		return nil, err
 	}
 
-	digestRows, err := q.db.QueryContext(ctx, `
+	digestRows, err := rd.QueryContext(ctx, `
 		SELECT id, user_id, week_start_date, status, content, emailed_at, created_at
 		FROM weekly_digests WHERE user_id = ? ORDER BY week_start_date`, userID)
 	if err != nil {
@@ -638,7 +799,7 @@ func (q *SQLiteQuery) GetUserExportBundle(ctx context.Context, userID string) (*
 		return nil, err
 	}
 
-	starRows, err := q.db.QueryContext(ctx, `
+	starRows, err := rd.QueryContext(ctx, `
 		SELECT user_id, comment_id, starred_at
 		FROM user_comment_stars WHERE user_id = ?`, userID)
 	if err != nil {

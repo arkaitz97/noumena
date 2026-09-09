@@ -88,10 +88,13 @@ func (f *fakeEmailStore) MarkEmailAttemptError(_ context.Context, _ string, _ st
 func (f *fakeEmailStore) ClaimPendingEmails(_ context.Context, _ time.Time, _ int) ([]*db.EmailLogRow, error) {
 	return nil, nil
 }
+func (f *fakeEmailStore) GetEmailRowByIdempotencyKey(_ context.Context, _ string) (*db.EmailLogRow, error) {
+	return nil, nil
+}
 
 type recordingSender struct{ called bool }
 
-func (s *recordingSender) Send(_ context.Context, _, _, _, _, _ string) error {
+func (s *recordingSender) Send(_ context.Context, _, _, _, _, _ string, _ []string) error {
 	s.called = true
 	return nil
 }

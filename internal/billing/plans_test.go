@@ -171,11 +171,11 @@ func TestAnnualPriceFromMonthly(t *testing.T) {
 		monthly int
 		want    int
 	}{
-		{2900, 27840},    // Creator: 2900*12*0.8 = 27840 (catalog uses 27800, rounded)
-		{9900, 95040},    // Studio: 9900*12*0.8 = 95040 (catalog uses 95000)
-		{29900, 287040},  // Agency: 29900*12*0.8 = 287040 (catalog uses 287000)
-		{0, 0},           // Free
-		{100, 960},         // 100*12*0.8 = 960
+		{2900, 27840},   // Creator: 2900*12*0.8 = 27840 (catalog uses 27800, rounded)
+		{9900, 95040},   // Studio: 9900*12*0.8 = 95040 (catalog uses 95000)
+		{29900, 287040}, // Agency: 29900*12*0.8 = 287040 (catalog uses 287000)
+		{0, 0},          // Free
+		{100, 960},      // 100*12*0.8 = 960
 	}
 	for _, c := range cases {
 		got := AnnualPriceFromMonthly(c.monthly)

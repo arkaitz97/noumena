@@ -7,11 +7,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"noumena/internal/api"
+	"noumena/internal/config"
 	"noumena/internal/db"
+	"noumena/internal/email"
 )
 
 // newDigestRouter mirrors newSyncStatusRouter: inject UserIDKey directly so
@@ -32,6 +35,7 @@ func newDigestRouter(h *api.DigestHandler, userID string) *chi.Mux {
 		r.Get("/digests/latest", h.Latest)
 		r.Patch("/user/preferences", h.UpdatePreferences)
 	})
+	r.Get("/unsubscribe", h.Unsubscribe)
 	return r
 }
 
@@ -272,5 +276,52 @@ func TestDigestList_EmptyListReturnsEmptyArray(t *testing.T) {
 	}
 	if resp.Digests == nil {
 		t.Fatalf("expected empty array, got null")
+	}
+}
+
+// TestUnsubscribe_ValidSignature verifies task 5.4: a properly signed
+// unsubscribe link flips the user's digest opt-in off without any auth.
+func TestUnsubscribe_ValidSignature(t *testing.T) {
+	const secret = "unsub-test-secret"
+	mock := &MockQuery{}
+	h := &api.DigestHandler{
+		Queries: mock,
+		Cfg:     &config.Config{ExportSignedURLSecret: secret},
+	}
+	r := newDigestRouter(h, "")
+
+	q := email.SignURL(secret, "user-1", "dig-1", time.Now().Add(24*time.Hour))
+	req := httptest.NewRequest(http.MethodGet, "/unsubscribe?user_id=user-1&job=dig-1&"+q, nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", w.Code, w.Body.String())
+	}
+	if v, ok := mock.digestOptIn["user-1"]; !ok || v != false {
+		t.Fatalf("expected opt-in=false persisted, got %v (ok=%v)", v, ok)
+	}
+}
+
+// Tampered or expired signatures must be rejected with 403.
+func TestUnsubscribe_RejectsBadSignature(t *testing.T) {
+	const secret = "unsub-test-secret"
+	mock := &MockQuery{}
+	h := &api.DigestHandler{
+		Queries: mock,
+		Cfg:     &config.Config{ExportSignedURLSecret: secret},
+	}
+	r := newDigestRouter(h, "")
+
+	q := email.SignURL(secret, "user-1", "dig-1", time.Now().Add(24*time.Hour))
+	req := httptest.NewRequest(http.MethodGet, "/unsubscribe?user_id=attacker&job=dig-1&"+q, nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 got %d", w.Code)
+	}
+	if _, ok := mock.digestOptIn["user-1"]; ok {
+		t.Fatalf("opt-in must not change on failed verification")
 	}
 }

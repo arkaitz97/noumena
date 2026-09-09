@@ -1,7 +1,12 @@
 // Package lifecycle: cleanup.go runs the daily export-cleanup cron.
 // Walks `data_export_jobs` for rows where expires_at < NOW() and
-// storage_path IS NOT NULL, removes the file, then nulls out
-// storage_path/download_url so the row stops appearing in the sweep.
+// export_url IS NOT NULL, removes the ZIP file, then nulls out
+// export_url so the row stops appearing in the sweep.
+//
+// The schema stores only the signed download URL, not the local file
+// path; the path derives deterministically from the storage dir +
+// user id + job id (mirroring export_worker.go's layout), so cleanup
+// and the download route can both locate the file without a path column.
 //
 // Why a separate cron rather than fold this into the export worker?
 // The export worker only fires on new jobs; expired files belong to
@@ -27,6 +32,11 @@ import (
 type CleanupCron struct {
 	Queries db.DBQuery
 	Logger  *log.Logger
+
+	// StorageDir is the GDPR export root (EXPORT_STORAGE_DIR). Files
+	// live at <StorageDir>/<user_id>/<job_id>.zip. Required: without it
+	// the sweep cannot locate files and logs a warning instead.
+	StorageDir string
 
 	// Hour/Minute set the daily run time in UTC. Default 08:00.
 	Hour, Minute int
@@ -79,11 +89,15 @@ func (c *CleanupCron) runOnce(ctx context.Context) {
 		c.Logger.Printf("export_cleanup_list_err err=%v", err)
 		return
 	}
+	if c.StorageDir == "" {
+		c.Logger.Printf("export_cleanup_warn storage_dir_unset")
+		return
+	}
 	for _, r := range rows {
-		if r.StoragePath == nil {
+		if r.ExportURL == nil {
 			continue
 		}
-		path := *r.StoragePath
+		path := filepath.Join(c.StorageDir, r.UserID, r.ID+".zip")
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			c.Logger.Printf("export_cleanup_unlink_err job=%s path=%s err=%v", r.ID, path, err)
 			continue

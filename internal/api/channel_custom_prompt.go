@@ -71,7 +71,7 @@ func (h *ChannelHandler) UpdateCustomPrompt(w http.ResponseWriter, r *http.Reque
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"channel_id":     channelID,
-		"custom_prompt":  req.CustomPrompt,
+		"channel_id":    channelID,
+		"custom_prompt": req.CustomPrompt,
 	})
 }

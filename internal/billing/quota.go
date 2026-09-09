@@ -12,6 +12,11 @@ import (
 // QuotaCronStore is the narrow surface the daily billing crons need.
 // *db.PostgresQuery satisfies it.
 type QuotaCronStore interface {
+	// RecordCurrentPeriodUsage snapshots the current period's usage into
+	// billing_usage for every user with a quota schedule (3.1). Must run
+	// BEFORE ResetFreeTierQuotas so a just-finished period's usage is
+	// captured before the reset zeroes it.
+	RecordCurrentPeriodUsage(ctx context.Context) (int64, error)
 	ResetFreeTierQuotas(ctx context.Context) (int64, error)
 	ExpirePastDueGrace(ctx context.Context, graceHours int) (int64, error)
 }
@@ -84,6 +89,13 @@ func StartQuotaCron(ctx context.Context, store QuotaCronStore, cfg QuotaCronConf
 // runQuotaCronOnce performs one iteration. It logs counts at INFO and
 // errors at WARN; failures do not abort the loop.
 func runQuotaCronOnce(ctx context.Context, store QuotaCronStore, graceHours int, p *email.Pipeline) {
+	// 3.1: snapshot current-period usage before any reset zeroes it.
+	if n, err := store.RecordCurrentPeriodUsage(ctx); err != nil {
+		log.Printf("billing quota cron: RecordCurrentPeriodUsage err=%v", err)
+	} else if n > 0 {
+		log.Printf("billing quota cron: billing_usage rows=%d", n)
+	}
+
 	if n, err := store.ResetFreeTierQuotas(ctx); err != nil {
 		log.Printf("billing quota cron: ResetFreeTierQuotas err=%v", err)
 	} else if n > 0 {
