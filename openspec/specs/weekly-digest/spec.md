@@ -112,3 +112,19 @@ The system SHALL explicitly exclude paused channels from digest comment aggregat
 - **GIVEN** a user who pauses a channel on Wednesday
 - **WHEN** the Monday digest runs
 - **THEN** the system SHALL exclude comments from the paused channel for the entire week (digest covers Mon-Sun, pause state at generation time applies)
+
+### Requirement: Missed Digest Catch-Up
+The system SHALL generate a weekly digest even when the scheduled trigger time was missed.
+
+#### Scenario: Downtime Across Scheduled Time
+- **GIVEN** application downtime spanning Monday 08:00 UTC
+- **WHEN** the application restarts
+- **THEN** the system SHALL generate the missed digest from the available data
+
+### Requirement: Deferred Digest Re-Dispatch
+The system SHALL retry digests marked `deferred` due to LLM failure instead of dropping them.
+
+#### Scenario: Deferred Digest Retry
+- **GIVEN** a digest marked `deferred` after LLM failures
+- **WHEN** its retry schedule comes due
+- **THEN** the system SHALL dispatch it again, eventually generating the digest or reaching the retry cap

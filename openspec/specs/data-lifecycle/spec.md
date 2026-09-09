@@ -6,12 +6,12 @@ Handles account deletion (GDPR-compliant), GDPR data exports, and cleanup of orp
 ## Requirements
 
 ### Requirement: Account Deletion Request
-The system SHALL allow users to request account deletion with email confirmation and a 30-day reversible window.
+The system SHALL accept an account-deletion request and enqueue an asynchronous deletion job.
 
 #### Scenario: Request Account Deletion
 - **GIVEN** an authenticated user
 - **WHEN** the user calls DELETE /api/user/account with email_confirmation matching their account email (case-insensitive)
-- **THEN** the system SHALL set users.deletion_requested_at = NOW(), cancel the Stripe subscription if active (at period end for annual plans, immediately for monthly), insert an account_deletion_jobs row (idempotent), send a deletion_scheduled email with reversible_until timestamp (30 days from request), and return 202 with job_id, reversible_until, and status=scheduled
+- **THEN** the system SHALL set users.deletion_requested_at to the current UTC timestamp (SQLite `strftime('%Y-%m-%dT%H:%M:%SZ','now')`), cancel the Stripe subscription if active (at period end for annual plans, immediately for monthly), insert an account_deletion_jobs row with status='pending' (idempotent), send a deletion_scheduled email with reversible_until timestamp (30 days from request), and return 202 with job_id, reversible_until, and status=scheduled
 
 #### Scenario: Deletion Email Mismatch
 - **GIVEN** an authenticated user
@@ -47,7 +47,7 @@ The system SHALL process account deletion jobs through a multi-stage pipeline.
 #### Scenario: Stage 2 - Per-Channel Detach
 - **GIVEN** a deletion job in the 'deleting' stage
 - **WHEN** the worker iterates the user's tracked channels
-- **THEN** for each channel, the system SHALL: revoke OAuth token (best-effort, 3 retries), delete user's starred comments, delete the tracking row, check remaining active tracker count. If others exist: promote next ingestion token and stop. If sole tracker: chunk-delete comments (10K rows/transaction), then delete the platform_channels row
+- **THEN** for each channel, the system SHALL: revoke OAuth refresh token first, then access token (best-effort, bounded retries; already-invalid token not an error), delete user's starred comments, delete the tracking row, check remaining active tracker count. If others exist: promote next ingestion token and stop. If sole tracker: chunk-delete comments (10K rows/transaction), then delete the platform_channels row
 
 #### Scenario: New Tracker Appears During Delete
 - **GIVEN** a sole-tracker channel being chunk-deleted
@@ -57,7 +57,7 @@ The system SHALL process account deletion jobs through a multi-stage pipeline.
 #### Scenario: Stage 3 - Final Wipe
 - **GIVEN** a deletion job with all channels processed
 - **WHEN** the worker runs the final stage
-- **THEN** the system SHALL delete all weekly digests, remaining starred comments, and auth tokens in one transaction, send the deletion_completed email (before hard delete), hard-delete the user row, and mark the job completed
+- **THEN** the system SHALL delete every user-owned row in one transaction before the user row: email-verification, password-reset and refresh tokens, oauth_states, user_comment_stars, comment_usage_logs, comment_exports, workspace_members, rate_limit_buckets, user_channel_tracking, weekly_digests and data_export_jobs; send the deletion_completed email (before hard delete); hard-delete the user row; and mark the job completed
 
 #### Scenario: User Already Gone
 - **GIVEN** a deletion job whose user row no longer exists
@@ -68,6 +68,19 @@ The system SHALL process account deletion jobs through a multi-stage pipeline.
 - **GIVEN** a deletion job that encounters an error
 - **WHEN** the worker processes it
 - **THEN** the system SHALL mark the job as 'failed' with last_error populated and NOT auto-retry (destructive surface is too large for blind retries)
+
+### Requirement: Complete data erasure
+When a user is hard-deleted, the system SHALL remove every row owned by that user across all tables, regardless of foreign-key enforcement state.
+
+#### Scenario: Hard delete completes
+- **GIVEN** a deletion job reaching its final stage
+- **WHEN** the user row is removed
+- **THEN** no rows referencing that user remain in any user-owned table (tokens, oauth states, stars, usage logs, exports, memberships, rate-limit buckets, digests, tracking)
+
+#### Scenario: Shared channel with another owner
+- **GIVEN** a channel also tracked by another user
+- **WHEN** one user is deleted
+- **THEN** only that user's tracking/grants are removed and the shared channel data is preserved
 
 ### Requirement: GDPR Data Export
 The system SHALL allow users to export all their data as a ZIP file.
@@ -97,6 +110,27 @@ The system SHALL allow users to export all their data as a ZIP file.
 - **WHEN** a request hits GET /api/exports/{job_id}/download (no auth middleware)
 - **THEN** the system SHALL verify the signature against EXPORT_SIGNED_URL_SECRET, check the file exists on disk, and serve the ZIP with Content-Type=application/zip. If signature is invalid/expired, return 403. If file missing, return 404.
 
+### Requirement: Data-export job recovery
+The system SHALL recover data-export jobs that were interrupted, without orphaning files.
+
+#### Scenario: Crash mid-export
+- **GIVEN** a data-export job stuck in `exporting`
+- **WHEN** the application restarts or the reaper tick runs
+- **THEN** the job is reset to a retryable state and any partial ZIP for a non-completed job is removed
+
+#### Scenario: Mark-completion failure
+- **GIVEN** a ZIP written but its completion row update fails
+- **WHEN** the failure is handled
+- **THEN** the orphaned file is removed and the job returns to a retryable state
+
+### Requirement: Exports do not block writers
+The system SHALL stream exports without holding the main write path.
+
+#### Scenario: Export while ingestion writes
+- **GIVEN** an ongoing export
+- **WHEN** ingestion or quota writes occur concurrently
+- **THEN** the writes proceed without unbounded blocking
+
 ### Requirement: Cleanup Worker
 The system SHALL clean up orphaned shared channel data when the last tracker is removed.
 
@@ -111,12 +145,22 @@ The system SHALL clean up orphaned shared channel data when the last tracker is 
 - **THEN** the system SHALL hard-delete all comments for that channel and delete the platform_channels row
 
 ### Requirement: OAuth Token Revocation
-The system SHALL revoke OAuth tokens when a user's tracking is removed.
+The system SHALL revoke the user's OAuth refresh token in addition to the access token when their tracking is removed.
 
 #### Scenario: Revoke with Retry
-- **GIVEN** an OAuth access token to revoke
+- **GIVEN** an OAuth token to revoke
 - **WHEN** the deletion worker calls RevokeWithRetry
-- **THEN** the system SHALL attempt revocation up to 3 times with backoff, log failures as non-fatal warnings, and continue deletion regardless of revocation outcome
+- **THEN** the system SHALL attempt revocation up to 3 times over a bounded ~30s window, log failures as non-fatal warnings, and continue deletion regardless of revocation outcome
+
+#### Scenario: Delete revokes provider tokens
+- **GIVEN** a user with linked YouTube OAuth tokens
+- **WHEN** the deletion job runs the revoke stage
+- **THEN** both access and refresh tokens are revoked at the provider (refresh first — it is the durable credential), and an already-invalid token is not treated as an error
+
+#### Scenario: Revoke failure retried out-of-band
+- **GIVEN** a deletion job whose in-job revocation failed
+- **WHEN** the periodic revoke sweeper runs
+- **THEN** the system SHALL retry revocation from the job's recorded revoke_error state while the user's credentials still exist, and clear the error on success
 
 ### Requirement: Audit Trail for Deletion Events
 The system SHALL log all deletion-related events to an audit trail for compliance and debugging.
@@ -143,3 +187,19 @@ The system SHALL handle annual plan cancellations by allowing access until the p
 #### Scenario: Annual Plan Period Expires
 - **WHEN** the annual plan period end date passes for a user with a pending deletion
 - **THEN** the system SHALL proceed with the deletion worker pipeline
+
+### Requirement: Workspace deletion cleanup
+The system SHALL clear member references when a workspace is deleted.
+
+#### Scenario: Workspace deleted while active for members
+- **GIVEN** members whose `active_workspace_id` points at the workspace
+- **WHEN** the workspace is deleted
+- **THEN** the members' `active_workspace_id` is NULLed and channel tracking is cleared, with no dangling references
+
+### Requirement: Free-tier quota reset schedule
+The system SHALL assign every free user a `quota_reset_at` so monthly resets always apply.
+
+#### Scenario: New free user created
+- **GIVEN** a new user on a free plan
+- **WHEN** the account is created
+- **THEN** `quota_reset_at` is set to approximately now + 30 days

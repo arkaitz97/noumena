@@ -60,13 +60,23 @@ The system SHALL provide an endpoint for users to check their current rate limit
 - **WHEN** an authenticated user calls GET /api/user/rate-limit-status
 - **THEN** the system SHALL return `{"limit": 100, "remaining": <count>, "reset_at": <timestamp>, "window_seconds": 60}`
 
-### Requirement: IP-Based Fallback for Unauthenticated
-The system SHALL use client IP as the rate limit key for unauthenticated requests.
+### Requirement: Client identity from a trusted source
+The system SHALL derive the client IP used for rate limiting from a source the client cannot spoof.
 
-#### Scenario: IP Key Extraction
-- **WHEN** an unauthenticated request arrives
-- **THEN** the system SHALL use X-Forwarded-For header (first IP) or RemoteAddr as the rate limit key
+#### Scenario: Spoofed forwarded header
+- **GIVEN** a client sending a forged `X-Forwarded-For` header
+- **WHEN** the request is rate limited
+- **THEN** the spoofed value is ignored and the trusted source (proxy-configured header or remote address) is used
 
-#### Scenario: Shared IP Fairness
-- **WHEN** multiple unauthenticated users share an IP (NAT, corporate network)
-- **THEN** the system SHALL share the 10 req/min limit among them (documented limitation)
+### Requirement: Rate limiting after authentication
+The system SHALL apply per-user rate limits to authenticated requests rather than treating them as anonymous.
+
+#### Scenario: Authenticated request exceeds user limit
+- **GIVEN** an authenticated session
+- **WHEN** the user exceeds their per-user limit
+- **THEN** the request is rejected with 429
+
+#### Scenario: Anonymous request
+- **GIVEN** no authenticated session
+- **WHEN** the request is rate limited
+- **THEN** it is keyed by the trusted client IP

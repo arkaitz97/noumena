@@ -1,7 +1,10 @@
 # AGENTS.md — OpenSpec Agent Instructions for Noumena
 
 ## Repository Overview
-Noumena is a Go backend + Vue 3 frontend SaaS platform for AI-powered comment intelligence. The codebase uses PostgreSQL-backed job queues (no Redis/SQS), chi router for HTTP, and feature-flagged modules.
+Noumena is a Go backend + Vue 3 frontend SaaS platform for AI-powered comment intelligence. Storage is SQLite via `modernc.org/sqlite` (pure-Go driver; `internal/db/schema.sql`), job queues are SQLite-backed (no Redis/SQS), router is chi, modules are feature-flagged. Workers (ingestion, LLM, digest, email, lifecycle, export) run as goroutines inside the single `api` process.
+
+## Active Change Set (audit fixes)
+A 2026-09-05 audit produced 12 openspec changes under `openspec/changes/` (`fix-*`, `implement-missing-product-features`), each with `proposal.md`/`design.md`/`tasks.md` + spec deltas. **Apply order and phases: `openspec/change-roadmap.md`.** Before editing a domain, check whether an open change already covers the area — if so, update/implement that change instead of editing the spec or code directly. Known-broken areas (deletion/export workers, email retry, workspace role enforcement) are deliberately left unfixed until their changes are applied; do not treat current behavior as intended.
 
 ## Spec Map
 When working on a change, identify which domain spec(s) it affects:
@@ -37,8 +40,8 @@ When working on a change, identify which domain spec(s) it affects:
 - Plan limits enforced AFTER CSRF validation but BEFORE burning Google auth code.
 
 ### Ingestion
-- Job queue: `FOR UPDATE SKIP LOCKED` for claim, `pg_try_advisory_lock` for per-channel mutual exclusion.
-- Advisory lock key: MD5 hash of platform_channel_id, first 8 bytes as int64 (network order).
+- Job queue: SQLite-backed. Claim via `UPDATE … WHERE status='pending' … RETURNING` (the archived PostgreSQL `FOR UPDATE SKIP LOCKED` wording is obsolete).
+- Per-channel mutual exclusion (`AcquireChannelLock`, `internal/ingestion/lock.go`) is a documented **no-op** — SQLite serializes writes. Concurrency safety relies on claim atomicity + `ON CONFLICT DO NOTHING` on comment insert; a real advisory lock is deferred (see `fix-workers-recovery-shutdown`).
 - Retry budget: 5 attempts. Dead-lettered jobs park the channel for 1 hour.
 - Token refresh: worker always forces a refresh via oauth2.TokenSource before API calls.
 - Only YouTube is implemented; non-YouTube platforms are marked completed without API calls.
@@ -67,6 +70,7 @@ When working on a change, identify which domain spec(s) it affects:
 ### Data Lifecycle
 - Deletion is NOT a hard delete on request. Sets `deletion_requested_at`, enqueues async job. Reversible within `DELETION_REVERSIBLE_HOURS` (default 48h) while status='pending'.
 - Deletion stages: export (best-effort, 12h timeout) → per-channel detach (OAuth revoke, chunked comment delete) → final wipe (digests, stars, auth tokens, hard delete user).
+- **Known-broken (audit):** the deletion endpoint + worker and the export worker currently error on real SQLite (Postgres-ism `NOW()`/`$1` + `last_error`/`storage_path` column drift; DSN pragmas WAL/FK/busy_timeout are not applied). Do not debug as-is — the fixes land via `fix-sqlite-driver-migrations` → `fix-data-lifecycle-gdpr` → `fix-export-pipeline`.
 - Failed deletion jobs are NOT auto-retried. They stay in 'failed' state for human triage.
 - Export ZIP cap: 500MB. Partial exports include a README.md and are considered successful (not failure).
 - Signed URLs: HMAC-based signature with EXPORT_SIGNED_URL_SECRET. Download route has NO auth middleware.
@@ -74,7 +78,7 @@ When working on a change, identify which domain spec(s) it affects:
 ### Email Pipeline
 - `EMAIL_ENABLED=false` is a documented kill-switch. Send is a logged no-op, no rows written.
 - Idempotency: two-layer — pre-insert SELECT + unique constraint on idempotency_key.
-- Retry worker: 3-attempt cap, 60-second tick. Does NOT re-render original template (sends degraded body).
+- Retry worker: 3-attempt cap, 60-second tick. **Known-broken (audit):** the retry path never calls `Sender.Send` (only bumps `attempt_count`), so transient SMTP failures lose mail silently — fixed by `fix-email-delivery`.
 - Email address redaction in logs: first char + "***" + domain.
 
 ### Weekly Digest
@@ -85,9 +89,12 @@ When working on a change, identify which domain spec(s) it affects:
 
 ## Conventions
 - All handlers use `writeJSON` / `writeError` from `auth_handlers.go`.
-- DB interfaces are narrow (e.g., `WorkerDB`, `SchedulerDB`, `RefreshTokenStore`). `*db.PostgresQuery` satisfies all.
+- DB interfaces are narrow (e.g., `WorkerDB`, `SchedulerDB`, `RefreshTokenStore`). `*db.SQLiteQuery` (db.go:243) satisfies the `DBQuery` interface; some stale comments still say `PostgresQuery` — see `fix-docs-ci-ops`.
 - Feature flags use environment variables. Default values in `config.Default`.
-- Tests use `testcontainers-go` with real PostgreSQL. MockQuery interface for unit tests.
+- Secrets: `JWT_SECRET` (≥32 bytes) and `ENCRYPTION_KEY` are mandatory — do not add or rely on hardcoded fallbacks (planned enforcement in `fix-auth-critical-security` + `fix-crypto-http-hardening`).
+- Migrations: currently CREATE-IF-NOT-EXISTS only (`ApplyMigrations`). Versioned `ALTER TABLE` migrations (with `schema_migrations` ledger + SQLite `_pragma` DSN: WAL/FK/busy_timeout) land via `fix-sqlite-driver-migrations` — follow that design once merged; until then, schema changes must be idempotent CREATE IF NOT EXISTS.
+- Tests use the `internal/dbtest` harness (in-memory SQLite, real `ApplyMigrations` path) plus MockQuery-style interfaces for unit tests. No testcontainers/PostgreSQL.
+- Workspace role enforcement and shared-channel grants are **not yet wired** (middleware unmounted, `tracking.workspace_id` never written) — pending `fix-workspace-authz-api`. Do not assume data routes are role-scoped.
 - OpenTelemetry instrumentation is zero-cost when `OTEL_ENABLED=false` (no-op providers).
 
 ## When Adding a New Domain

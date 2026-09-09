@@ -103,3 +103,11 @@ The system SHALL expose metrics for scraping when OTel is enabled.
 #### Scenario: Prometheus Endpoint
 - **WHEN** a request hits GET /metrics and OTEL_ENABLED=true
 - **THEN** the system SHALL return Prometheus-format metrics for all registered instruments
+
+### Requirement: Graceful Shutdown Drain
+The system SHALL stop background workers before flushing telemetry and closing the database.
+
+#### Scenario: Shutdown Signal Received
+- **GIVEN** a running process with active workers
+- **WHEN** a shutdown signal is received
+- **THEN** the system SHALL drain workers within a bounded window, then stop the HTTP server, flush telemetry, and close the database — in that order

@@ -21,7 +21,7 @@ The system SHALL enforce three roles with specific permissions.
 
 #### Scenario: Analyst Permissions
 - **WHEN** a user with Analyst role accesses workspace resources
-- **THEN** the system SHALL allow: view all data, export data, star comments, view insights. SHALL deny: manage members, manage billing, connect/remove channels
+- **THEN** the system SHALL allow: view all data, export data, view insights. SHALL deny: star comments (admin-only), manage members, manage billing, connect/remove channels
 
 #### Scenario: Viewer Permissions
 - **WHEN** a user with Viewer role accesses workspace resources
@@ -68,6 +68,14 @@ The system SHALL scope channel visibility and access to the current workspace.
 - **WHEN** a user attempts to access a channel from a different workspace
 - **THEN** the system SHALL return 403 with "channel not accessible in this workspace"
 
+#### Scenario: Shared Channel Grant
+- **WHEN** an Analyst or Admin grants a channel to the workspace and a member requests its comments or insights
+- **THEN** the system SHALL return the data
+
+#### Scenario: Non-Member Request
+- **WHEN** a user requests comments, insights, or stars a channel they neither track nor hold a grant for
+- **THEN** the system SHALL deny the request
+
 ### Requirement: Role Enforcement Middleware
 The system SHALL validate workspace role permissions on protected routes.
 
@@ -107,3 +115,45 @@ The system SHALL allow Admins to change a member's role.
 #### Scenario: Change Role
 - **WHEN** an Admin calls PATCH /api/workspaces/{id}/members/{user_id} with `{role: "analyst"}`
 - **THEN** the system SHALL update the role, return 200, and the user's permissions SHALL update immediately
+
+### Requirement: Server-Side Role Enforcement on Data Routes
+The system SHALL enforce workspace roles server-side on all data routes: channel connect/remove, star/unstar, and member management require `admin`; export and insights require at least `analyst`; reads require any member (`viewer`+).
+
+#### Scenario: Viewer Attempts a Write
+- **GIVEN** a workspace member with the `viewer` role
+- **WHEN** they call a channel-removal or channel-connect endpoint
+- **THEN** the request is denied with 403
+
+### Requirement: Single Workspace Fetch
+The system SHALL return a single workspace for `GET /workspaces/{id}`.
+
+#### Scenario: Fetch Own Workspace
+- **GIVEN** a workspace the user belongs to
+- **WHEN** `GET /workspaces/{id}` is called
+- **THEN** exactly that workspace is returned
+
+#### Scenario: Fetch Foreign Workspace
+- **GIVEN** a workspace the user does not belong to
+- **WHEN** `GET /workspaces/{id}` is called
+- **THEN** a 404/403 is returned
+
+### Requirement: Atomic Channel-Cap Enforcement
+The system SHALL enforce plan channel limits atomically so concurrent connects cannot exceed the cap.
+
+#### Scenario: Concurrent Connects at the Cap
+- **GIVEN** a plan at its channel cap
+- **WHEN** two connect requests arrive in parallel
+- **THEN** at most one succeeds and the plan cap is not exceeded
+
+### Requirement: Backfill Enqueued on First Track
+The system SHALL enqueue a backfill ingestion job when a user first tracks a new platform channel.
+
+#### Scenario: First Connect
+- **GIVEN** a brand-new platform channel
+- **WHEN** a user connects it
+- **THEN** a backfill job is enqueued
+
+#### Scenario: Reconnect
+- **GIVEN** an already-tracked channel
+- **WHEN** the user reconnects it
+- **THEN** no duplicate backfill job is enqueued

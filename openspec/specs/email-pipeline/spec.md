@@ -11,7 +11,7 @@ The system SHALL send transactional emails through an SMTP pipeline with idempot
 #### Scenario: Successful Email Send
 - **GIVEN** EMAIL_ENABLED=true and valid SMTP configuration
 - **WHEN** Pipeline.Send is called with a valid Message (template, to_address, idempotency_key, variables)
-- **THEN** the system SHALL render the template (HTML + text), insert an email_send_log row with status='pending', attempt_count=1, send via SMTP, and on success update the row to status='sent' with sent_at=NOW()
+- **THEN** the system SHALL render the template (HTML + text), insert an email_send_log row with status='pending', attempt_count=1, and the persisted rendered body (html_body, text_body), recipient (to_address), and subject; send via SMTP; and on success update the row to status='sent' with sent_at=NOW()
 
 #### Scenario: Idempotency Short-Circuit
 - **GIVEN** an idempotency_key already associated with a sent email
@@ -21,7 +21,12 @@ The system SHALL send transactional emails through an SMTP pipeline with idempot
 #### Scenario: Idempotency Race Resolution
 - **GIVEN** two concurrent Send calls with the same idempotency_key
 - **WHEN** both attempt to insert the log row
-- **THEN** the system SHALL enforce the unique constraint; the second caller SHALL catch the 23505 error and treat it as idempotent success
+- **THEN** the system SHALL enforce the unique constraint; the second caller SHALL read the existing row and only treat it as a no-op when the row status is 'sent'
+
+#### Scenario: Duplicate key after failed first send
+- **GIVEN** a first send failed leaving the row `pending` (or the attempt cap left it `failed`)
+- **WHEN** the same idempotency key is enqueued again
+- **THEN** the email is not dropped and is eventually delivered (the send is re-attempted from the persisted body; the 3-attempt cap still applies)
 
 #### Scenario: SMTP Transient Failure
 - **GIVEN** a valid email send that encounters a transient SMTP error
@@ -57,15 +62,15 @@ The system SHALL retry failed email sends with exponential backoff.
 #### Scenario: Retry Pending Email
 - **GIVEN** an email_send_log row with status='pending' and attempt_count < 3
 - **WHEN** the retry worker ticks (default every 60 seconds)
-- **THEN** the system SHALL claim the row, attempt SMTP send with a degraded retry body, and on success mark it as sent
+- **THEN** the system SHALL claim the row and re-send the persisted recipient, subject, and rendered body (html_body/text_body); on success mark the row sent; on failure bump attempt_count, and after the cap is reached mark the row failed with a terminal metric
 
 #### Scenario: Retry Budget Exhausted
-- **GIVEN** an email_send_log row with attempt_count >= 3
+- **GIVEN** an email_send_log row whose next attempt would exceed the cap
 - **WHEN** the retry worker processes it
-- **THEN** the system SHALL mark the row as status='failed' with "retry budget exhausted" and log the failure
+- **THEN** the system SHALL mark the row as status='failed' with "retry budget exhausted", log the failure, and emit the terminal metric
 
 #### Scenario: Retry Without Recipient
-- **GIVEN** a pending email log row with NULL user_id (recipient context lost)
+- **GIVEN** a pending email log row with an empty persisted to_address (legacy row)
 - **WHEN** the retry worker processes it
 - **THEN** the system SHALL mark the row as failed with "retry-without-recipient" and log a structured event for operator intervention
 
@@ -82,7 +87,28 @@ The system SHALL support a weekly digest email template with LLM-generated conte
 
 #### Scenario: Render Digest Email
 - **WHEN** the pipeline renders a digest_email template
-- **THEN** the system SHALL include top 5 content ideas, top 5 unanswered questions, sentiment trend summary, and health score in both HTML and text formats
+- **THEN** the system SHALL include top 5 content ideas, top 5 unanswered questions, sentiment trend summary (when sentiment data is available), and health score in both HTML and text formats, and NEVER render Go's "<no value>" placeholder
+
+### Requirement: Unsubscribe on digest mail
+The system SHALL provide a `List-Unsubscribe` mechanism and a working unsubscribe path for digest emails.
+
+#### Scenario: Recipient unsubscribes
+- **GIVEN** a digest email with an unsubscribe link
+- **WHEN** the recipient follows the link
+- **THEN** digest opt-in is disabled for that user without further emails
+
+#### Scenario: Forged unsubscribe link
+- **GIVEN** an unsubscribe link whose HMAC signature does not verify (or whose expiry has passed)
+- **WHEN** the recipient follows the link
+- **THEN** the request SHALL be rejected (403) and the user's opt-in SHALL NOT change
+
+### Requirement: SMTP command deadlines
+The system SHALL bound every SMTP command with a deadline so a stalled relay cannot hang a send indefinitely.
+
+#### Scenario: Relay stalls mid-command
+- **GIVEN** an SMTP relay that stops responding after connect
+- **WHEN** a send is attempted
+- **THEN** the send fails within the configured timeout (SMTP_CMD_TIMEOUT, default 10s) rather than hanging
 
 ### Requirement: Trial Expiry Email Template
 The system SHALL support a trial expiry reminder email template.
