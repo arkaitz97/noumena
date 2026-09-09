@@ -145,7 +145,8 @@ async function onRemove(m: WorkspaceMember): Promise<void> {
 <template>
   <div class="max-w-5xl mx-auto py-8 px-4 sm:px-6 lg:px-8 space-y-8">
     <div>
-      <h1 class="text-2xl font-semibold leading-7 text-zinc-900 dark:text-white tracking-tight">Members</h1>
+      <p class="eyebrow mb-2">Team</p>
+      <h1 class="text-display-sm font-bold text-zinc-900 dark:text-white">Members</h1>
       <p class="mt-2 text-sm text-zinc-500 dark:text-zinc-400">
         Manage who can access
         <strong class="font-medium text-zinc-700 dark:text-zinc-300">{{ activeWorkspace?.name ?? 'this workspace' }}</strong>.

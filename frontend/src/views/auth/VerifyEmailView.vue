@@ -4,6 +4,7 @@ import { useRoute, useRouter, RouterLink } from 'vue-router'
 import { useAuthStore } from '../../stores/auth'
 import { toast } from '../../lib/toast'
 import SecondaryButton from '../../components/forms/SecondaryButton.vue'
+import AppLogo from '../../components/AppLogo.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -51,17 +52,12 @@ async function handleResend() {
 
 <template>
   <div class="min-h-screen bg-zinc-50 flex flex-col justify-center py-12 sm:px-6 lg:px-8 relative overflow-hidden">
-    <div class="absolute top-[-10%] left-[10%] w-[30rem] h-[30rem] bg-brand-200 rounded-full mix-blend-multiply filter blur-[100px] opacity-40" data-unslop-ignore></div>
-    <div class="absolute bottom-[-10%] right-[10%] w-[30rem] h-[30rem] bg-blue-100 rounded-full mix-blend-multiply filter blur-[100px] opacity-40" data-unslop-ignore></div>
+    <div class="absolute top-[-10%] left-[10%] w-[30rem] h-[30rem] bg-brand-200 rounded-full mix-blend-multiply filter blur-[100px] opacity-40"></div>
+    <div class="absolute bottom-[-10%] right-[10%] w-[30rem] h-[30rem] bg-blue-100 rounded-full mix-blend-multiply filter blur-[100px] opacity-40"></div>
 
     <div class="sm:mx-auto sm:w-full sm:max-w-md relative z-10 text-center">
-      <div class="flex items-center justify-center gap-2 mb-10">
-        <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-brand-400 to-brand-700 flex items-center justify-center shadow-card ring-1 ring-white/20">
-          <svg class="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
-          </svg>
-        </div>
-        <span class="text-xl font-bold tracking-tight text-zinc-900">Noumena</span>
+      <div class="flex items-center justify-center mb-10">
+        <AppLogo size="lg" show-text />
       </div>
 
       <!-- Verifying -->
@@ -112,7 +108,7 @@ async function handleResend() {
       </template>
 
       <!-- Resend card (always visible except during success) -->
-      <div v-if="phase !== 'success'" class="bg-white py-8 px-6 shadow-card rounded-[2rem] border border-zinc-100/80 mx-4 sm:mx-0">
+      <div v-if="phase !== 'success'" class="bg-white py-8 px-6 shadow-card rounded-xl border border-zinc-100/80 mx-4 sm:mx-0">
         <p v-if="resendError" class="text-sm text-rose-600 dark:text-rose-400 mb-4 font-medium">{{ resendError }}</p>
         <p v-else class="text-sm text-zinc-500 mb-6 font-medium">
           Didn't receive the email? Check your spam folder or request a new one.

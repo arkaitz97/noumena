@@ -145,7 +145,7 @@ export interface ToxicityBucket {
 }
 
 export interface ToxicityResponse {
-  window: '7d' | '30d'
+  window: WindowKey
   channel_id: string | null
   filtered_pct: number
   filtered_comments: number

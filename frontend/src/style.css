@@ -47,6 +47,18 @@
   /* Signature motion curve: fast start, expo settle — physics, not linear. */
   --ease-snappy: cubic-bezier(0.16, 1, 0.3, 1);
 
+  /* Fluid display type: scales organically across viewport shifts instead of
+     jumping at breakpoints. Line-height and tracking tighten as size grows. */
+  --text-display-sm: clamp(1.75rem, 1.2rem + 2.2vw, 2.375rem);
+  --text-display-sm--line-height: 1.15;
+  --text-display-sm--letter-spacing: -0.02em;
+  --text-display: clamp(2.125rem, 1.35rem + 3.1vw, 3rem);
+  --text-display--line-height: 1.1;
+  --text-display--letter-spacing: -0.025em;
+  --text-display-lg: clamp(2.625rem, 1.5rem + 4.6vw, 4.5rem);
+  --text-display-lg--line-height: 1.04;
+  --text-display-lg--letter-spacing: -0.03em;
+
   /* Elevation tinted to the neutral hue (blue-charcoal), never pure black. */
   --shadow-card: 0 1px 2px rgb(18 22 31 / 0.04), 0 8px 24px -16px rgb(18 22 31 / 0.12);
   --shadow-pop: 0 2px 4px rgb(18 22 31 / 0.05), 0 12px 32px -12px rgb(18 22 31 / 0.18);
@@ -71,6 +83,47 @@
   .tabular {
     font-variant-numeric: tabular-nums;
   }
+}
+
+/* Editorial micro-label: uppercase, widely spaced, quiet. The typographic
+   voice for section markers and data captions across the app. */
+@utility eyebrow {
+  @apply text-xs font-semibold uppercase tracking-[0.2em] text-zinc-400 dark:text-zinc-500;
+}
+
+/* Shared staggered load-in: rise + settle on the snappy curve. Pair with
+   .d2–.d5 delay steps. prefers-reduced-motion collapses durations globally. */
+@utility rise {
+  opacity: 0;
+  animation: rise 0.7s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+@utility d2 {
+  animation-delay: 0.1s;
+}
+@utility d3 {
+  animation-delay: 0.2s;
+}
+@utility d4 {
+  animation-delay: 0.3s;
+}
+@utility d5 {
+  animation-delay: 0.42s;
+}
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(18px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Hairline that fades at both ends — editorial divider for section breaks. */
+@utility rule-fade {
+  height: 1px;
+  background: linear-gradient(to right, transparent, rgb(148 163 184 / 0.35), transparent);
 }
 
 button:not(:disabled),

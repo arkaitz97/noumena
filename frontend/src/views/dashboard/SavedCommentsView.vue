@@ -4,6 +4,7 @@
 // the row optimistically (handled in feedStore.unstarComment).
 
 import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { Bookmark } from 'lucide-vue-next'
 import { useFeedStore } from '../../stores/feed'
 import { useChannelsStore } from '../../stores/channels'
 import { useFilterUrlSync } from '../../lib/useFilterUrlSync'
@@ -101,11 +102,12 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="max-w-5xl mx-auto py-8 px-4 sm:px-6 lg:px-8">
-    <div class="mb-6">
-      <h1 class="text-2xl font-semibold leading-7 text-zinc-900 dark:text-white sm:text-3xl sm:tracking-tight">
+    <div class="mb-7">
+      <p class="eyebrow rise mb-2">Bookmarks</p>
+      <h1 class="rise d2 text-display-sm font-bold text-zinc-900 dark:text-white">
         Saved comments
       </h1>
-      <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
+      <p class="rise d3 mt-2 text-sm text-zinc-500 dark:text-zinc-400">
         The signals you've explicitly starred for follow-up.
       </p>
     </div>
@@ -129,8 +131,11 @@ onBeforeUnmount(() => {
 
     <div
       v-else-if="feed.savedComments.length === 0"
-      class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-10 text-center"
+      class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-12 text-center"
     >
+      <div class="mx-auto w-12 h-12 rounded-xl bg-zinc-50 dark:bg-white/5 ring-1 ring-zinc-950/5 dark:ring-white/10 flex items-center justify-center text-zinc-400 dark:text-zinc-500 mb-4">
+        <Bookmark class="w-5 h-5" />
+      </div>
       <p class="text-sm font-medium text-zinc-900 dark:text-white">No saved comments yet.</p>
       <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-1">Star comments from your feed to keep track of them here.</p>
       <RouterLink

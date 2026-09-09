@@ -41,7 +41,7 @@ export async function actionableInsights(
 
 export async function toxicityShield(
   channelId?: string,
-  windowKey: '7d' | '30d' = '7d',
+  windowKey: WindowKey = '7d',
 ): Promise<ToxicityResponse> {
   const { data } = await apiClient.get<ToxicityResponse>('/insights/toxicity-shield', {
     params: buildParams(channelId, { window: windowKey }),

@@ -53,7 +53,7 @@ const maxCount = computed(() => {
         <span class="text-xs text-zinc-600 dark:text-zinc-400 w-32 truncate text-right">{{ INSIGHT_TYPE_LABELS[item.type] }}</span>
         <div class="flex-1 h-4 bg-zinc-100 dark:bg-zinc-800 rounded-full overflow-hidden">
           <div
-            class="h-full rounded-full transition-all duration-300" data-unslop-ignore
+            class="h-full rounded-full transition-all duration-300"
             :style="{
               width: `${(item.count / maxCount) * 100}%`,
               backgroundColor: INSIGHT_TYPE_COLORS[item.type],

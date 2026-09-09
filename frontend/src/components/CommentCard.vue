@@ -87,7 +87,7 @@ function onToggleStar(): void {
           <p v-if="postedAt" class="text-xs text-zinc-500 dark:text-zinc-400">{{ postedAt }}</p>
           <span
             v-if="isProcessing"
-            class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-50 dark:bg-amber-400/10 text-amber-700 dark:text-amber-300 ring-1 ring-inset ring-amber-600/20 dark:ring-amber-400/20" data-unslop-ignore
+            class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-50 dark:bg-amber-400/10 text-amber-700 dark:text-amber-300 ring-1 ring-inset ring-amber-600/20 dark:ring-amber-400/20"
           >
             Processing…
           </span>
@@ -98,7 +98,7 @@ function onToggleStar(): void {
           :aria-label="isStarred ? 'Unstar comment' : 'Star comment'"
           @click="onToggleStar"
           class="flex items-center justify-center h-11 w-11 rounded-lg transition-all duration-200 active:scale-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60"
-          :class="isStarred ? 'text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-950/30' : 'text-zinc-400 hover:text-amber-400 hover:bg-zinc-100/80 dark:hover:bg-white/5'" data-unslop-ignore
+          :class="isStarred ? 'text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-950/30' : 'text-zinc-400 hover:text-amber-400 hover:bg-zinc-100/80 dark:hover:bg-white/5'"
         >
           <Star class="h-5 w-5" :fill="isStarred ? 'currentColor' : 'none'" />
         </button>

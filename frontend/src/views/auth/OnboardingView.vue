@@ -8,6 +8,7 @@ import * as channels from '../../services/channels'
 import type { SyncStatus } from '../../services/types'
 import PrimaryButton from '../../components/forms/PrimaryButton.vue'
 import SecondaryButton from '../../components/forms/SecondaryButton.vue'
+import AppLogo from '../../components/AppLogo.vue'
 
 const router = useRouter()
 const auth = useAuthStore()
@@ -162,14 +163,7 @@ function finishOnboarding() {
 <template>
   <div class="min-h-screen bg-zinc-50 dark:bg-zinc-950 flex flex-col">
     <header class="px-6 sm:px-12 py-6 flex items-center justify-between">
-      <div class="flex items-center gap-2">
-        <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-brand-400 to-brand-700 flex items-center justify-center shadow-card ring-1 ring-white/20">
-          <svg class="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
-          </svg>
-        </div>
-        <span class="text-xl font-bold tracking-tight text-zinc-900 dark:text-zinc-100">Noumena</span>
-      </div>
+      <AppLogo size="md" show-text />
       <span class="text-xs font-medium text-zinc-500 dark:text-zinc-400">Step {{ step }} of 4 · {{ stepLabels[step - 1] }}</span>
     </header>
 
@@ -185,7 +179,7 @@ function finishOnboarding() {
 
     <main class="flex-1 flex items-center justify-center px-6 sm:px-12 py-12">
       <div class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl max-w-xl w-full p-8 sm:p-12 relative overflow-hidden">
-        <div class="absolute top-0 right-0 -mt-16 -mr-16 w-48 h-48 bg-gradient-to-br from-brand-500 to-brand-400 rounded-full blur-[80px] opacity-20 pointer-events-none" data-unslop-ignore></div>
+        <div class="absolute top-0 right-0 -mt-16 -mr-16 w-48 h-48 bg-gradient-to-br from-brand-500 to-brand-400 rounded-full blur-[80px] opacity-20 pointer-events-none"></div>
 
         <!-- STEP 1: Welcome -->
         <template v-if="step === 1">

@@ -105,7 +105,8 @@ onMounted(async () => {
     <!-- Header + connect button -->
     <div class="sm:flex sm:items-center sm:justify-between">
       <div>
-        <h1 class="text-2xl font-semibold leading-7 text-zinc-900 dark:text-white tracking-tight">Connected channels</h1>
+        <p class="eyebrow mb-2">Sources</p>
+        <h1 class="text-display-sm font-bold text-zinc-900 dark:text-white">Connected channels</h1>
         <p class="mt-2 text-sm text-zinc-500 dark:text-zinc-400">
           Manage your tracked channels, pause processing, or remove channels you no longer need.
         </p>

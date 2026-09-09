@@ -289,8 +289,9 @@ function downloadRecent(j: ExportJob): void {
 <template>
   <div class="max-w-5xl mx-auto py-8 px-4 sm:px-6 lg:px-8 space-y-8">
     <div>
-      <h1 class="text-2xl font-semibold leading-7 text-zinc-900 dark:text-white tracking-tight">Account</h1>
-      <p class="mt-2 text-sm text-zinc-500 dark:text-zinc-400 dark:text-zinc-400">Manage your profile, preferences, and account lifecycle.</p>
+      <p class="eyebrow mb-2">Profile</p>
+      <h1 class="text-display-sm font-bold text-zinc-900 dark:text-white">Account</h1>
+      <p class="mt-2 text-sm text-zinc-500 dark:text-zinc-400">Manage your profile, preferences, and account lifecycle.</p>
     </div>
 
     <!-- Profile / email -->
@@ -332,7 +333,7 @@ function downloadRecent(j: ExportJob): void {
               type="button"
               :disabled="resendingChange"
               @click="resendEmailChange"
-              class="mt-2 inline-flex items-center px-3 py-1.5 rounded-lg text-xs font-semibold text-amber-800 dark:text-amber-200 bg-amber-100 dark:bg-amber-400/15 hover:bg-amber-200 dark:hover:bg-amber-400/25 disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500" data-unslop-ignore
+              class="mt-2 inline-flex items-center px-3 py-1.5 rounded-lg text-xs font-semibold text-amber-800 dark:text-amber-200 bg-amber-100 dark:bg-amber-400/15 hover:bg-amber-200 dark:hover:bg-amber-400/25 disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500"
             >
               {{ resendingChange ? 'Sending…' : 'Resend verification' }}
             </button>

@@ -24,6 +24,7 @@ import { toast } from '../../lib/toast'
 import WorkspaceSwitcher from '../../components/WorkspaceSwitcher.vue'
 import RateLimitBanner from '../../components/RateLimitBanner.vue'
 import TokenExpiryBanner from '../../components/TokenExpiryBanner.vue'
+import AppLogo from '../../components/AppLogo.vue'
 import { usePolling } from '../../lib/usePolling'
 import { getTokenExpiry } from '../../services/tokenExpiry'
 import type { TokenExpiryChannel } from '../../services/tokenExpiry'
@@ -212,19 +213,13 @@ function dismissTokenExpiry() {
     <!-- Sidebar -->
     <aside class="hidden lg:flex flex-col w-64 bg-white dark:bg-zinc-900 border-r border-zinc-200 dark:border-zinc-800 sticky top-0 h-screen">
           <div class="px-5 py-5 border-b border-zinc-100 dark:border-white/5">
-        <RouterLink to="/dashboard" class="flex items-center gap-2.5 group">
-          <div
-            class="w-9 h-9 rounded-xl bg-gradient-to-br from-brand-400 to-brand-700 dark:from-brand-400 dark:to-brand-600 flex items-center justify-center shadow-card ring-1 ring-white/20 transition-transform duration-200 ease-snappy group-hover:scale-105"
-          >
-            <svg class="w-[18px] h-[18px] text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
-            </svg>
-          </div>
-          <span class="font-bold text-lg tracking-tight text-zinc-900 dark:text-white">Noumena</span>
+        <RouterLink to="/dashboard" class="flex items-center group focus:outline-none">
+          <AppLogo size="md" show-text />
         </RouterLink>
       </div>
 
-      <nav class="flex-1 px-3 py-4 space-y-1">
+      <nav class="flex-1 px-3 py-5 space-y-1">
+        <p class="eyebrow px-3 pb-2">Workspace</p>
         <RouterLink
           v-for="item in navItems"
           :key="item.to"
@@ -233,7 +228,7 @@ function dismissTokenExpiry() {
             isActive(item.to, item.exact)
               ? 'bg-white dark:bg-zinc-800 text-zinc-900 dark:text-white shadow-card dark:shadow-none ring-1 ring-zinc-950/5 dark:ring-white/5'
               : 'text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 hover:bg-zinc-100/80 dark:hover:bg-white/5',
-            'flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-all duration-200 ease-snappy focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500/50',
+            'group flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-all duration-200 ease-snappy focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500/50',
           ]"
         >
           <component
@@ -245,8 +240,8 @@ function dismissTokenExpiry() {
         </RouterLink>
       </nav>
 
-      <div class="px-6 py-4 border-t border-zinc-100 dark:border-zinc-800 text-xs text-zinc-500 dark:text-zinc-400">
-        © {{ new Date().getFullYear() }} Noumena
+      <div class="px-6 py-4 border-t border-zinc-100 dark:border-zinc-800">
+        <p class="font-mono text-[11px] text-zinc-400 dark:text-zinc-600 tracking-wide">© {{ new Date().getFullYear() }} Noumena</p>
       </div>
     </aside>
 
@@ -268,13 +263,8 @@ function dismissTokenExpiry() {
             >
               <Menu class="w-5 h-5" />
             </button>
-            <RouterLink to="/dashboard" class="flex items-center gap-2 min-w-0">
-              <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-brand-400 to-brand-700 flex items-center justify-center ring-1 ring-white/20">
-                <svg class="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
-                </svg>
-              </div>
-              <span class="font-bold tracking-tight text-zinc-900 dark:text-white truncate">Noumena</span>
+            <RouterLink to="/dashboard" class="flex items-center min-w-0">
+              <AppLogo size="sm" show-text />
             </RouterLink>
           </div>
 
@@ -401,13 +391,8 @@ function dismissTokenExpiry() {
         @keydown="onDrawerKeydown"
       >
         <div class="flex items-center justify-between px-4 h-16 border-b border-zinc-100 dark:border-zinc-800">
-          <RouterLink to="/dashboard" class="flex items-center gap-2" @click="closeDrawer">
-            <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-brand-400 to-brand-700 flex items-center justify-center ring-1 ring-white/20">
-              <svg class="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
-              </svg>
-            </div>
-            <span class="font-bold tracking-tight text-zinc-900 dark:text-white">Noumena</span>
+          <RouterLink to="/dashboard" class="flex items-center" @click="closeDrawer">
+            <AppLogo size="sm" show-text />
           </RouterLink>
           <button
             type="button"

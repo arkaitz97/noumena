@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import type { ToxicityResponse } from '../services/types'
+import type { ToxicityResponse, WindowKey } from '../services/types'
 
 const props = defineProps<{
   data: ToxicityResponse | null
-  windowKey?: '7d' | '30d'
+  windowKey?: WindowKey
   compact?: boolean
 }>()
 

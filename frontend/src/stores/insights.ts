@@ -72,7 +72,7 @@ export const useInsightsStore = defineStore('insights', () => {
 
   async function fetchToxicity(
     channelId?: string,
-    windowKey: '7d' | '30d' = '7d',
+    windowKey: WindowKey = '7d',
     opts: { force?: boolean } = {},
   ): Promise<ToxicityResponse | null> {
     const key = cacheKey(channelId, windowKey)

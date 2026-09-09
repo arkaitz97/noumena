@@ -44,7 +44,7 @@ function fmt(n: number): string {
       :aria-valuemax="unlimited ? Math.max(1, used) : limit"
       :aria-label="label || 'Usage'"
     >
-      <div :class="['h-full rounded-full transition-all duration-500', colorClass]" :style="widthStyle" data-unslop-ignore></div>
+      <div :class="['h-full rounded-full transition-all duration-500', colorClass]" :style="widthStyle"></div>
     </div>
   </div>
 </template>

@@ -128,8 +128,7 @@ function onResetFilters(): void {
 const widgetChannelId = computed(() => feed.filters.channels[0] ?? null)
 const range = ref<WindowKey>('7d')
 const rangeDays = computed(() => ({ '7d': 7, '30d': 30, '90d': 90 })[range.value])
-// Backend toxicity-shield only supports 7d/30d (insights_handlers.go) — clamp.
-const toxicityWindow = computed<'7d' | '30d'>(() => (range.value === '90d' ? '30d' : range.value))
+const toxicityWindow = computed<WindowKey>(() => range.value)
 
 async function refreshInsights(force = false): Promise<void> {
   await insights.fetchActionableInsights(widgetChannelId.value ?? undefined, range.value, { force })
@@ -262,31 +261,32 @@ usePolling(async () => {
 
 <template>
   <div class="max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8">
-    <div class="md:flex md:items-end md:justify-between mb-6">
+    <div class="md:flex md:items-end md:justify-between mb-8">
       <div class="flex-1 min-w-0">
-        <h1 class="text-2xl sm:text-3xl font-bold tracking-tight text-zinc-900 dark:text-white">
+        <p class="eyebrow rise mb-2">Signals</p>
+        <h1 class="rise d2 text-display-sm font-bold text-zinc-900 dark:text-white">
           Insights feed
         </h1>
-        <p class="mt-1.5 text-sm text-zinc-500 dark:text-zinc-400">
+        <p class="rise d3 mt-2 text-sm text-zinc-500 dark:text-zinc-400">
           Real-time signals across your channels.
         </p>
       </div>
       <button
         type="button"
         @click="helpVisible = true"
-        class="mt-4 md:mt-0 inline-flex items-center gap-2 text-xs font-semibold text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white px-3 py-2 rounded-lg hover:bg-zinc-100/80 dark:hover:bg-white/5 transition-all duration-200 active:scale-95"
+        class="rise d3 mt-4 md:mt-0 inline-flex items-center gap-2 text-xs font-semibold text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white px-3 py-2 rounded-lg hover:bg-zinc-100/80 dark:hover:bg-white/5 transition-all duration-200 active:scale-95"
       >
         <kbd class="inline-flex items-center justify-center min-w-[1.4rem] h-5 px-1 py-0.5 text-[10px] font-mono font-semibold bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-white/10 rounded-md shadow-card dark:shadow-none">?</kbd>
         Keyboard shortcuts
       </button>
     </div>
 
-    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8 rise d3">
       <Card>
-        <div class="flex items-center gap-2 text-zinc-500 dark:text-zinc-400 text-xs font-medium uppercase tracking-wider">
+        <div class="eyebrow flex items-center gap-2">
           <MessageSquare class="w-3.5 h-3.5" /> Insights ({{ range }})
         </div>
-        <p class="mt-2 text-2xl font-bold tracking-tight text-zinc-900 dark:text-white font-mono tabular-nums">
+        <p class="mt-3 text-3xl font-bold tracking-tight text-zinc-900 dark:text-white font-mono tabular">
           {{ totalCommentsCount !== null ? totalCommentsCount.toLocaleString() : '—' }}
         </p>
       </Card>
@@ -294,15 +294,15 @@ usePolling(async () => {
       <Card class="flex items-center gap-4">
         <ToxicityShield :data="insights.toxicity" :window-key="toxicityWindow" compact />
         <div>
-          <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Toxicity shield</p>
-          <p class="text-[11px] text-zinc-500 dark:text-zinc-400 mt-1">
+          <p class="eyebrow">Toxicity shield</p>
+          <p class="text-[11px] text-zinc-500 dark:text-zinc-400 mt-1.5">
             {{ insights.toxicity ? `${insights.toxicity.filtered_comments.toLocaleString()} filtered` : '—' }}
           </p>
         </div>
       </Card>
 
       <Card>
-        <div class="flex items-center gap-2 text-zinc-500 dark:text-zinc-400 text-xs font-medium uppercase tracking-wider mb-2">
+        <div class="eyebrow mb-3">
           Quota
         </div>
         <UsageBar
@@ -322,17 +322,17 @@ usePolling(async () => {
       </Card>
 
       <Card>
-        <div class="flex items-center gap-2 text-zinc-500 dark:text-zinc-400 text-xs font-medium uppercase tracking-wider">
+        <div class="eyebrow flex items-center gap-2">
           <TrendingUp class="w-3.5 h-3.5" /> Top insight type
         </div>
-        <p class="mt-2 text-lg font-bold tracking-tight text-zinc-900 dark:text-white">
+        <p class="mt-3 text-xl font-bold tracking-tight text-zinc-900 dark:text-white capitalize">
           {{
             insights.actionableInsights?.distribution?.length
               ? insights.actionableInsights.distribution.sort((a, b) => b.count - a.count)[0].type.replace(/_/g, ' ')
               : '—'
           }}
         </p>
-        <p class="text-[11px] text-zinc-500 dark:text-zinc-400 mt-1">
+        <p class="text-[11px] text-zinc-500 dark:text-zinc-400 mt-1.5 font-mono tabular">
           {{
             insights.actionableInsights?.distribution?.length
               ? `${insights.actionableInsights.distribution.sort((a, b) => b.count - a.count)[0].count} mentions`
@@ -416,7 +416,10 @@ usePolling(async () => {
         </div>
 
         <div v-else-if="feed.comments.length === 0">
-          <Card padding="none" class="p-12 text-center">
+          <Card padding="none" class="p-14 text-center">
+            <div class="mx-auto w-12 h-12 rounded-xl bg-zinc-50 dark:bg-white/5 ring-1 ring-zinc-950/5 dark:ring-white/10 flex items-center justify-center text-zinc-400 dark:text-zinc-500 mb-4">
+              <MessageSquare class="w-5 h-5" />
+            </div>
             <p class="text-sm font-semibold text-zinc-900 dark:text-white">No comments match these filters.</p>
             <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-1.5">Try resetting filters or widening the date range.</p>
           </Card>
@@ -448,7 +451,7 @@ usePolling(async () => {
           class="space-y-0"
         >
           <Card padding="none" class="p-5">
-            <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider mb-3">Top topics</p>
+            <p class="eyebrow mb-4">Top topics</p>
             <div class="flex flex-wrap gap-1.5">
               <span
                 v-for="t in insights.trends.top_topics.slice(0, 12)"
@@ -476,7 +479,7 @@ usePolling(async () => {
         <div class="flex items-end justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:block sm:p-0">
           <div class="fixed inset-0 bg-zinc-950/50 backdrop-blur-sm dark:bg-black/60" aria-hidden="true" @click="exportOpen = false"></div>
           <span class="hidden sm:inline-block sm:align-middle sm:h-screen" aria-hidden="true">&#8203;</span>
-          <div class="relative z-10 inline-block align-bottom bg-white dark:bg-zinc-900 rounded-2xl px-4 pt-5 pb-6 text-left overflow-hidden shadow-pop ring-1 ring-zinc-950/5 dark:ring-white/10 transform transition-all sm:my-8 sm:align-middle sm:max-w-md sm:w-full sm:p-8">
+          <div class="relative z-10 inline-block align-bottom bg-white dark:bg-zinc-900 rounded-xl px-4 pt-5 pb-6 text-left overflow-hidden shadow-pop ring-1 ring-zinc-950/5 dark:ring-white/10 transform transition-all sm:my-8 sm:align-middle sm:max-w-md sm:w-full sm:p-8">
             <div class="flex items-start justify-between">
               <div>
                 <h3 class="text-xl font-bold tracking-tight text-zinc-900 dark:text-white">Export comments</h3>

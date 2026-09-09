@@ -56,7 +56,7 @@ function onReauthorize(): void {
   <Card tag="article" class="overflow-hidden">
     <div
       v-if="tokenWarning === 'soon'"
-      class="px-5 py-2 bg-amber-50 dark:bg-amber-400/10 text-amber-800 dark:text-amber-200 text-xs flex items-center gap-2" data-unslop-ignore
+      class="px-5 py-2 bg-amber-50 dark:bg-amber-400/10 text-amber-800 dark:text-amber-200 text-xs flex items-center gap-2"
     >
       <AlertTriangle class="w-4 h-4" />
       <span class="flex-1">
@@ -65,7 +65,7 @@ function onReauthorize(): void {
       <button
         type="button"
         @click="onReauthorize"
-        class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-semibold text-amber-800 dark:text-amber-200 bg-amber-100 dark:bg-amber-400/20 hover:bg-amber-200 dark:hover:bg-amber-400/30 transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500" data-unslop-ignore
+        class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-semibold text-amber-800 dark:text-amber-200 bg-amber-100 dark:bg-amber-400/20 hover:bg-amber-200 dark:hover:bg-amber-400/30 transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500"
       >
         <RefreshCw class="w-3 h-3" /> Reconnect
       </button>
@@ -92,7 +92,7 @@ function onReauthorize(): void {
             <path d="M21.582,6.186c-0.23-0.86-0.908-1.538-1.768-1.768C18.254,4,12,4,12,4S5.746,4,4.186,4.418 c-0.86,0.23-1.538,0.908-1.768,1.768C2,7.746,2,12,2,12s0,4.254,0.418,5.814c0.23,0.86,0.908,1.538,1.768,1.768 C5.746,20,12,20,12,20s6.254,0,7.814-0.418c0.86-0.23,1.538-0.908,1.768-1.768C22,16.254,22,12,22,12S22,7.746,21.582,6.186z M9.996,15.005l0-6.01l5.418,3.004L9.996,15.005z" />
           </svg>
           <div v-if="isActive" class="absolute -top-1 -right-1 flex h-3 w-3">
-            <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" data-unslop-ignore></span>
+            <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
             <span class="relative inline-flex rounded-full h-3 w-3 bg-emerald-500 border-2 border-white"></span>
           </div>
         </div>

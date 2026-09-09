@@ -102,7 +102,8 @@ onBeforeUnmount(() => {
 <template>
   <div class="max-w-5xl mx-auto py-8 px-4 sm:px-6 lg:px-8 space-y-8">
     <div>
-      <h1 class="text-2xl font-semibold leading-7 text-zinc-900 dark:text-white tracking-tight">Billing & subscription</h1>
+      <p class="eyebrow mb-2">Plan</p>
+      <h1 class="text-display-sm font-bold text-zinc-900 dark:text-white">Billing & subscription</h1>
       <p class="mt-2 text-sm text-zinc-500 dark:text-zinc-400">Manage your plan, payment method, and invoices.</p>
     </div>
 
@@ -141,7 +142,7 @@ onBeforeUnmount(() => {
       <!-- Usage alert banner -->
       <div
         v-if="showUsageAlert"
-        class="bg-amber-50 dark:bg-amber-950/40 ring-1 ring-amber-600/20 rounded-xl p-4 flex items-start gap-3" data-unslop-ignore
+        class="bg-amber-50 dark:bg-amber-950/40 ring-1 ring-amber-600/20 rounded-xl p-4 flex items-start gap-3"
         role="alert"
       >
         <AlertTriangle class="w-5 h-5 text-amber-700 dark:text-amber-400 flex-shrink-0 mt-0.5" />
@@ -251,7 +252,7 @@ onBeforeUnmount(() => {
                 <td class="py-3">
                   <div class="w-24 h-2 bg-zinc-100 dark:bg-zinc-800 rounded-full overflow-hidden">
                     <div
-                      class="h-full rounded-full bg-brand-500" data-unslop-ignore
+                      class="h-full rounded-full bg-brand-500"
                       :style="{ width: usagePct(p) }"
                       :aria-label="`${usagePct(p)} of quota used`"
                     ></div>

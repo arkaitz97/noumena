@@ -8,6 +8,7 @@ import { googleAuthUrl, loginWithGoogleRedirect } from '../../services/auth'
 import TextInput from '../../components/forms/TextInput.vue'
 import PasswordInput from '../../components/forms/PasswordInput.vue'
 import PrimaryButton from '../../components/forms/PrimaryButton.vue'
+import AppLogo from '../../components/AppLogo.vue'
 
 const router = useRouter()
 const auth = useAuthStore()
@@ -72,16 +73,11 @@ async function handleGoogle() {
   <div class="min-h-screen bg-white flex">
     <div class="flex-1 flex flex-col justify-center px-6 sm:px-12 lg:flex-none lg:w-1/2 xl:w-5/12 mx-auto lg:mx-0 relative z-10">
       <div class="mx-auto w-full max-w-sm lg:max-w-md my-12">
-        <div class="flex items-center gap-2 mb-10">
-          <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-brand-400 to-brand-700 flex items-center justify-center shadow-card ring-1 ring-white/20">
-            <svg class="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
-            </svg>
-          </div>
-          <span class="text-xl font-bold tracking-tight text-zinc-900">Noumena</span>
+        <div class="mb-10">
+          <AppLogo size="lg" show-text />
         </div>
 
-        <h1 class="text-3xl font-semibold tracking-tight text-zinc-900 mb-2">Create an account</h1>
+        <h1 class="text-display-sm font-bold text-zinc-900 mb-2">Create an account</h1>
         <p class="text-zinc-500 text-base mb-8">Start understanding your audience in minutes.</p>
 
         <form class="space-y-5" @submit.prevent="handleSignup">
@@ -146,9 +142,9 @@ async function handleGoogle() {
     </div>
 
     <div class="hidden lg:flex relative w-0 flex-1 bg-zinc-950 overflow-hidden items-center justify-center">
-      <div class="absolute top-1/4 left-1/4 w-[40rem] h-[40rem] bg-brand-600 rounded-full mix-blend-screen filter blur-[120px] opacity-20" data-unslop-ignore></div>
-      <div class="absolute bottom-1/4 right-1/4 w-[40rem] h-[40rem] bg-blue-600 rounded-full mix-blend-screen filter blur-[120px] opacity-20" data-unslop-ignore></div>
-      <div class="relative z-10 max-w-lg p-10 rounded-[2rem] bg-white/5 border border-white/10 backdrop-blur-3xl shadow-2xl">
+      <div class="absolute top-1/4 left-1/4 w-[40rem] h-[40rem] bg-brand-600 rounded-full mix-blend-screen filter blur-[120px] opacity-20"></div>
+      <div class="absolute bottom-1/4 right-1/4 w-[40rem] h-[40rem] bg-blue-600 rounded-full mix-blend-screen filter blur-[120px] opacity-20"></div>
+      <div class="relative z-10 max-w-lg p-10 rounded-xl bg-white/5 border border-white/10 backdrop-blur-3xl shadow-2xl">
         <blockquote class="text-2xl font-medium text-zinc-100 leading-snug">
           "Using Noumena feels like having a data science team on my payroll."
         </blockquote>

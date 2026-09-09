@@ -6,6 +6,7 @@ import { toast } from '../../lib/toast'
 import { validatePassword } from '../../lib/validation'
 import PasswordInput from '../../components/forms/PasswordInput.vue'
 import PrimaryButton from '../../components/forms/PrimaryButton.vue'
+import AppLogo from '../../components/AppLogo.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -49,16 +50,11 @@ async function handleSubmit() {
 
 <template>
   <div class="min-h-screen bg-zinc-50 flex flex-col justify-center py-12 sm:px-6 lg:px-8 relative overflow-hidden">
-    <div class="absolute top-0 right-0 -mt-16 -mr-16 w-[28rem] h-[28rem] bg-gradient-to-br from-brand-500 to-brand-300 rounded-full blur-[80px] opacity-20 pointer-events-none" data-unslop-ignore></div>
+    <div class="absolute top-0 right-0 -mt-16 -mr-16 w-[28rem] h-[28rem] bg-gradient-to-br from-brand-500 to-brand-300 rounded-full blur-[80px] opacity-20 pointer-events-none"></div>
 
     <div class="sm:mx-auto sm:w-full sm:max-w-md relative z-10">
-      <div class="flex items-center justify-center gap-2 mb-8">
-        <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-brand-400 to-brand-700 flex items-center justify-center shadow-card ring-1 ring-white/20">
-          <svg class="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
-          </svg>
-        </div>
-        <span class="text-xl font-bold tracking-tight text-zinc-900">Noumena</span>
+      <div class="flex items-center justify-center mb-8">
+        <AppLogo size="lg" show-text />
       </div>
 
       <div class="bg-white py-10 px-8 shadow-card ring-1 ring-zinc-950/5 rounded-xl">

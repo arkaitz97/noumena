@@ -126,7 +126,7 @@ onBeforeUnmount(() => {
           <span class="hidden sm:inline-block sm:align-middle sm:h-screen" aria-hidden="true">&#8203;</span>
           <div
             ref="dialogRef"
-            class="relative z-10 inline-block align-bottom bg-white dark:bg-zinc-900 rounded-2xl px-4 pt-5 pb-6 text-left overflow-hidden shadow-pop ring-1 ring-zinc-950/5 dark:ring-white/10 transform transition-all sm:my-8 sm:align-middle sm:max-w-lg sm:w-full sm:p-8"
+            class="relative z-10 inline-block align-bottom bg-white dark:bg-zinc-900 rounded-xl px-4 pt-5 pb-6 text-left overflow-hidden shadow-pop ring-1 ring-zinc-950/5 dark:ring-white/10 transform transition-all sm:my-8 sm:align-middle sm:max-w-lg sm:w-full sm:p-8"
           >
             <div class="sm:flex sm:items-start">
               <div

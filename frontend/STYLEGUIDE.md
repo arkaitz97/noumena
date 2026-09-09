@@ -7,7 +7,7 @@ This document outlines the core design system and standard practices for buildin
 ## 1. Core Principles
 
 - **Contrast over Clutter**: Rely on distinct grayscale separations (`zinc-50` backgrounds vs `white` foreground cards with `zinc-900` text) instead of heavy, loud separators.
-- **Soft Geometry**: We favor highly rounded styling (`rounded-xl` and `rounded-2xl`) combined with delicate borders (`ring-1 ring-zinc-950/5`) to make elements look floating rather than boxed.
+- **Radius Scale**: Deliberate scale by role — surfaces (cards, modals, panels) use `rounded-xl`; buttons, inputs, and selects use `rounded-xl`; badges use `rounded-md`; `rounded-full` is reserved for functional circles only (avatars, status dots, progress bars, ambient orbs). Never `rounded-2xl` or larger. Pair with delicate borders (`ring-1 ring-zinc-950/5`) so elements float rather than box.
 - **Glassmorphism & Depth**: Make use of layered ambient lighting (blurred blobs) behind standard white components, or use `backdrop-blur-sm` for sticky/floating overlays.
 - **Alive but Restrained**: Interactivity (hover/focus states) should be ubiquitous but subtle. Prefer `transition-colors duration-200` to make state shifts feel polished rather than instantaneous.
 
@@ -56,7 +56,7 @@ When building new features, use these exact patterns for consistency:
 ### A. Layout Cards
 
 ```html
-<div class="bg-white shadow-sm ring-1 ring-zinc-950/5 sm:rounded-2xl p-6 sm:p-8">
+<div class="bg-white shadow-sm ring-1 ring-zinc-950/5 sm:rounded-xl p-6 sm:p-8">
   <!-- Content here -->
 </div>
 ```
