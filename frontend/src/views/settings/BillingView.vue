@@ -153,8 +153,8 @@ onBeforeUnmount(() => {
       </div>
 
       <!-- Current plan summary -->
-      <Card padding="lg">
-        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-5">
+      <Card padding="lg" class="@container">
+        <div class="flex flex-col @sm:flex-row @sm:items-center @sm:justify-between gap-3 mb-5">
           <div>
             <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Current plan</p>
             <h2 class="mt-1 text-xl font-semibold text-zinc-900 dark:text-white tracking-tight capitalize">
@@ -181,7 +181,7 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-6">
+        <div class="grid grid-cols-1 @sm:grid-cols-2 gap-6">
           <UsageBar
             :used="billing.status.channels_used"
             :limit="billing.status.channels_limit"
@@ -206,7 +206,7 @@ onBeforeUnmount(() => {
       </Card>
 
       <!-- Usage history -->
-      <Card padding="lg">
+      <Card padding="lg" class="@container">
         <div class="mb-5">
           <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Usage history</p>
           <h3 class="mt-1 text-lg font-semibold text-zinc-900 dark:text-white tracking-tight">

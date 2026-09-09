@@ -85,7 +85,7 @@ function onReauthorize(): void {
       </button>
     </div>
 
-    <div class="px-5 py-5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+    <div class="px-5 py-5 flex flex-col @sm:flex-row @sm:items-center @sm:justify-between gap-4">
       <div class="flex items-center min-w-0 gap-3">
         <div class="flex-shrink-0 h-12 w-12 flex items-center justify-center rounded-xl bg-red-50 text-red-600 border border-red-100 dark:border-red-500/20 shadow-sm relative">
           <svg class="h-6 w-6" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">

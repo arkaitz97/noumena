@@ -163,14 +163,14 @@ async function onRemove(m: WorkspaceMember): Promise<void> {
 
     <template v-else>
       <!-- Invite -->
-      <section class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-6 sm:p-8">
-        <div class="md:grid md:grid-cols-3 md:gap-8">
-          <div class="md:col-span-1">
+      <section class="@container bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-6 sm:p-8">
+        <div class="@md:grid @md:grid-cols-3 @md:gap-8">
+          <div class="@md:col-span-1">
             <h2 class="text-base font-semibold text-zinc-900 dark:text-white">Invite a member</h2>
             <p class="mt-1 text-sm text-zinc-500 pr-4">They'll receive an email with a join link.</p>
           </div>
-          <form class="mt-5 md:mt-0 md:col-span-2 space-y-3" @submit.prevent="onInvite">
-            <div class="flex flex-col sm:flex-row gap-3">
+          <form class="mt-5 @md:mt-0 @md:col-span-2 space-y-3" @submit.prevent="onInvite">
+            <div class="flex flex-col @sm:flex-row gap-3">
               <input
                 v-model="inviteEmail"
                 type="email"
@@ -202,7 +202,7 @@ async function onRemove(m: WorkspaceMember): Promise<void> {
       </section>
 
       <!-- Roster -->
-      <section class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl overflow-hidden">
+      <section class="@container bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl overflow-hidden">
         <div class="px-6 py-4 border-b border-zinc-200/70 dark:border-white/5 flex items-center gap-2">
           <ShieldCheck class="w-4 h-4 text-zinc-400" />
           <h2 class="text-sm font-semibold text-zinc-900 dark:text-white">Roster</h2>

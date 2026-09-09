@@ -30,7 +30,7 @@ function drillQuery(type: string): Record<string, string> {
 </script>
 
 <template>
-  <Card>
+  <Card class="@container">
     <div class="flex items-center justify-between mb-3">
       <div>
         <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Actionable insights</p>
@@ -51,14 +51,14 @@ function drillQuery(type: string): Record<string, string> {
       <li v-for="(insight, i) in topInsights.slice(0, 8)" :key="i">
         <RouterLink
           :to="{ name: 'dashboard', query: drillQuery(insight.type) }"
-          class="flex items-start gap-2 text-xs rounded-lg -m-1 p-1 hover:bg-zinc-50 dark:hover:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-brand-500"
+          class="flex items-start gap-1.5 @xs:gap-2 text-xs rounded-lg -m-1 p-1 hover:bg-zinc-50 dark:hover:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-brand-500"
         >
-          <span class="flex-shrink-0 w-5 h-5 rounded-full bg-brand-50 dark:bg-brand-950/40 text-brand-600 dark:text-brand-300 flex items-center justify-center text-[10px] font-semibold">
+          <span class="flex-shrink-0 w-4.5 h-4.5 @xs:w-5 @xs:h-5 rounded-full bg-brand-50 dark:bg-brand-950/40 text-brand-600 dark:text-brand-300 flex items-center justify-center text-[9px] @xs:text-[10px] font-semibold">
             {{ i + 1 }}
           </span>
           <span class="flex-1 min-w-0">
-            <span class="block text-zinc-700 dark:text-zinc-300 truncate">{{ insight.description }}</span>
-            <span class="block text-zinc-500 dark:text-zinc-400 text-[10px] mt-0.5">
+            <span class="block text-zinc-700 dark:text-zinc-300 truncate @max-xs:text-[11px]">{{ insight.description }}</span>
+            <span class="block text-zinc-500 dark:text-zinc-400 text-[9px] @xs:text-[10px] mt-0.5 truncate">
               {{ insightTypeLabel(insight.type) }} · {{ insight.count }} mentions
             </span>
           </span>

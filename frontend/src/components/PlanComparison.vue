@@ -68,7 +68,7 @@ function onSelect(p: PlanOption): void {
 </script>
 
 <template>
-  <section class="space-y-4">
+  <section class="@container space-y-4">
     <div class="flex items-center justify-between">
       <h3 class="text-base font-semibold text-zinc-900 dark:text-zinc-100 tracking-tight">Plans</h3>
       <SegmentedControl
@@ -82,7 +82,7 @@ function onSelect(p: PlanOption): void {
       />
     </div>
 
-    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+    <div class="grid grid-cols-1 @sm:grid-cols-2 @2xl:grid-cols-4 gap-4">
       <article
         v-for="p in plans"
         :key="p.id"

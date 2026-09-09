@@ -31,13 +31,13 @@ function fmt(n: number): string {
 </script>
 
 <template>
-  <div>
-    <div v-if="label || unit" class="flex items-center justify-between text-xs mb-1.5 font-medium">
-      <span class="text-zinc-700">{{ label }}</span>
-      <span class="text-zinc-500 font-mono tabular-nums">{{ fmt(used) }} / {{ unlimited ? 'Unlimited' : fmt(limit) }}{{ unit ? ' ' + unit : '' }}</span>
+  <div class="@container">
+    <div v-if="label || unit" class="flex items-center justify-between @max-xs:flex-col @max-xs:items-start @max-xs:gap-0.5 text-xs mb-1.5 font-medium">
+      <span class="text-zinc-700 dark:text-zinc-300">{{ label }}</span>
+      <span class="text-zinc-500 dark:text-zinc-400 font-mono tabular-nums @max-xs:text-[11px]">{{ fmt(used) }} / {{ unlimited ? 'Unlimited' : fmt(limit) }}{{ unit ? ' ' + unit : '' }}</span>
     </div>
     <div
-      class="w-full bg-zinc-100 dark:bg-white/5 rounded-full h-2.5 overflow-hidden border border-zinc-200/50"
+      class="w-full bg-zinc-100 dark:bg-white/5 rounded-full h-2.5 overflow-hidden border border-zinc-200/50 dark:border-zinc-800"
       role="progressbar"
       :aria-valuenow="used"
       :aria-valuemin="0"

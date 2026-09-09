@@ -37,7 +37,7 @@ const maxCount = computed(() => {
 </script>
 
 <template>
-  <div class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl p-5">
+  <div class="@container bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl p-4 @sm:p-5">
     <p class="text-xs font-medium text-zinc-500 uppercase tracking-wider mb-3">Insight distribution</p>
 
     <div v-if="sorted.length === 0" class="h-32 flex items-center justify-center text-xs text-zinc-400">
@@ -48,9 +48,9 @@ const maxCount = computed(() => {
       <div
         v-for="item in sorted"
         :key="item.type"
-        class="flex items-center gap-3"
+        class="flex items-center gap-2 @xs:gap-2.5 @sm:gap-3"
       >
-        <span class="text-xs text-zinc-600 dark:text-zinc-400 w-32 truncate text-right">{{ INSIGHT_TYPE_LABELS[item.type] }}</span>
+        <span class="text-[11px] @xs:text-xs text-zinc-600 dark:text-zinc-400 w-24 @xs:w-28 @sm:w-32 truncate text-right">{{ INSIGHT_TYPE_LABELS[item.type] }}</span>
         <div class="flex-1 h-4 bg-zinc-100 dark:bg-zinc-800 rounded-full overflow-hidden">
           <div
             class="h-full rounded-full transition-all duration-300"
@@ -60,7 +60,7 @@ const maxCount = computed(() => {
             }"
           ></div>
         </div>
-        <span class="text-xs font-medium text-zinc-500 font-mono tabular-nums w-10">{{ item.count }}</span>
+        <span class="text-[11px] @xs:text-xs font-medium text-zinc-500 font-mono tabular-nums w-8 @xs:w-10 text-right">{{ item.count }}</span>
       </div>
     </div>
 

@@ -277,7 +277,7 @@ usePolling(async () => {
       </button>
     </div>
 
-    <div class="sticky top-16 z-20 mb-8">
+    <div class="mb-8">
       <FilterBar
         ref="filterBarRef"
         :filters="feed.filters"

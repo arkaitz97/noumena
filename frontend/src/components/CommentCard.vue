@@ -54,31 +54,31 @@ function onToggleStar(): void {
 
 <template>
   <article
-    class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-5 hover:shadow-pop transition-shadow duration-200 relative overflow-hidden"
+    class="@container bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-5 hover:shadow-pop transition-shadow duration-200 relative overflow-hidden"
     :class="isFocused ? 'ring-2 ring-brand-500 dark:ring-brand-400 shadow-md' : ''"
   >
     <div>
       <div class="flex items-start justify-between gap-2">
         <div class="flex flex-wrap items-center gap-2 min-w-0">
-          <p class="text-sm font-semibold text-zinc-900 dark:text-white truncate">{{ author }}</p>
+          <p class="text-sm font-semibold text-zinc-900 dark:text-white truncate max-w-[140px] @xs:max-w-[200px] @sm:max-w-none">{{ author }}</p>
           <span class="text-zinc-300 dark:text-zinc-600">•</span>
           <a
             v-if="channelUrl"
             :href="channelUrl"
             target="_blank"
             rel="noopener"
-            class="text-xs font-medium text-zinc-500 dark:text-zinc-400 truncate underline-offset-2 hover:underline hover:text-zinc-900 dark:hover:text-zinc-100"
+            class="text-xs font-medium text-zinc-500 dark:text-zinc-400 truncate underline-offset-2 hover:underline hover:text-zinc-900 dark:hover:text-zinc-100 max-w-[120px] @xs:max-w-[180px] @sm:max-w-none"
           >
             {{ channelLabel }}
           </a>
-          <span v-else class="text-xs font-medium text-zinc-500 dark:text-zinc-400 truncate">{{ channelLabel }}</span>
+          <span v-else class="text-xs font-medium text-zinc-500 dark:text-zinc-400 truncate max-w-[120px] @xs:max-w-[180px] @sm:max-w-none">{{ channelLabel }}</span>
           <span v-if="videoUrl" class="text-zinc-300 dark:text-zinc-600">•</span>
           <a
             v-if="videoUrl"
             :href="videoUrl"
             target="_blank"
             rel="noopener"
-            class="inline-flex items-center gap-1 text-xs font-medium text-zinc-500 dark:text-zinc-400 truncate underline-offset-2 hover:underline hover:text-zinc-900 dark:hover:text-zinc-100"
+            class="inline-flex items-center gap-1 text-xs font-medium text-zinc-500 dark:text-zinc-400 truncate underline-offset-2 hover:underline hover:text-zinc-900 dark:hover:text-zinc-100 max-w-[140px] @xs:max-w-[220px] @sm:max-w-none"
           >
             <Play class="w-3 h-3 shrink-0" aria-hidden="true" />
             <span class="truncate">{{ videoLabel }}</span>
@@ -97,7 +97,7 @@ function onToggleStar(): void {
           :aria-pressed="isStarred"
           :aria-label="isStarred ? 'Unstar comment' : 'Star comment'"
           @click="onToggleStar"
-          class="flex items-center justify-center h-11 w-11 rounded-lg transition-all duration-200 active:scale-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60"
+          class="flex items-center justify-center h-11 w-11 rounded-lg transition-all duration-200 active:scale-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60 shrink-0"
           :class="isStarred ? 'text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-950/30' : 'text-zinc-400 hover:text-amber-400 hover:bg-zinc-100/80 dark:hover:bg-white/5'"
         >
           <Star class="h-5 w-5" :fill="isStarred ? 'currentColor' : 'none'" />
@@ -128,7 +128,7 @@ function onToggleStar(): void {
         </span>
         <span
           v-if="comment.topic"
-          class="inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium bg-zinc-50 dark:bg-white/5 text-zinc-700 dark:text-zinc-300 ring-1 ring-inset ring-zinc-500/10 dark:ring-white/10"
+          class="inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium bg-zinc-50 dark:bg-white/5 text-zinc-700 dark:text-zinc-300 ring-1 ring-inset ring-zinc-500/10 dark:ring-white/10 truncate max-w-[140px] @xs:max-w-[200px] @sm:max-w-none"
         >
           {{ comment.topic }}
         </span>

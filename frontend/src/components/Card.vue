@@ -18,15 +18,16 @@ const props = withDefaults(
 
 const Tag = computed(() => props.as ?? props.tag ?? 'div')
 const padClass = computed(() =>
-  props.padding === 'lg' ? 'p-6 sm:p-8' : props.padding === 'none' ? '' : 'p-5',
+  props.padding === 'lg' ? 'p-6 @md:p-8' : props.padding === 'none' ? '' : 'p-5',
 )
 </script>
 
 <template>
   <component
     :is="Tag"
-    class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl"
+    class="@container bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl"
     :class="padClass"
-  >    <slot />
+  >
+    <slot />
   </component>
 </template>

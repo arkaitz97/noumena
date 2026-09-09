@@ -33,8 +33,8 @@ const display = computed(() => `${pct.value.toFixed(1)}%`)
 </script>
 
 <template>
-  <div class="flex flex-col items-center justify-center" role="img" :aria-label="`Toxicity shield ${display}`">
-    <svg :width="SIZE" :height="SIZE" :viewBox="`0 0 ${SIZE} ${SIZE}`">
+  <div class="shrink-0 flex flex-col items-center justify-center" role="img" :aria-label="`Toxicity shield ${display}`">
+    <svg :width="SIZE" :height="SIZE" :viewBox="`0 0 ${SIZE} ${SIZE}`" class="shrink-0">
       <circle
         :cx="SIZE / 2"
         :cy="SIZE / 2"

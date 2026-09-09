@@ -217,7 +217,7 @@ function doReset(): void {
 </script>
 
 <template>
-  <Card padding="none" class="p-2.5 sm:p-3">
+  <Card padding="none" class="@container p-2.5 @sm:p-3">
     <div class="flex flex-wrap items-center gap-2">
       <div class="relative min-w-0 flex-1 basis-48">
         <Search class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-400 dark:text-zinc-500" />
@@ -245,7 +245,7 @@ function doReset(): void {
         </button>
         <div
           v-if="dateOpen"
-          class="absolute left-0 sm:left-auto sm:right-0 mt-2 w-72 sm:w-80 bg-white dark:bg-zinc-900 shadow-pop ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-1.5 z-30 origin-top-right"
+          class="absolute left-0 @sm:left-auto @sm:right-0 mt-2 w-72 @sm:w-80 bg-white dark:bg-zinc-900 shadow-pop ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-1.5 z-30 origin-top-right"
           role="menu"
           aria-label="Date range options"
         >
@@ -314,7 +314,7 @@ function doReset(): void {
           aria-label="Toggle filters"
         >
           <SlidersHorizontal class="w-4 h-4" />
-          <span class="hidden sm:inline">Filters</span>
+          <span class="hidden @sm:inline">Filters</span>
           <span
             v-if="activeCount > 0"
             class="inline-flex items-center justify-center min-w-5 h-5 px-1 rounded-full text-[11px] font-semibold bg-brand-600 text-white"
@@ -323,7 +323,7 @@ function doReset(): void {
         </button>
         <div
           v-if="filtersOpen"
-          class="fixed inset-x-3 bottom-3 max-h-[65vh] overflow-y-auto rounded-xl bg-white dark:bg-zinc-900 shadow-pop ring-1 ring-zinc-950/5 dark:ring-white/10 p-4 space-y-4 z-30 sm:absolute sm:inset-auto sm:right-0 sm:top-full sm:mt-2 sm:w-80 sm:max-h-none sm:overflow-visible sm:origin-top-right"
+          class="fixed inset-x-3 bottom-3 max-h-[65vh] overflow-y-auto rounded-xl bg-white dark:bg-zinc-900 shadow-pop ring-1 ring-zinc-950/5 dark:ring-white/10 p-4 space-y-4 z-30 @sm:absolute @sm:inset-auto @sm:right-0 @sm:top-full @sm:mt-2 @sm:w-80 @sm:max-h-none @sm:overflow-visible @sm:origin-top-right"
         >
           <div v-if="channels.length > 0">
             <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider mb-2">Channels</p>

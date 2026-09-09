@@ -90,7 +90,7 @@ onBeforeUnmount(() => {
         <div class="flex items-center justify-center min-h-screen px-4">
           <div class="fixed inset-0 bg-zinc-950/50 backdrop-blur-sm dark:bg-black/60" @click="emit('close')"></div>
 
-          <div ref="dialogRef" class="relative bg-white dark:bg-zinc-900 rounded-xl shadow-pop ring-1 ring-zinc-950/5 dark:ring-white/10 max-w-md w-full p-6 sm:p-8">
+          <div ref="dialogRef" class="@container relative bg-white dark:bg-zinc-900 rounded-xl shadow-pop ring-1 ring-zinc-950/5 dark:ring-white/10 max-w-md w-full p-6 @sm:p-8">
             <div class="flex items-start justify-between">
               <h3 id="keyboard-help-title" class="text-lg font-bold tracking-tight text-zinc-900 dark:text-white">Keyboard shortcuts</h3>
               <button
