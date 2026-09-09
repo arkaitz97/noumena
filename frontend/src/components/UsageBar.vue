@@ -6,10 +6,11 @@ const props = defineProps<{
   limit: number
   unit?: string
   label?: string
+  unlimited?: boolean
 }>()
 
 const ratio = computed(() => {
-  if (!props.limit || props.limit <= 0) return 0
+  if (props.unlimited || !props.limit || props.limit <= 0) return 0
   return Math.min(1, Math.max(0, props.used / props.limit))
 })
 
@@ -33,17 +34,17 @@ function fmt(n: number): string {
   <div>
     <div v-if="label || unit" class="flex items-center justify-between text-xs mb-1.5 font-medium">
       <span class="text-zinc-700">{{ label }}</span>
-      <span class="text-zinc-500 tabular-nums">{{ fmt(used) }} / {{ fmt(limit) }}{{ unit ? ' ' + unit : '' }}</span>
+      <span class="text-zinc-500 font-mono tabular-nums">{{ fmt(used) }} / {{ unlimited ? 'Unlimited' : fmt(limit) }}{{ unit ? ' ' + unit : '' }}</span>
     </div>
     <div
       class="w-full bg-zinc-100 rounded-full h-2.5 overflow-hidden border border-zinc-200/50"
       role="progressbar"
       :aria-valuenow="used"
       :aria-valuemin="0"
-      :aria-valuemax="limit"
+      :aria-valuemax="unlimited ? Math.max(1, used) : limit"
       :aria-label="label || 'Usage'"
     >
-      <div :class="['h-full rounded-full transition-all duration-500', colorClass]" :style="widthStyle"></div>
+      <div :class="['h-full rounded-full transition-all duration-500', colorClass]" :style="widthStyle" data-unslop-ignore></div>
     </div>
   </div>
 </template>

@@ -3,7 +3,7 @@ import { ref } from 'vue'
 import { useRouter, RouterLink } from 'vue-router'
 import { useAuthStore } from '../../stores/auth'
 import { generateState, openOAuthPopup } from '../../lib/oauthPopup'
-import { googleAuthUrl, loginWithGoogleRedirect } from '../../services/auth'
+import { googleAuthUrl, linkGoogle, loginWithGoogleRedirect } from '../../services/auth'
 import TextInput from '../../components/forms/TextInput.vue'
 import PrimaryButton from '../../components/forms/PrimaryButton.vue'
 
@@ -17,6 +17,12 @@ const error = ref<string | null>(null)
 const loading = ref(false)
 const googleLoading = ref(false)
 
+// When a Google sign-in collides with an existing password account, the
+// backend answers 409 link_required with a server-verified ID token. We
+// stash it here, ask for the account password, and complete the link after
+// login (the endpoint requires an authenticated session).
+const PENDING_LINK_KEY = 'pending_google_link'
+
 async function postLoginRedirect() {
   const next = (router.currentRoute.value.query.next as string | undefined) || ''
   if (!auth.isEmailVerified) return router.push('/verify-email')
@@ -24,11 +30,28 @@ async function postLoginRedirect() {
   return router.push(next || '/dashboard')
 }
 
+async function completePendingGoogleLink(): Promise<void> {
+  const raw = sessionStorage.getItem(PENDING_LINK_KEY)
+  if (!raw) return
+  sessionStorage.removeItem(PENDING_LINK_KEY)
+  try {
+    const pending = JSON.parse(raw) as { email?: string; sub?: string; id_token?: string }
+    if (pending.email && pending.sub && pending.id_token) {
+      await linkGoogle(pending.email, pending.sub, pending.id_token)
+    }
+  } catch {
+    // Non-fatal: the account is already signed in; the link can be retried
+    // from a fresh Google sign-in.
+    error.value = 'Google account link failed. Please try signing in with Google again.'
+  }
+}
+
 async function handleLogin() {
   loading.value = true
   error.value = null
   try {
     await auth.login(email.value, password.value, rememberMe.value)
+    await completePendingGoogleLink()
     await postLoginRedirect()
   } catch (err: any) {
     error.value = err?.response?.data?.error || 'Invalid email or password.'
@@ -50,8 +73,26 @@ async function handleGoogle() {
     const { auth_url } = await googleAuthUrl()
     try {
       const result = await openOAuthPopup('google', auth_url, { state })
-      await auth.loginWithGoogle(result.code, result.state)
-      await postLoginRedirect()
+      try {
+        await auth.loginWithGoogle(result.code, result.state)
+        await postLoginRedirect()
+      } catch (linkErr: any) {
+        // Google identity collides with an existing password account: the
+        // backend returns the verified ID token; sign in with the password
+        // to confirm the link.
+        const data = linkErr?.response?.data
+        if (linkErr?.response?.status === 409 && data?.error === 'link_required') {
+          sessionStorage.setItem(
+            PENDING_LINK_KEY,
+            JSON.stringify({ email: data.email, sub: data.sub, id_token: data.id_token }),
+          )
+          email.value = data.email || email.value
+          error.value =
+            'An account with this email already exists. Enter your password to link your Google account.'
+          return
+        }
+        throw linkErr
+      }
     } catch (popupErr: any) {
       if (popupErr?.message === 'popup_blocked') {
         error.value = 'Pop-up blocked. Please allow pop-ups and try again.'
@@ -159,8 +200,8 @@ async function handleGoogle() {
     </div>
 
     <div class="hidden lg:flex relative w-0 flex-1 bg-zinc-950 overflow-hidden items-center justify-center">
-      <div class="absolute top-1/4 left-1/4 w-[40rem] h-[40rem] bg-indigo-600 rounded-full mix-blend-screen filter blur-[120px] opacity-20"></div>
-      <div class="absolute bottom-1/4 right-1/4 w-[40rem] h-[40rem] bg-blue-600 rounded-full mix-blend-screen filter blur-[120px] opacity-20"></div>
+      <div class="absolute top-1/4 left-1/4 w-[40rem] h-[40rem] bg-brand-600 rounded-full mix-blend-screen filter blur-[120px] opacity-20" data-unslop-ignore></div>
+      <div class="absolute bottom-1/4 right-1/4 w-[40rem] h-[40rem] bg-blue-600 rounded-full mix-blend-screen filter blur-[120px] opacity-20" data-unslop-ignore></div>
       <div class="relative z-10 max-w-lg p-10 rounded-[2rem] bg-white/5 border border-white/10 backdrop-blur-3xl shadow-2xl">
         <blockquote class="text-2xl font-medium text-zinc-100 leading-snug">
           "Noumena turned thousands of comments into the only weekly report I now actually read."

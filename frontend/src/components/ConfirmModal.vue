@@ -31,6 +31,11 @@ const emit = defineEmits<{
 const dialogRef = ref<HTMLElement | null>(null)
 let previouslyFocused: HTMLElement | null = null
 
+let titleIdCounter = 0
+// Real id the dialog's aria-labelledby points at (previously bound the raw
+// title text, which is invalid).
+const titleId = `confirm-modal-title-${++titleIdCounter}`
+
 function focusable(): HTMLElement[] {
   if (!dialogRef.value) return []
   return Array.from(
@@ -104,95 +109,117 @@ onBeforeUnmount(() => {
 
 <template>
   <Teleport to="body">
-    <div
-      v-if="open"
-      class="fixed z-50 inset-0 overflow-y-auto"
-      role="dialog"
-      aria-modal="true"
-      :aria-labelledby="title"
-    >
-      <div class="flex items-end justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:block sm:p-0">
-        <div
-          class="fixed inset-0 bg-zinc-900/60 backdrop-blur-sm transition-opacity"
-          aria-hidden="true"
-          @click="closeModal"
-        ></div>
-        <span class="hidden sm:inline-block sm:align-middle sm:h-screen" aria-hidden="true">&#8203;</span>
-        <div
-          ref="dialogRef"
-          class="inline-block align-bottom bg-white rounded-2xl px-4 pt-5 pb-6 text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-lg sm:w-full sm:p-8"
-        >
-          <div class="sm:flex sm:items-start">
-            <div
-              :class="[
-                'mx-auto flex-shrink-0 flex items-center justify-center h-12 w-12 rounded-full sm:mx-0 sm:h-10 sm:w-10',
-                destructive ? 'bg-rose-100' : 'bg-zinc-100',
-              ]"
-            >
-              <svg
-                v-if="destructive"
-                class="h-6 w-6 text-rose-600"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-                aria-hidden="true"
-              >
-                <path
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  stroke-width="2"
-                  d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
-                />
-              </svg>
-              <svg
-                v-else
-                class="h-6 w-6 text-zinc-700"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-                aria-hidden="true"
-              >
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01" />
-              </svg>
-            </div>
-            <div class="mt-3 text-center sm:mt-0 sm:ml-4 sm:text-left w-full">
-              <h3 class="text-xl leading-6 font-semibold text-zinc-900 mb-2">{{ title }}</h3>
-              <div class="mt-2 text-sm text-zinc-500 leading-relaxed">
-                <p v-if="description">{{ description }}</p>
-                <slot name="step" />
-                <slot />
-              </div>
-            </div>
-          </div>
-          <div class="mt-8 sm:flex sm:flex-row-reverse gap-3">
-            <slot name="footer">
-              <button
-                v-if="!customFooter"
-                type="button"
-                @click="confirm"
-                :disabled="confirmDisabled"
+    <Transition name="modal">
+      <div
+        v-if="open"
+        class="fixed z-50 inset-0 overflow-y-auto"
+        role="dialog"
+        aria-modal="true"
+        :aria-labelledby="titleId"
+      >
+        <div class="flex items-end justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:block sm:p-0">
+          <div
+            class="fixed inset-0 bg-zinc-900/60 backdrop-blur-sm transition-opacity"
+            aria-hidden="true"
+            @click="closeModal"
+          ></div>
+          <span class="hidden sm:inline-block sm:align-middle sm:h-screen" aria-hidden="true">&#8203;</span>
+          <div
+            ref="dialogRef"
+            class="relative z-10 inline-block align-bottom bg-white dark:bg-zinc-900 rounded-xl px-4 pt-5 pb-6 text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-lg sm:w-full sm:p-8"
+          >
+            <div class="sm:flex sm:items-start">
+              <div
                 :class="[
-                  'w-full inline-flex justify-center rounded-xl border border-transparent shadow-sm px-5 py-2.5 text-sm font-medium text-white sm:w-auto disabled:opacity-50 disabled:cursor-not-allowed transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2',
-                  destructive
-                    ? 'bg-rose-600 hover:bg-rose-700 focus:ring-rose-500'
-                    : 'bg-zinc-900 hover:bg-zinc-800 focus:ring-zinc-900',
+                  'mx-auto flex-shrink-0 flex items-center justify-center h-12 w-12 rounded-full sm:mx-0 sm:h-10 sm:w-10',
+                  destructive ? 'bg-rose-100 dark:bg-rose-950/40' : 'bg-zinc-100 dark:bg-zinc-800',
                 ]"
               >
-                {{ confirmLabel }}
-              </button>
-              <button
-                v-if="!customFooter"
-                type="button"
-                data-modal-cancel="true"
-                @click="closeModal"
-                class="mt-3 sm:mt-0 w-full inline-flex justify-center rounded-xl border border-zinc-200 shadow-sm px-5 py-2.5 bg-white text-sm font-medium text-zinc-700 hover:bg-zinc-50 sm:w-auto transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900"
-              >
-                {{ cancelLabel }}
-              </button>
-            </slot>
+                <svg
+                  v-if="destructive"
+                  class="h-6 w-6 text-rose-600"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                  aria-hidden="true"
+                >
+                  <path
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    stroke-width="2"
+                    d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
+                  />
+                </svg>
+                <svg
+                  v-else
+                  class="h-6 w-6 text-zinc-700 dark:text-zinc-300"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                  aria-hidden="true"
+                >
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01" />
+                </svg>
+              </div>
+              <div class="mt-3 text-center sm:mt-0 sm:ml-4 sm:text-left w-full">
+                <h3 :id="titleId" class="text-xl leading-6 font-semibold text-zinc-900 dark:text-zinc-100 mb-2">{{ title }}</h3>
+                <div class="mt-2 text-sm text-zinc-500 dark:text-zinc-400 leading-relaxed">
+                  <p v-if="description">{{ description }}</p>
+                  <slot name="step" />
+                  <slot />
+                </div>
+              </div>
+            </div>
+            <div class="mt-8 sm:flex sm:flex-row-reverse gap-3">
+              <slot name="footer">
+                <button
+                  v-if="!customFooter"
+                  type="button"
+                  @click="confirm"
+                  :disabled="confirmDisabled"
+                  :class="[
+                    'w-full inline-flex justify-center rounded-xl border border-transparent shadow-sm px-5 py-2.5 text-sm font-medium text-white sm:w-auto disabled:opacity-50 disabled:cursor-not-allowed transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2',
+                    destructive
+                      ? 'bg-rose-600 hover:bg-rose-700 focus:ring-rose-500'
+                      : 'bg-zinc-900 hover:bg-zinc-800 focus:ring-zinc-900 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-200 dark:focus:ring-zinc-300',
+                  ]"
+                >
+                  {{ confirmLabel }}
+                </button>
+                <button
+                  v-if="!customFooter"
+                  type="button"
+                  data-modal-cancel="true"
+                  @click="closeModal"
+                  class="mt-3 sm:mt-0 w-full inline-flex justify-center rounded-xl border border-zinc-200 dark:border-zinc-700 shadow-sm px-5 py-2.5 bg-white dark:bg-zinc-800 text-sm font-medium text-zinc-700 dark:text-zinc-200 hover:bg-zinc-50 dark:hover:bg-zinc-700 sm:w-auto transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900"
+                >
+                  {{ cancelLabel }}
+                </button>
+              </slot>
+            </div>
           </div>
         </div>
       </div>
-    </div>
+    </Transition>
   </Teleport>
 </template>
+
+<style scoped>
+.modal-enter-active,
+.modal-leave-active {
+  transition: opacity 0.15s ease;
+}
+.modal-enter-active .inline-block,
+.modal-leave-active .inline-block {
+  transition: transform 0.15s ease, opacity 0.15s ease;
+}
+.modal-enter-from,
+.modal-leave-to {
+  opacity: 0;
+}
+.modal-enter-from .inline-block,
+.modal-leave-to .inline-block {
+  opacity: 0;
+  transform: translateY(8px) scale(0.98);
+}
+</style>

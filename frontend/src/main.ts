@@ -9,7 +9,6 @@ import { useAuthStore } from './stores/auth'
 async function start() {
   const app = createApp(App)
   app.use(createPinia())
-  app.use(router)
 
   // Wire the late-bound dependencies the Axios interceptors need.
   const auth = useAuthStore()
@@ -21,10 +20,12 @@ async function start() {
   })
   registerRouter(router)
 
-  // Recover the session before the very first navigation resolves so the
-  // first paint reflects the real auth state and we don't flash /login on
-  // hard reload.
+  // Recover the session before the router's initial navigation resolves so
+  // the first paint reflects the real auth state and we don't flash /login
+  // on hard reload.
   await auth.bootstrap()
+
+  app.use(router)
   await router.isReady()
 
   app.mount('#app')

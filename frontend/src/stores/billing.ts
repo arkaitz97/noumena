@@ -1,16 +1,19 @@
-// useBillingStore — Stripe Checkout + Customer Portal + status read.
+// useBillingStore — Stripe Checkout + Customer Portal + status/usage reads.
 
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import * as billingApi from '../services/billing'
 import { NoStripeCustomerError } from '../services/billing'
+import type { BillingStatusWithTrial, UsagePeriod } from '../services/billing'
 import { toast } from '../lib/toast'
-import type { BillingInterval, BillingStatus, Plan } from '../services/types'
+import type { BillingInterval, Plan } from '../services/types'
 
 export const useBillingStore = defineStore('billing', () => {
-  const status = ref<BillingStatus | null>(null)
+  const status = ref<BillingStatusWithTrial | null>(null)
   const loading = ref(false)
   const portalUnavailable = ref(false)
+  const usagePeriods = ref<UsagePeriod[]>([])
+  const usageLoading = ref(false)
 
   async function fetchStatus(): Promise<void> {
     loading.value = true
@@ -20,6 +23,18 @@ export const useBillingStore = defineStore('billing', () => {
       toast.error('Could not load your billing status.')
     } finally {
       loading.value = false
+    }
+  }
+
+  async function fetchUsage(periods = 6): Promise<void> {
+    usageLoading.value = true
+    try {
+      const res = await billingApi.getUsage(periods)
+      usagePeriods.value = res.periods
+    } catch {
+      toast.error('Could not load usage history.')
+    } finally {
+      usageLoading.value = false
     }
   }
 
@@ -66,6 +81,7 @@ export const useBillingStore = defineStore('billing', () => {
   // ---- computed helpers ----
   const channelsRemaining = computed(() => {
     if (!status.value) return null
+    if (status.value.channels_unlimited) return null
     return Math.max(0, status.value.channels_limit - status.value.channels_used)
   })
   const commentsRemaining = computed(() => {
@@ -77,7 +93,7 @@ export const useBillingStore = defineStore('billing', () => {
     return status.value.comments_used / status.value.comments_limit
   })
   const channelsUsedPct = computed(() => {
-    if (!status.value || status.value.channels_limit <= 0) return 0
+    if (!status.value || status.value.channels_unlimited || status.value.channels_limit <= 0) return 0
     return status.value.channels_used / status.value.channels_limit
   })
   const nearLimit = computed(() => commentsUsedPct.value >= 0.95 || channelsUsedPct.value >= 1)
@@ -86,7 +102,10 @@ export const useBillingStore = defineStore('billing', () => {
     status,
     loading,
     portalUnavailable,
+    usagePeriods,
+    usageLoading,
     fetchStatus,
+    fetchUsage,
     startCheckout,
     openPortal,
     channelsRemaining,

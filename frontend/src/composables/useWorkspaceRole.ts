@@ -1,26 +1,25 @@
-import { computed, ref } from 'vue'
-import apiClient from '../services/api'
+import { useWorkspaceRoleStore } from '../stores/workspaceRole'
 
-export type WorkspaceRole = 'admin' | 'analyst' | 'viewer'
+export type { WorkspaceRole } from '../stores/workspaceRole'
 
-const currentRole = ref<WorkspaceRole>('viewer')
-
+/**
+ * Fetch the caller's role in their active workspace into the pinia store.
+ * Call at bootstrap, after login, and after a workspace switch so role-gated
+ * UI mirrors the server decision.
+ */
 export async function fetchCurrentWorkspaceRole(): Promise<void> {
-  try {
-    const { data } = await apiClient.get<{ role: WorkspaceRole }>('/workspaces/active/role')
-    currentRole.value = data?.role ?? 'viewer'
-  } catch {
-    currentRole.value = 'viewer'
-  }
+  const store = useWorkspaceRoleStore()
+  await store.fetchRole()
 }
 
 export function useWorkspaceRole() {
-  const role = computed(() => currentRole.value)
-  const isAdmin = computed(() => role.value === 'admin')
-  const isAnalyst = computed(() => role.value === 'analyst')
-  const isViewer = computed(() => role.value === 'viewer')
-  const canManageMembers = computed(() => isAdmin.value)
-  const canExport = computed(() => isAdmin.value || isAnalyst.value)
-
-  return { role, isAdmin, isAnalyst, isViewer, canManageMembers, canExport }
+  const store = useWorkspaceRoleStore()
+  return {
+    role: store.role,
+    isAdmin: store.isAdmin,
+    isAnalyst: store.isAnalyst,
+    isViewer: store.isViewer,
+    canManageMembers: store.canManageMembers,
+    canExport: store.canExport,
+  }
 }

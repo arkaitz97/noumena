@@ -6,6 +6,7 @@
 import axios, { AxiosError } from 'axios'
 import type { AxiosInstance, AxiosRequestConfig, InternalAxiosRequestConfig } from 'axios'
 import type { Router } from 'vue-router'
+import { useRateLimitStore } from '../stores/rateLimit'
 
 // `VITE_API_BASE_URL` defaults to `/api`. The /auth surface is computed
 // relative to it so deployments where /api lives on a different origin
@@ -111,8 +112,26 @@ function isEmailNotVerified(err: AxiosError): boolean {
   return body?.code === 'email_not_verified'
 }
 
+// Retry-After may be seconds ("30") or an HTTP date. Fall back to 30s.
+function parseRetryAfter(v: unknown): number {
+  const raw = Array.isArray(v) ? v[0] : v
+  if (typeof raw !== 'string' || raw === '') return 30
+  const secs = Number(raw)
+  if (Number.isFinite(secs) && secs > 0) return secs
+  const t = Date.parse(raw)
+  if (Number.isFinite(t)) return Math.max(1, Math.round((t - Date.now()) / 1000))
+  return 30
+}
+
 function handleResponseError(err: AxiosError): Promise<never> {
   const config = err.config as RetriableConfig | undefined
+
+  // 429 — surface the rate-limit banner (Retry-After countdown). The
+  // request itself still rejects; callers handle it as a plain error.
+  if (err.response?.status === 429) {
+    useRateLimitStore().show(parseRetryAfter(err.response.headers['retry-after']))
+    return Promise.reject(err)
+  }
 
   // 403 email_not_verified → redirect, do not retry.
   if (config && isEmailNotVerified(err)) {
@@ -128,7 +147,8 @@ function handleResponseError(err: AxiosError): Promise<never> {
     config &&
     !config.__retried &&
     !config.__isRefreshCall &&
-    authBridge
+    authBridge &&
+    Boolean((config.headers as Record<string, unknown> | undefined)?.['Authorization'])
   ) {
     return getRefreshPromise()
       .then((newToken) => {
@@ -142,10 +162,15 @@ function handleResponseError(err: AxiosError): Promise<never> {
         return client.request(config) as unknown as Promise<never>
       })
       .catch((refreshErr) => {
-        // Refresh failed — clear store and bounce to /login.
+        // Refresh failed — clear store and bounce to /login, preserving the
+        // destination so the user lands back where they were after signing
+        // in again.
         authBridge?.reset()
         if (routerRef && routerRef.currentRoute.value.path !== '/login') {
-          void routerRef.push('/login')
+          void routerRef.push({
+            path: '/login',
+            query: { next: routerRef.currentRoute.value.fullPath },
+          })
         }
         return Promise.reject(refreshErr)
       })

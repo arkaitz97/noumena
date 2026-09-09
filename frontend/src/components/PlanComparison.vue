@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed } from 'vue'
 import { Check } from 'lucide-vue-next'
 import type { BillingInterval, Plan } from '../services/types'
+import SegmentedControl from './SegmentedControl.vue'
 
 export interface PlanOption {
   id: Plan | string
@@ -65,40 +65,21 @@ function onSelect(p: PlanOption): void {
   }
   emit('select-plan', p.id, props.interval, prepopened)
 }
-
-const intervalToggleClass = computed(() => 'inline-flex rounded-lg bg-zinc-100 p-0.5')
 </script>
 
 <template>
   <section class="space-y-4">
     <div class="flex items-center justify-between">
-      <h3 class="text-base font-semibold text-zinc-900 tracking-tight">Plans</h3>
-      <div :class="intervalToggleClass" role="tablist" aria-label="Billing interval">
-        <button
-          type="button"
-          role="tab"
-          :aria-selected="interval === 'monthly'"
-          @click="emit('update:interval', 'monthly')"
-          :class="[
-            'px-3 py-1 text-xs font-medium rounded-md transition-colors',
-            interval === 'monthly' ? 'bg-white text-zinc-900 shadow-sm' : 'text-zinc-500 hover:text-zinc-900',
-          ]"
-        >
-          Monthly
-        </button>
-        <button
-          type="button"
-          role="tab"
-          :aria-selected="interval === 'annual'"
-          @click="emit('update:interval', 'annual')"
-          :class="[
-            'px-3 py-1 text-xs font-medium rounded-md transition-colors',
-            interval === 'annual' ? 'bg-white text-zinc-900 shadow-sm' : 'text-zinc-500 hover:text-zinc-900',
-          ]"
-        >
-          Annual
-        </button>
-      </div>
+      <h3 class="text-base font-semibold text-zinc-900 dark:text-zinc-100 tracking-tight">Plans</h3>
+      <SegmentedControl
+        :model-value="interval"
+        :options="[
+          { value: 'monthly', label: 'Monthly' },
+          { value: 'annual', label: 'Annual' },
+        ]"
+        label="Billing interval"
+        @update:model-value="(i) => emit('update:interval', i as BillingInterval)"
+      />
     </div>
 
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -106,23 +87,23 @@ const intervalToggleClass = computed(() => 'inline-flex rounded-lg bg-zinc-100 p
         v-for="p in plans"
         :key="p.id"
         :class="[
-          'bg-white shadow-sm ring-1 rounded-2xl p-5 flex flex-col gap-3',
-          isCurrent(p) ? 'ring-zinc-900' : 'ring-zinc-950/5',
+          'bg-white dark:bg-zinc-900 shadow-sm ring-1 rounded-xl p-5 flex flex-col gap-3',
+          isCurrent(p) ? 'ring-zinc-900 dark:ring-zinc-100' : 'ring-zinc-950/5 dark:ring-zinc-100/10',
           p.highlight ? 'relative' : '',
         ]"
       >
         <div>
-          <p class="text-sm font-semibold text-zinc-900 tracking-tight">{{ p.name }}</p>
-          <p class="text-2xl font-semibold tracking-tight text-zinc-900 mt-1">
-            {{ priceDisplay(p) }}<span class="text-sm font-medium text-zinc-500">/mo</span>
+          <p class="text-sm font-semibold text-zinc-900 dark:text-zinc-100 tracking-tight">{{ p.name }}</p>
+          <p class="text-2xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-100 mt-1">
+            {{ priceDisplay(p) }}<span class="text-sm font-medium text-zinc-500 dark:text-zinc-400">/mo</span>
           </p>
-          <p v-if="interval === 'annual' && annualSavingsPct(p)" class="text-[11px] text-emerald-600 font-medium mt-0.5">
+          <p v-if="interval === 'annual' && annualSavingsPct(p)" class="text-[11px] text-emerald-600 dark:text-emerald-400 font-medium mt-0.5">
             Save {{ annualSavingsPct(p) }}%
           </p>
         </div>
-        <ul class="space-y-1.5 text-xs text-zinc-700 flex-1">
+        <ul class="space-y-1.5 text-xs text-zinc-700 dark:text-zinc-300 flex-1">
           <li v-for="(f, i) in p.features" :key="i" class="flex items-start gap-1.5">
-            <Check class="w-3.5 h-3.5 mt-0.5 text-emerald-600 shrink-0" />
+            <Check class="w-3.5 h-3.5 mt-0.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
             <span>{{ f }}</span>
           </li>
         </ul>
@@ -133,8 +114,8 @@ const intervalToggleClass = computed(() => 'inline-flex rounded-lg bg-zinc-100 p
           :class="[
             'inline-flex justify-center items-center py-2 px-3 rounded-xl text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900',
             isCurrent(p)
-              ? 'bg-zinc-100 text-zinc-500 cursor-not-allowed'
-              : 'bg-zinc-900 text-white hover:bg-zinc-800',
+              ? 'bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400 cursor-not-allowed'
+              : 'bg-zinc-900 text-white hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-200',
           ]"
         >
           {{ ctaLabel(p) }}

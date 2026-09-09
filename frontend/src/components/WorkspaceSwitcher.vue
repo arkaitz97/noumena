@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { ChevronDown, Building2 } from 'lucide-vue-next'
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import apiClient from '../services/api'
 import { toast } from '../lib/toast'
+import { fetchCurrentWorkspaceRole } from '../composables/useWorkspaceRole'
 
 export interface Workspace {
   id: string
@@ -32,6 +33,7 @@ async function activateWorkspace(id: string): Promise<boolean> {
   try {
     await apiClient.put(`/workspaces/${encodeURIComponent(id)}/activate`)
     await fetchWorkspaces()
+    await fetchCurrentWorkspaceRole()
     return true
   } catch {
     return false
@@ -39,6 +41,7 @@ async function activateWorkspace(id: string): Promise<boolean> {
 }
 
 const open = ref(false)
+const triggerRef = ref<HTMLButtonElement | null>(null)
 const menuRef = ref<HTMLElement | null>(null)
 
 onMounted(() => {
@@ -61,42 +64,93 @@ function onWorkspaceClick(w: Workspace) {
   })
 }
 
+function menuItems(): HTMLElement[] {
+  if (!menuRef.value) return []
+  return Array.from(menuRef.value.querySelectorAll<HTMLElement>('[role="menuitem"]:not([aria-disabled="true"])'))
+}
+
+function focusItemAt(index: number): void {
+  const items = menuItems()
+  if (items.length === 0) return
+  items[(index + items.length) % items.length].focus()
+}
+
+function onMenuKeydown(e: KeyboardEvent): void {
+  if (!open.value) return
+  const items = menuItems()
+  if (items.length === 0) return
+  const idx = items.indexOf(document.activeElement as HTMLElement)
+  if (e.key === 'ArrowDown') {
+    e.preventDefault()
+    focusItemAt(idx + 1)
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault()
+    focusItemAt(idx - 1)
+  } else if (e.key === 'Home') {
+    e.preventDefault()
+    focusItemAt(0)
+  } else if (e.key === 'End') {
+    e.preventDefault()
+    focusItemAt(items.length - 1)
+  } else if (e.key === 'Escape') {
+    e.preventDefault()
+    open.value = false
+    triggerRef.value?.focus()
+  }
+}
+
+watch(open, async (v) => {
+  if (v) {
+    await nextTick()
+    focusItemAt(0)
+  }
+})
+
 const label = computed(() => currentWorkspace.value?.name ?? 'Workspace')
 </script>
 
 <template>
-  <div ref="menuRef" class="relative" @click.outside="open = false">
+  <div class="relative" @click.outside="open = false">
     <button
+      ref="triggerRef"
       @click="toggle"
-      class="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-zinc-200 hover:border-zinc-300 hover:bg-zinc-50 transition-colors text-sm"
+      class="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:border-zinc-300 dark:hover:border-zinc-600 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors text-sm"
       :aria-expanded="open"
+      aria-haspopup="menu"
       :aria-label="'Switch workspace, current: ' + label"
     >
-      <Building2 class="w-4 h-4 text-zinc-500" />
-      <span class="max-w-[10rem] truncate font-medium text-zinc-700">{{ label }}</span>
-      <ChevronDown class="w-3.5 h-3.5 text-zinc-400" />
+      <Building2 class="w-4 h-4 text-zinc-500 dark:text-zinc-400" />
+      <span class="max-w-[10rem] truncate font-medium text-zinc-700 dark:text-zinc-300">{{ label }}</span>
+      <ChevronDown class="w-3.5 h-3.5 text-zinc-400 dark:text-zinc-500" />
     </button>
 
     <transition name="ws">
       <div
         v-if="open"
-        class="absolute left-0 mt-2 w-64 bg-white shadow-lg ring-1 ring-zinc-950/5 rounded-xl py-1 z-50"
+        ref="menuRef"
+        role="menu"
+        aria-label="Switch workspace"
+        class="absolute left-0 mt-2 w-64 bg-white dark:bg-zinc-900 shadow-lg ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl py-1 z-50"
+        @keydown="onMenuKeydown"
       >
-        <div
+        <button
           v-for="w in workspaces"
           :key="w.id"
+          type="button"
+          role="menuitem"
+          :aria-disabled="w.is_active ? 'true' : undefined"
           @click="onWorkspaceClick(w)"
-          class="flex items-center gap-2 px-3 py-2 text-sm cursor-pointer transition-colors"
-          :class="w.is_active ? 'bg-zinc-50 text-zinc-900 font-medium' : 'text-zinc-700 hover:bg-zinc-50'"
+          class="w-full flex items-center gap-2 px-3 py-2 text-sm text-left transition-colors"
+          :class="w.is_active ? 'bg-zinc-50 dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 font-medium' : 'text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800'"
         >
           <span class="flex-1 truncate">{{ w.name }}</span>
-          <span class="text-[10px] uppercase tracking-wider text-zinc-400">{{ w.role }}</span>
-          <svg v-if="w.is_active" class="w-4 h-4 text-zinc-900" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <span class="text-[10px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400">{{ w.role }}</span>
+          <svg v-if="w.is_active" class="w-4 h-4 text-zinc-900 dark:text-zinc-100" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
           </svg>
-        </div>
-        <div v-if="loading" class="px-3 py-2 text-xs text-zinc-400">Loading…</div>
-        <div v-if="workspaces.length === 0 && !loading" class="px-3 py-2 text-xs text-zinc-400">No workspaces</div>
+        </button>
+        <div v-if="loading" class="px-3 py-2 text-xs text-zinc-500 dark:text-zinc-400">Loading…</div>
+        <div v-if="workspaces.length === 0 && !loading" class="px-3 py-2 text-xs text-zinc-500 dark:text-zinc-400">No workspaces</div>
       </div>
     </transition>
   </div>

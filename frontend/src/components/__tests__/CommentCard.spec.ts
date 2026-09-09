@@ -62,4 +62,28 @@ describe('CommentCard', () => {
     })
     expect(wrapper.text()).toContain('1 insight')
   })
+
+  it('links the channel name and video title to youtube', () => {
+    const wrapper = mount(CommentCard, {
+      props: {
+        comment: makeComment({
+          platform_channel_id: 'UC123',
+          video_id: 'v456',
+          video_title: 'My video',
+        }),
+        isStarred: false,
+      },
+    })
+    const channel = wrapper.get('a[href="https://www.youtube.com/channel/UC123"]')
+    expect(channel.text()).toContain('Test channel')
+    const video = wrapper.get('a[href="https://www.youtube.com/watch?v=v456"]')
+    expect(video.text()).toContain('My video')
+  })
+
+  it('omits the video link when video context is missing', () => {
+    const wrapper = mount(CommentCard, {
+      props: { comment: makeComment({ video_id: null, video_title: null }), isStarred: false },
+    })
+    expect(wrapper.find('a[href^="https://www.youtube.com/watch"]').exists()).toBe(false)
+  })
 })

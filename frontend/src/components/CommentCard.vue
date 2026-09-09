@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { Star } from 'lucide-vue-next'
+import { Star, Play } from 'lucide-vue-next'
 import type { Comment, Insight } from '../services/types'
 import { categoryColor, categoryLabel } from '../lib/categories'
+import { insightTypeColor, insightTypeLabel } from '../lib/insightTypes'
 import { relative } from '../lib/relativeTime'
 
 const props = defineProps<{
@@ -17,6 +18,8 @@ const TRUNCATE = 280
 const expanded = ref(false)
 const insightsExpanded = ref(false)
 
+const insightListId = computed(() => `comment-insights-${props.comment.id.replace(/[^a-zA-Z0-9_-]/g, '')}`)
+
 const isStarred = computed(() => props.isStarred ?? props.comment.is_starred)
 const body = computed(() => props.comment.body || '')
 const truncated = computed(() => body.value.length > TRUNCATE)
@@ -27,30 +30,18 @@ const visibleBody = computed(() =>
 const insights = computed<Insight[]>(() => props.comment.actionable_insights ?? [])
 const hasInsights = computed(() => insights.value.length > 0)
 
-const INSIGHT_TYPE_COLORS: Record<string, string> = {
-  video_idea: 'bg-blue-50 text-blue-700 ring-blue-600/20',
-  editing_tip: 'bg-amber-50 text-amber-700 ring-amber-600/20',
-  feature_request: 'bg-purple-50 text-purple-700 ring-purple-600/20',
-  collaboration_ask: 'bg-green-50 text-green-700 ring-green-600/20',
-  improvement_suggestion: 'bg-orange-50 text-orange-700 ring-orange-600/20',
-  content_format_request: 'bg-pink-50 text-pink-700 ring-pink-600/20',
-  other: 'bg-zinc-50 text-zinc-700 ring-zinc-600/20',
-}
-
-const INSIGHT_TYPE_LABELS: Record<string, string> = {
-  video_idea: 'Video Idea',
-  editing_tip: 'Editing Tip',
-  feature_request: 'Feature Request',
-  collaboration_ask: 'Collaboration Ask',
-  improvement_suggestion: 'Improvement',
-  content_format_request: 'Format Request',
-  other: 'Other',
-}
-
 const author = computed(() =>
   props.comment.author_handle || props.comment.author_display_name || 'anonymous',
 )
 const channelLabel = computed(() => props.comment.channel_display_name || 'Channel')
+const channelUrl = computed(() =>
+  props.comment.platform_channel_id
+    ? `https://www.youtube.com/channel/${props.comment.platform_channel_id}`
+    : null,
+)
+const videoUrl = computed(() =>
+  props.comment.video_id ? `https://www.youtube.com/watch?v=${props.comment.video_id}` : null,
+)
 const postedAt = computed(() => relative(props.comment.posted_at))
 const isProcessing = computed(() => props.comment.processed_at === null)
 
@@ -61,22 +52,31 @@ function onToggleStar(): void {
 
 <template>
   <article
-    class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-2xl p-5 hover:shadow-md transition-shadow duration-200 relative overflow-hidden"
-    :class="isFocused ? 'ring-2 ring-indigo-500 dark:ring-indigo-400 shadow-md' : ''"
+    class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl p-5 hover:shadow-md transition-shadow duration-200 relative overflow-hidden"
+    :class="isFocused ? 'ring-2 ring-brand-500 dark:ring-brand-400 shadow-md' : ''"
   >
-    <div class="absolute left-0 top-0 bottom-0 w-1 bg-indigo-400" aria-hidden="true"></div>
+    <div class="absolute left-0 top-0 bottom-0 w-1 bg-brand-400" aria-hidden="true"></div>
 
     <div class="pl-3">
       <div class="flex items-start justify-between gap-2">
         <div class="flex flex-wrap items-center gap-2 min-w-0">
           <p class="text-sm font-semibold text-zinc-900 dark:text-zinc-100 truncate">{{ author }}</p>
           <span class="text-zinc-300 dark:text-zinc-600">•</span>
-          <span class="text-xs font-medium text-zinc-500 dark:text-zinc-400 truncate">{{ channelLabel }}</span>
+          <a
+            v-if="channelUrl"
+            :href="channelUrl"
+            target="_blank"
+            rel="noopener"
+            class="text-xs font-medium text-zinc-500 dark:text-zinc-400 truncate underline-offset-2 hover:underline hover:text-zinc-900 dark:hover:text-zinc-100"
+          >
+            {{ channelLabel }}
+          </a>
+          <span v-else class="text-xs font-medium text-zinc-500 dark:text-zinc-400 truncate">{{ channelLabel }}</span>
           <span v-if="postedAt" class="text-zinc-300 dark:text-zinc-600">•</span>
           <p v-if="postedAt" class="text-xs text-zinc-500 dark:text-zinc-400">{{ postedAt }}</p>
           <span
             v-if="isProcessing"
-            class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-50 text-amber-700 ring-1 ring-inset ring-amber-600/20"
+            class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-50 text-amber-700 ring-1 ring-inset ring-amber-600/20" data-unslop-ignore
           >
             Processing…
           </span>
@@ -86,12 +86,23 @@ function onToggleStar(): void {
           :aria-pressed="isStarred"
           :aria-label="isStarred ? 'Unstar comment' : 'Star comment'"
           @click="onToggleStar"
-          class="p-1.5 rounded-lg transition-colors focus:outline-none focus:ring-2 focus:ring-zinc-900 dark:focus:ring-zinc-100"
-          :class="isStarred ? 'text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-950/30' : 'text-zinc-400 hover:text-amber-400 hover:bg-zinc-50 dark:hover:bg-zinc-800'"
+          class="flex items-center justify-center h-11 w-11 rounded-lg transition-colors focus:outline-none focus:ring-2 focus:ring-zinc-900 dark:focus:ring-zinc-100"
+          :class="isStarred ? 'text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-950/30' : 'text-zinc-400 hover:text-amber-400 hover:bg-zinc-50 dark:hover:bg-zinc-800'" data-unslop-ignore
         >
           <Star class="h-5 w-5" :fill="isStarred ? 'currentColor' : 'none'" />
         </button>
       </div>
+
+      <a
+        v-if="videoUrl && comment.video_title"
+        :href="videoUrl"
+        target="_blank"
+        rel="noopener"
+        class="mt-1 inline-flex items-center gap-1 max-w-full text-xs text-zinc-500 dark:text-zinc-400 truncate underline-offset-2 hover:underline hover:text-zinc-900 dark:hover:text-zinc-100"
+      >
+        <Play class="w-3 h-3 shrink-0" aria-hidden="true" />
+        <span class="truncate">{{ comment.video_title }}</span>
+      </a>
 
       <p class="text-[15px] text-zinc-800 dark:text-zinc-200 leading-relaxed mt-2 mb-3 break-words whitespace-pre-wrap">
         {{ visibleBody }}
@@ -117,20 +128,27 @@ function onToggleStar(): void {
         </span>
         <span
           v-if="comment.topic"
-          class="inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium bg-zinc-50 text-zinc-700 ring-1 ring-inset ring-zinc-500/10"
+          class="inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium bg-zinc-50 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 ring-1 ring-inset ring-zinc-500/10 dark:ring-zinc-400/10"
         >
           {{ comment.topic }}
         </span>
-        <span
+        <button
           v-if="hasInsights"
-          class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium bg-indigo-50 text-indigo-700 ring-1 ring-inset ring-indigo-600/20 cursor-pointer hover:bg-indigo-100 transition-colors"
+          type="button"
+          class="-m-2 p-2 focus:outline-none focus:ring-2 focus:ring-brand-500 rounded-lg"
+          :aria-expanded="insightsExpanded"
+          :aria-controls="insightListId"
           @click="insightsExpanded = !insightsExpanded"
         >
-          {{ insights.length }} insight{{ insights.length > 1 ? 's' : '' }}
-        </span>
+          <span
+            class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium bg-brand-50 dark:bg-brand-950/40 text-brand-700 dark:text-brand-300 ring-1 ring-inset ring-brand-600/20 dark:ring-brand-500/30 hover:bg-brand-100 dark:hover:bg-brand-900/50 transition-colors"
+          >
+            {{ insights.length }} insight{{ insights.length > 1 ? 's' : '' }}
+          </span>
+        </button>
       </div>
 
-      <div v-if="hasInsights && insightsExpanded" class="mt-3 space-y-2 border-t border-zinc-100 dark:border-zinc-800 pt-3">
+      <div v-if="hasInsights && insightsExpanded" :id="insightListId" class="mt-3 space-y-2 border-t border-zinc-100 dark:border-zinc-800 pt-3">
         <div
           v-for="(insight, i) in insights"
           :key="i"
@@ -140,14 +158,14 @@ function onToggleStar(): void {
             <span
               :class="[
                 'inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium ring-1 ring-inset',
-                INSIGHT_TYPE_COLORS[insight.type] ?? INSIGHT_TYPE_COLORS.other,
+                insightTypeColor(insight.type),
               ]"
             >
-              {{ INSIGHT_TYPE_LABELS[insight.type] ?? insight.type }}
+              {{ insightTypeLabel(insight.type) }}
             </span>
-            <span class="text-[10px] text-zinc-400 tabular-nums">{{ Math.round(insight.confidence * 100) }}%</span>
+            <span class="text-[10px] text-zinc-500 dark:text-zinc-400 font-mono tabular-nums">{{ Math.round(insight.confidence * 100) }}%</span>
           </div>
-          <p class="text-xs text-zinc-700">{{ insight.description }}</p>
+          <p class="text-xs text-zinc-700 dark:text-zinc-300">{{ insight.description }}</p>
         </div>
       </div>
     </div>

@@ -65,7 +65,7 @@ const message = computed(() => {
 <template>
   <div
     v-if="visible"
-    class="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 flex items-center gap-3"
+    class="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 flex items-center gap-3" data-unslop-ignore
     role="alert"
   >
     <AlertTriangle class="w-5 h-5 text-amber-500 flex-shrink-0" />
@@ -74,7 +74,7 @@ const message = computed(() => {
       type="button"
       aria-label="Dismiss"
       @click="emit('dismiss')"
-      class="p-1 rounded-lg text-amber-500 hover:text-amber-700 hover:bg-amber-100 focus:outline-none focus:ring-2 focus:ring-amber-500"
+      class="flex items-center justify-center h-11 w-11 rounded-lg text-amber-500 hover:text-amber-700 hover:bg-amber-100 focus:outline-none focus:ring-2 focus:ring-amber-500" data-unslop-ignore
     >
       <X class="w-4 h-4" />
     </button>

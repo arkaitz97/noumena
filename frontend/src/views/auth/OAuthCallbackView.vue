@@ -63,8 +63,8 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="min-h-screen bg-zinc-50 flex items-center justify-center px-4">
-    <div class="bg-white shadow-sm ring-1 ring-zinc-950/5 rounded-2xl p-8 max-w-md w-full text-center">
+  <div class="min-h-screen bg-zinc-50 dark:bg-zinc-950 flex items-center justify-center px-4">
+    <div class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl p-8 max-w-md w-full text-center">
       <template v-if="error">
         <div class="mx-auto h-12 w-12 rounded-full bg-rose-50 flex items-center justify-center text-rose-600 mb-4 ring-1 ring-rose-600/20">
           <svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">

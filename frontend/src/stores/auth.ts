@@ -10,6 +10,7 @@ import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import * as authApi from '../services/auth'
 import * as channelsApi from '../services/channels'
+import { fetchCurrentWorkspaceRole } from '../composables/useWorkspaceRole'
 import type { User } from '../services/types'
 
 export const useAuthStore = defineStore('auth', () => {
@@ -68,6 +69,7 @@ export const useAuthStore = defineStore('auth', () => {
     accessToken.value = res.access_token
     await fetchUser()
     await refreshChannelsCount()
+    await fetchCurrentWorkspaceRole()
   }
 
   async function register(email: string, password: string): Promise<void> {
@@ -77,22 +79,20 @@ export const useAuthStore = defineStore('auth', () => {
     // fine, the verify-email view doesn't depend on it. We still try.
     await fetchUser()
     await refreshChannelsCount()
+    await fetchCurrentWorkspaceRole()
   }
 
   async function logout(): Promise<void> {
-    try {
-      await authApi.logout()
-    } finally {
-      reset()
-    }
+    // Server-confirmed logout: only clear local state after the backend
+    // revokes the refresh cookie. On failure the session is still valid —
+    // surface the error and keep the user logged in (no fake logout).
+    await authApi.logout()
+    reset()
   }
 
   async function logoutAll(): Promise<void> {
-    try {
-      await authApi.logoutAll()
-    } finally {
-      reset()
-    }
+    await authApi.logoutAll()
+    reset()
   }
 
   /**
@@ -125,11 +125,25 @@ export const useAuthStore = defineStore('auth', () => {
     await authApi.resetPassword(token, password)
   }
 
+  /**
+   * Change the current session's password. The backend reissues cookies and
+   * returns a fresh access token in the body — store it the same way login
+   * does so the axios interceptor keeps sending a valid token. Other
+   * sessions die silently.
+   */
+  async function changePassword(currentPassword: string, newPassword: string): Promise<void> {
+    const res = await authApi.changePassword(currentPassword, newPassword)
+    if (res.access_token) {
+      accessToken.value = res.access_token
+    }
+  }
+
   async function loginWithGoogle(code: string, state: string): Promise<void> {
     const res = await authApi.googleExchange(code, state)
     accessToken.value = res.access_token
     await fetchUser()
     await refreshChannelsCount()
+    await fetchCurrentWorkspaceRole()
   }
 
   /**
@@ -138,16 +152,32 @@ export const useAuthStore = defineStore('auth', () => {
    * — public routes must still render when unauthenticated.
    */
   async function bootstrap(): Promise<void> {
-    try {
-      await refreshAccessToken()
-      await fetchUser()
-      await refreshChannelsCount()
-    } catch {
-      // No valid session — leave the store in its logged-out state.
-      reset()
-    } finally {
-      isBootstrapped.value = true
+    const maxRetries = 3
+    const baseDelayMs = 1000
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        await refreshAccessToken()
+        await fetchUser()
+        await refreshChannelsCount()
+        await fetchCurrentWorkspaceRole()
+        isBootstrapped.value = true
+        return
+      } catch (err) {
+        // A 401 from the silent refresh means there is no session (no
+        // refresh cookie) — retrying cannot help. Fail fast so public pages
+        // paint immediately instead of stalling on backoff.
+        if ((err as { response?: { status?: number } } | undefined)?.response?.status === 401) {
+          reset()
+          isBootstrapped.value = true
+          return
+        }
+        if (attempt < maxRetries - 1) {
+          await new Promise((r) => setTimeout(r, baseDelayMs * Math.pow(2, attempt)))
+        }
+      }
     }
+    reset()
+    isBootstrapped.value = true
   }
 
   return {
@@ -172,6 +202,7 @@ export const useAuthStore = defineStore('auth', () => {
     resendVerification,
     forgotPassword,
     resetPassword,
+    changePassword,
     fetchUser,
     refreshChannelsCount,
     loginWithGoogle,

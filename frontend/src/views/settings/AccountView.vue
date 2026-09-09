@@ -7,13 +7,19 @@
 
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
+import { AxiosError } from 'axios'
 import { Download, Mail, ShieldCheck, ShieldAlert } from 'lucide-vue-next'
 import { useAuthStore } from '../../stores/auth'
 import { useAccountStore } from '../../stores/account'
 import { forgotPassword } from '../../services/auth'
+import { recentExports } from '../../services/comments'
+import { validatePassword } from '../../lib/validation'
+import type { ApiErrorBody, ExportJob } from '../../services/types'
 import { toast } from '../../lib/toast'
+import { shortDate } from '../../lib/relativeTime'
 import ConfirmModal from '../../components/ConfirmModal.vue'
 import TextInput from '../../components/forms/TextInput.vue'
+import PasswordInput from '../../components/forms/PasswordInput.vue'
 import PrimaryButton from '../../components/forms/PrimaryButton.vue'
 
 const auth = useAuthStore()
@@ -45,6 +51,28 @@ async function submitEmailChange(): Promise<void> {
   newEmail.value = ''
 }
 
+const pendingEmail = computed(() => account.profile?.pending_email ?? null)
+
+const verificationBadgeClass = computed(() =>
+  account.isVerified
+    ? 'bg-emerald-50 text-emerald-700 ring-emerald-600/20'
+    : 'bg-amber-50 text-amber-700 ring-amber-600/20', // unslop-ignore: semantic pending state
+)
+
+const resendingChange = ref(false)
+
+async function resendEmailChange(): Promise<void> {
+  resendingChange.value = true
+  try {
+    await auth.resendVerification()
+    toast.success('Verification email sent to your new address.')
+  } catch {
+    toast.error('Could not resend. Please try again later.')
+  } finally {
+    resendingChange.value = false
+  }
+}
+
 // ---- digest opt-in -------------------------------------------------------
 async function onDigestToggle(e: Event): Promise<void> {
   const next = (e.target as HTMLInputElement).checked
@@ -63,6 +91,68 @@ async function sendPasswordReset(): Promise<void> {
     toast.error('Could not send the reset link. Please try again.')
   } finally {
     sendingReset.value = false
+  }
+}
+
+// ---- password change ------------------------------------------------------
+const currentPassword = ref('')
+const newPassword = ref('')
+const confirmPassword = ref('')
+const changingPassword = ref(false)
+const passwordError = ref<string | null>(null)
+
+// Same policy + rule labels as the reset form (lib/validation) — shown
+// inline via the strength meter before any submit.
+const newPasswordValidation = computed(() => validatePassword(newPassword.value))
+const passwordsMatch = computed(
+  () => confirmPassword.value.length > 0 && confirmPassword.value === newPassword.value,
+)
+const canSubmitPassword = computed(
+  () =>
+    currentPassword.value.length > 0 &&
+    newPasswordValidation.value.valid &&
+    passwordsMatch.value,
+)
+
+async function submitPasswordChange(): Promise<void> {
+  passwordError.value = null
+  if (!currentPassword.value) {
+    passwordError.value = 'Enter your current password.'
+    return
+  }
+  if (!newPasswordValidation.value.valid) {
+    passwordError.value =
+      newPasswordValidation.value.firstError || 'Password does not meet requirements.'
+    return
+  }
+  if (!passwordsMatch.value) {
+    passwordError.value = 'Passwords do not match.'
+    return
+  }
+  changingPassword.value = true
+  try {
+    await auth.changePassword(currentPassword.value, newPassword.value)
+    currentPassword.value = ''
+    newPassword.value = ''
+    confirmPassword.value = ''
+    toast.success('Password updated.')
+  } catch (err) {
+    if (err instanceof AxiosError && err.response) {
+      const status = err.response.status
+      const body = err.response.data as ApiErrorBody | undefined
+      if (status === 401) {
+        passwordError.value = 'Current password is incorrect.'
+      } else if (status === 400) {
+        passwordError.value =
+          body?.error ?? body?.message ?? 'New password does not meet the requirements.'
+      } else {
+        passwordError.value = 'Could not update your password. Please try again.'
+      }
+    } else {
+      passwordError.value = 'Could not update your password. Please try again.'
+    }
+  } finally {
+    changingPassword.value = false
   }
 }
 
@@ -164,40 +254,63 @@ async function submitDelete(): Promise<void> {
 // ---- mount ---------------------------------------------------------------
 onMounted(() => {
   void account.fetchProfile()
+  void loadRecentExports()
 })
 
 onBeforeUnmount(() => {
   clearPoll()
 })
+
+// ---- recent comment exports (fix-frontend-plumbing) ----------------------
+const recent = ref<ExportJob[]>([])
+const recentLoading = ref(false)
+
+async function loadRecentExports(): Promise<void> {
+  recentLoading.value = true
+  try {
+    recent.value = await recentExports()
+  } catch {
+    recent.value = []
+  } finally {
+    recentLoading.value = false
+  }
+}
+
+function recentDownloadUrl(j: ExportJob): string | null {
+  return j.download_url ?? j.export_url ?? null
+}
+
+function downloadRecent(j: ExportJob): void {
+  const url = recentDownloadUrl(j)
+  if (url) window.location.assign(url)
+}
 </script>
 
 <template>
   <div class="max-w-5xl mx-auto py-8 px-4 sm:px-6 lg:px-8 space-y-8">
     <div>
-      <h3 class="text-2xl font-semibold leading-7 text-zinc-900 tracking-tight">Account</h3>
-      <p class="mt-2 text-sm text-zinc-500">Manage your profile, preferences, and account lifecycle.</p>
+      <h1 class="text-2xl font-semibold leading-7 text-zinc-900 dark:text-zinc-100 tracking-tight">Account</h1>
+      <p class="mt-2 text-sm text-zinc-500 dark:text-zinc-400 dark:text-zinc-400">Manage your profile, preferences, and account lifecycle.</p>
     </div>
 
     <!-- Profile / email -->
-    <section class="bg-white shadow-sm ring-1 ring-zinc-950/5 rounded-2xl p-6 sm:p-8">
+    <section class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl p-6 sm:p-8">
       <div class="md:grid md:grid-cols-3 md:gap-8">
         <div class="md:col-span-1">
-          <h4 class="text-base font-semibold text-zinc-900">Profile</h4>
-          <p class="mt-1 text-sm text-zinc-500 pr-4">Your sign-in email and verification status.</p>
+          <h2 class="text-base font-semibold text-zinc-900 dark:text-zinc-100">Profile</h2>
+          <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400 pr-4">Your sign-in email and verification status.</p>
         </div>
         <div class="mt-5 md:mt-0 md:col-span-2 space-y-6">
           <div>
-            <p class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Current email</p>
+            <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Current email</p>
             <div class="mt-1 flex items-center gap-2">
-              <Mail class="w-4 h-4 text-zinc-400" />
-              <p class="text-sm font-semibold text-zinc-900">{{ auth.user?.email ?? '—' }}</p>
+              <Mail class="w-4 h-4 text-zinc-400 dark:text-zinc-500" />
+              <p class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{{ auth.user?.email ?? '—' }}</p>
               <span
                 v-if="account.profile"
                 :class="[
                   'inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold uppercase tracking-wider ring-1 ring-inset',
-                  account.isVerified
-                    ? 'bg-emerald-50 text-emerald-700 ring-emerald-600/20'
-                    : 'bg-amber-50 text-amber-700 ring-amber-600/20',
+                  verificationBadgeClass,
                 ]"
               >
                 <ShieldCheck v-if="account.isVerified" class="w-3 h-3" />
@@ -205,6 +318,24 @@ onBeforeUnmount(() => {
                 {{ account.isVerified ? 'Verified' : 'Unverified' }}
               </span>
             </div>
+          </div>
+
+          <div v-if="pendingEmail" class="rounded-xl bg-amber-50 ring-1 ring-amber-600/20 p-4"> <!-- unslop-ignore -->
+            <p class="text-sm font-medium text-amber-800">
+              Verification pending for
+              <span class="font-semibold">{{ pendingEmail }}</span>
+            </p>
+            <p class="text-xs text-amber-700 mt-1">
+              Check your inbox (and spam) for the verification link. Your current email stays active until the new one is confirmed.
+            </p>
+            <button
+              type="button"
+              :disabled="resendingChange"
+              @click="resendEmailChange"
+              class="mt-2 inline-flex items-center px-3 py-1.5 rounded-lg text-xs font-semibold text-amber-800 bg-amber-100 hover:bg-amber-200 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-amber-500" data-unslop-ignore
+            >
+              {{ resendingChange ? 'Sending…' : 'Resend verification' }}
+            </button>
           </div>
 
           <form class="space-y-3" @submit.prevent="submitEmailChange">
@@ -224,38 +355,75 @@ onBeforeUnmount(() => {
             </div>
           </form>
 
-          <div class="border-t border-zinc-100 pt-4">
-            <p class="text-xs font-medium text-zinc-500 uppercase tracking-wider mb-2">Password</p>
-            <button
-              type="button"
-              :disabled="sendingReset"
-              @click="sendPasswordReset"
-              class="inline-flex items-center px-3 py-2 rounded-xl text-sm font-medium text-zinc-700 bg-white border border-zinc-200 hover:bg-zinc-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900 disabled:opacity-50 transition-colors"
-            >
-              {{ sendingReset ? 'Sending…' : 'Send password reset email' }}
-            </button>
+          <div class="border-t border-zinc-100 dark:border-zinc-800 pt-4">
+            <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider mb-3">Password</p>
+            <form class="space-y-3" @submit.prevent="submitPasswordChange">
+              <div v-if="passwordError" role="alert" class="bg-rose-50 p-4 rounded-xl text-rose-700 text-sm border border-rose-100">
+                {{ passwordError }}
+              </div>
+
+              <PasswordInput
+                v-model="currentPassword"
+                label="Current password"
+                placeholder="••••••••"
+                autocomplete="current-password"
+                required
+              />
+
+              <PasswordInput
+                v-model="newPassword"
+                label="New password"
+                placeholder="••••••••"
+                autocomplete="new-password"
+                show-strength
+                required
+              />
+
+              <PasswordInput
+                v-model="confirmPassword"
+                label="Confirm new password"
+                placeholder="••••••••"
+                autocomplete="new-password"
+                :error="confirmPassword.length > 0 && !passwordsMatch ? 'Passwords do not match' : null"
+                required
+              />
+
+              <div class="flex flex-wrap items-center justify-between gap-3 pt-1">
+                <button
+                  type="button"
+                  :disabled="sendingReset"
+                  @click="sendPasswordReset"
+                  class="inline-flex items-center px-3 py-2 rounded-xl text-sm font-medium text-zinc-700 dark:text-zinc-300 bg-white border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900 disabled:opacity-50 transition-colors"
+                >
+                  {{ sendingReset ? 'Sending…' : 'Send password reset email' }}
+                </button>
+                <PrimaryButton type="submit" :loading="changingPassword" :disabled="!canSubmitPassword">
+                  Update password
+                </PrimaryButton>
+              </div>
+            </form>
           </div>
         </div>
       </div>
     </section>
 
     <!-- Preferences -->
-    <section class="bg-white shadow-sm ring-1 ring-zinc-950/5 rounded-2xl p-6 sm:p-8">
+    <section class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl p-6 sm:p-8">
       <div class="md:grid md:grid-cols-3 md:gap-8">
         <div class="md:col-span-1">
-          <h4 class="text-base font-semibold text-zinc-900">Preferences</h4>
-          <p class="mt-1 text-sm text-zinc-500 pr-4">Notification and digest options.</p>
+          <h2 class="text-base font-semibold text-zinc-900 dark:text-zinc-100">Preferences</h2>
+          <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400 pr-4">Notification and digest options.</p>
         </div>
         <div class="mt-5 md:mt-0 md:col-span-2">
           <label class="flex items-start justify-between gap-4">
             <span class="flex-1">
-              <span class="block text-sm font-medium text-zinc-900">Weekly digest email</span>
-              <span class="block text-xs text-zinc-500 mt-0.5">
+              <span class="block text-sm font-medium text-zinc-900 dark:text-zinc-100">Weekly digest email</span>
+              <span class="block text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">
                 Get a Monday summary of your top ideas, questions, and actionable insights.
               </span>
               <span
                 v-if="!account.supportsDigestOptIn"
-                class="inline-block mt-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-500 bg-zinc-100 px-1.5 py-0.5 rounded-md"
+                class="inline-block mt-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400 bg-zinc-100 px-1.5 py-0.5 rounded-md"
               >
                 Coming soon
               </span>
@@ -265,7 +433,7 @@ onBeforeUnmount(() => {
               :disabled="!account.supportsDigestOptIn"
               :checked="!!account.profile?.weekly_digest_opt_in"
               @change="onDigestToggle"
-              class="h-5 w-5 rounded border-zinc-300 text-zinc-900 focus:ring-zinc-900 disabled:opacity-40 cursor-pointer"
+              class="h-5 w-5 rounded border-zinc-300 text-zinc-900 dark:text-zinc-100 focus:ring-zinc-900 disabled:opacity-40 cursor-pointer"
               aria-label="Weekly digest opt-in"
             />
           </label>
@@ -274,11 +442,11 @@ onBeforeUnmount(() => {
     </section>
 
     <!-- GDPR data export -->
-    <section class="bg-white shadow-sm ring-1 ring-zinc-950/5 rounded-2xl p-6 sm:p-8">
+    <section class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl p-6 sm:p-8">
       <div class="md:grid md:grid-cols-3 md:gap-8">
         <div class="md:col-span-1">
-          <h4 class="text-base font-semibold text-zinc-900">Your data</h4>
-          <p class="mt-1 text-sm text-zinc-500 pr-4">Download a portable copy of everything we hold for you.</p>
+          <h2 class="text-base font-semibold text-zinc-900 dark:text-zinc-100">Your data</h2>
+          <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400 pr-4">Download a portable copy of everything we hold for you.</p>
         </div>
         <div class="mt-5 md:mt-0 md:col-span-2 space-y-3">
           <div v-if="!account.exportJob">
@@ -286,18 +454,18 @@ onBeforeUnmount(() => {
               type="button"
               :disabled="account.exportLoading"
               @click="onRequestExport"
-              class="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-medium text-zinc-700 bg-white border border-zinc-200 hover:bg-zinc-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900 disabled:opacity-50"
+              class="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-medium text-zinc-700 dark:text-zinc-300 bg-white border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900 disabled:opacity-50"
             >
               <Download class="w-4 h-4" />
               {{ account.exportLoading ? 'Requesting…' : 'Export my data (GDPR)' }}
             </button>
-            <p class="text-xs text-zinc-500 mt-2">
+            <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-2">
               We'll prepare a .zip archive. Larger accounts may take a few minutes.
             </p>
           </div>
 
-          <div v-else class="rounded-xl ring-1 ring-zinc-200 p-4 bg-zinc-50/40">
-            <p class="text-sm font-medium text-zinc-900">
+          <div v-else class="rounded-xl ring-1 ring-zinc-200 dark:ring-zinc-700 p-4 bg-zinc-50/40 dark:bg-zinc-800/50">
+            <p class="text-sm font-medium text-zinc-900 dark:text-zinc-100">
               Status:
               <span class="capitalize">{{ account.exportJob.status }}</span>
             </p>
@@ -309,12 +477,12 @@ onBeforeUnmount(() => {
               <button
                 type="button"
                 @click="downloadExport"
-                class="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-medium text-white bg-zinc-900 hover:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900"
+                class="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-medium text-white bg-zinc-900 hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900"
               >
                 <Download class="w-4 h-4" /> Download (.zip)
               </button>
-              <p v-if="account.exportJob.expires_at" class="text-[11px] text-zinc-500 mt-1.5">
-                Link expires {{ account.exportJob.expires_at }}
+              <p v-if="account.exportJob.expires_at" class="text-[11px] text-zinc-500 dark:text-zinc-400 mt-1.5">
+                Link expires {{ shortDate(account.exportJob.expires_at) }}
               </p>
             </div>
 
@@ -322,20 +490,20 @@ onBeforeUnmount(() => {
               <button
                 type="button"
                 @click="onRequestExport"
-                class="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-medium text-zinc-700 bg-white border border-zinc-200 hover:bg-zinc-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900"
+                class="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-medium text-zinc-700 dark:text-zinc-300 bg-white border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900"
               >
                 Retry
               </button>
               <button
                 type="button"
                 @click="account.clearExport()"
-                class="text-xs text-zinc-500 hover:text-zinc-700"
+                class="text-xs text-zinc-500 dark:text-zinc-400 hover:text-zinc-700 dark:text-zinc-300"
               >
                 Dismiss
               </button>
             </div>
 
-            <div v-else class="mt-3 flex items-center gap-2 text-xs text-zinc-500">
+            <div v-else class="mt-3 flex items-center gap-2 text-xs text-zinc-500 dark:text-zinc-400">
               <span class="inline-block h-2 w-2 rounded-full bg-amber-500 animate-pulse"></span>
               We'll keep checking…
             </div>
@@ -344,11 +512,49 @@ onBeforeUnmount(() => {
       </div>
     </section>
 
-    <!-- Danger zone -->
-    <section class="bg-rose-50/50 ring-1 ring-rose-950/10 rounded-2xl p-6 sm:p-8">
+    <!-- Recent comment exports -->
+    <section class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl p-6 sm:p-8">
       <div class="md:grid md:grid-cols-3 md:gap-8">
         <div class="md:col-span-1">
-          <h4 class="text-base font-semibold text-rose-700">Danger zone</h4>
+          <h2 class="text-base font-semibold text-zinc-900 dark:text-zinc-100">Recent exports</h2>
+          <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400 pr-4">Comment exports you've requested from the feed.</p>
+        </div>
+        <div class="mt-5 md:mt-0 md:col-span-2">
+          <p v-if="recentLoading" class="text-sm text-zinc-500 dark:text-zinc-400">Loading…</p>
+          <ul v-else-if="recent.length > 0" class="divide-y divide-zinc-100 dark:divide-zinc-800">
+            <li
+              v-for="j in recent"
+              :key="j.job_id"
+              class="py-2.5 flex items-center gap-3"
+            >
+              <div class="flex-1 min-w-0">
+                <p class="text-sm text-zinc-900 dark:text-zinc-100">
+                  {{ (j.format ?? 'comments').toUpperCase() }} export
+                  <span class="capitalize text-xs text-zinc-500 dark:text-zinc-400">· {{ j.status }}</span>
+                </p>
+                <p v-if="j.created_at" class="text-[11px] text-zinc-400 dark:text-zinc-500">{{ j.created_at }}</p>
+                <p v-if="j.status === 'failed' && j.error" class="text-[11px] text-rose-600">{{ j.error }}</p>
+              </div>
+              <button
+                v-if="j.status === 'completed' && recentDownloadUrl(j)"
+                type="button"
+                @click="downloadRecent(j)"
+                class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-zinc-700 dark:text-zinc-300 bg-white border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 focus:outline-none focus:ring-2 focus:ring-zinc-900"
+              >
+                <Download class="w-3.5 h-3.5" /> Download
+              </button>
+            </li>
+          </ul>
+          <p v-else class="text-sm text-zinc-500 dark:text-zinc-400">No comment exports yet.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Danger zone -->
+    <section class="bg-rose-50/50 dark:bg-rose-950/20 ring-1 ring-rose-950/10 dark:ring-rose-500/20 rounded-xl p-6 sm:p-8">
+      <div class="md:grid md:grid-cols-3 md:gap-8">
+        <div class="md:col-span-1">
+          <h2 class="text-base font-semibold text-rose-700">Danger zone</h2>
           <p class="mt-1 text-sm text-rose-600/80 pr-4">Irreversible account actions.</p>
         </div>
         <div class="mt-5 md:mt-0 md:col-span-2">
@@ -375,33 +581,33 @@ onBeforeUnmount(() => {
       @cancel="closeDelete"
     >
       <template v-if="deleteStep === 1">
-        <p class="text-sm text-zinc-700 leading-relaxed">
+        <p class="text-sm text-zinc-700 dark:text-zinc-300 leading-relaxed">
           This will permanently remove:
         </p>
-        <ul class="mt-2 text-sm text-zinc-600 list-disc pl-5 space-y-1">
+        <ul class="mt-2 text-sm text-zinc-600 dark:text-zinc-400 list-disc pl-5 space-y-1">
           <li>All your tracked channels and their settings</li>
           <li>Your saved comments and starred items</li>
           <li>Your weekly digest history</li>
           <li>Your account profile and login</li>
         </ul>
-        <p class="mt-3 text-sm text-zinc-500">
+        <p class="mt-3 text-sm text-zinc-500 dark:text-zinc-400">
           Comments and analytics for channels shared with other users are kept on their accounts.
         </p>
       </template>
       <template v-else>
-        <p class="text-sm text-zinc-700">
+        <p class="text-sm text-zinc-700 dark:text-zinc-300">
           Type your email
-          <strong class="text-zinc-900 font-semibold">{{ auth.user?.email }}</strong>
+          <strong class="text-zinc-900 dark:text-zinc-100 font-semibold">{{ auth.user?.email }}</strong>
           to confirm.
         </p>
         <input
           v-model="deleteEmailInput"
           type="email"
           autocomplete="off"
-          class="mt-3 appearance-none block w-full px-4 py-3 border border-zinc-200 rounded-xl shadow-sm text-sm focus:outline-none focus:ring-2 focus:ring-rose-500 focus:border-rose-500"
+          class="mt-3 appearance-none block w-full px-4 py-3 border border-zinc-200 dark:border-zinc-700 rounded-xl shadow-sm text-sm focus:outline-none focus:ring-2 focus:ring-rose-500 focus:border-rose-500 bg-zinc-50/50 focus:bg-white dark:bg-zinc-800 dark:focus:bg-zinc-800 dark:text-zinc-100"
           placeholder="Enter your email"
         />
-        <p v-if="deleteError" class="mt-2 text-xs text-rose-600 font-medium">{{ deleteError }}</p>
+        <p v-if="deleteError" role="alert" class="mt-2 text-xs text-rose-600 dark:text-rose-400 font-medium">{{ deleteError }}</p>
       </template>
 
       <template #footer>
@@ -427,7 +633,7 @@ onBeforeUnmount(() => {
             type="button"
             data-modal-cancel="true"
             @click="closeDelete"
-            class="w-full sm:w-auto inline-flex justify-center items-center py-2.5 px-5 rounded-xl text-sm font-medium text-zinc-700 bg-white border border-zinc-200 hover:bg-zinc-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900"
+            class="w-full sm:w-auto inline-flex justify-center items-center py-2.5 px-5 rounded-xl text-sm font-medium text-zinc-700 dark:text-zinc-300 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-900"
           >
             Cancel
           </button>

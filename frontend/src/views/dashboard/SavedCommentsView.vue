@@ -102,10 +102,10 @@ onBeforeUnmount(() => {
 <template>
   <div class="max-w-5xl mx-auto py-8 px-4 sm:px-6 lg:px-8">
     <div class="mb-6">
-      <h2 class="text-2xl font-semibold leading-7 text-zinc-900 sm:text-3xl sm:tracking-tight">
+      <h1 class="text-2xl font-semibold leading-7 text-zinc-900 dark:text-zinc-100 sm:text-3xl sm:tracking-tight">
         Saved comments
-      </h2>
-      <p class="mt-1 text-sm text-zinc-500">
+      </h1>
+      <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
         The signals you've explicitly starred for follow-up.
       </p>
     </div>
@@ -119,29 +119,29 @@ onBeforeUnmount(() => {
       @reset="onResetFilters"
     />
 
-    <div v-if="feed.isInitialLoadSaved" class="space-y-3" aria-label="Loading saved comments">
+    <div v-if="feed.isInitialLoadSaved" class="space-y-3" role="status" aria-label="Loading saved comments">
       <div
         v-for="i in 3"
         :key="i"
-        class="bg-white shadow-sm ring-1 ring-zinc-950/5 rounded-2xl h-28 animate-pulse"
+        class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl h-28 animate-pulse"
       ></div>
     </div>
 
     <div
       v-else-if="feed.savedComments.length === 0"
-      class="bg-white shadow-sm ring-1 ring-zinc-950/5 rounded-2xl p-10 text-center"
+      class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl p-10 text-center"
     >
-      <p class="text-sm font-medium text-zinc-900">No saved comments yet.</p>
-      <p class="text-xs text-zinc-500 mt-1">Star comments from your feed to keep track of them here.</p>
+      <p class="text-sm font-medium text-zinc-900 dark:text-zinc-100">No saved comments yet.</p>
+      <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-1">Star comments from your feed to keep track of them here.</p>
       <RouterLink
         to="/dashboard"
-        class="mt-4 inline-flex items-center px-3 py-2 border border-zinc-200 shadow-sm text-sm font-medium rounded-xl text-zinc-700 bg-white hover:bg-zinc-50"
+        class="mt-4 inline-flex items-center px-3 py-2 border border-zinc-200 dark:border-zinc-700 shadow-sm text-sm font-medium rounded-xl text-zinc-700 dark:text-zinc-300 bg-white dark:bg-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-700"
       >
         Go to feed
       </RouterLink>
     </div>
 
-    <div v-else class="space-y-3">
+    <TransitionGroup v-else tag="div" name="saved-list" class="space-y-3">
       <CommentCard
         v-for="c in feed.savedComments"
         :key="c.id"
@@ -149,13 +149,29 @@ onBeforeUnmount(() => {
         :is-starred="true"
         @toggle-star="(id, next) => (next ? feed.starComment(id) : feed.unstarComment(id))"
       />
-    </div>
+    </TransitionGroup>
 
     <div ref="sentinel" class="h-10 flex items-center justify-center">
-      <span v-if="feed.savedLoadingMore" class="text-xs text-zinc-500">Loading more…</span>
-      <span v-else-if="!feed.savedHasMore && feed.savedComments.length > 0" class="text-xs text-zinc-400">
+      <span v-if="feed.savedLoadingMore" class="text-xs text-zinc-500 dark:text-zinc-400">Loading more…</span>
+      <span v-else-if="!feed.savedHasMore && feed.savedComments.length > 0" class="text-xs text-zinc-500 dark:text-zinc-400">
         End of saved comments
       </span>
     </div>
   </div>
 </template>
+
+<style scoped>
+.saved-list-enter-active,
+.saved-list-leave-active,
+.saved-list-move {
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+.saved-list-enter-from,
+.saved-list-leave-to {
+  opacity: 0;
+  transform: translateY(8px);
+}
+.saved-list-leave-active {
+  position: absolute;
+}
+</style>

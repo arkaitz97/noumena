@@ -57,6 +57,13 @@ function clearStoredState(provider: OAuthProvider): void {
 export interface OpenPopupOptions {
   /** Pre-generated state token (recommended — call `generateState` first). */
   state?: string
+  /**
+   * Pre-opened popup window (popup-blocker safety, PlanComparison pattern).
+   * When provided, the auth URL is loaded into it instead of calling
+   * `window.open`; pass `null` explicitly to skip opening when the opener
+   * was blocked (caller falls back).
+   */
+  popup?: Window | null
 }
 
 /**
@@ -79,10 +86,22 @@ export function openOAuthPopup(
   }
 
   const features = `width=${POPUP_W},height=${POPUP_H},menubar=no,toolbar=no,location=yes,status=no,resizable=yes,scrollbars=yes`
-  const popup = window.open(authUrl, `oauth_${provider}`, features)
-  if (!popup) {
-    clearStoredState(provider)
-    return Promise.reject(new Error('popup_blocked'))
+  let popup = options.popup ?? null
+  if (popup === null) {
+    popup = window.open(authUrl, `oauth_${provider}`, features)
+    if (!popup) {
+      clearStoredState(provider)
+      return Promise.reject(new Error('popup_blocked'))
+    }
+  } else {
+    // Caller pre-opened the window synchronously in the click handler;
+    // navigate it to the (lazily fetched) auth URL now.
+    try {
+      popup.location.href = authUrl
+    } catch {
+      clearStoredState(provider)
+      return Promise.reject(new Error('popup_closed'))
+    }
   }
 
   return new Promise<OAuthResult>((resolve, reject) => {

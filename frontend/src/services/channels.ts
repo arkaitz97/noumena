@@ -34,6 +34,18 @@ export async function exchangeYouTube(
   return data
 }
 
+/** Connect a public channel by @handle or full URL (competitor tracking, no OAuth). */
+export async function connectYouTubeByName(
+  ref: string,
+  backfillDays = 90,
+): Promise<ExchangeChannelResponse> {
+  const { data } = await apiClient.post<ExchangeChannelResponse>('/channels/connect/youtube/by-name', {
+    ref,
+    backfill_days: backfillDays,
+  })
+  return data
+}
+
 export async function syncStatus(channelId: string): Promise<SyncStatus> {
   const { data } = await apiClient.get<SyncStatus>(
     `/channels/${encodeURIComponent(channelId)}/sync-status`,
@@ -65,5 +77,31 @@ export async function status(id: string): Promise<ChannelStatus> {
   const { data } = await apiClient.get<ChannelStatus>(
     `/channels/${encodeURIComponent(id)}/status`,
   )
+  return data
+}
+
+// ---------------------------------------------------------------------------
+// Reauthorize (fix-frontend-plumbing) — re-link an expired/revoked token to
+// an existing tracking row. Same OAuth popup dance as connect; the exchange
+// updates the existing row instead of creating a channel.
+// ---------------------------------------------------------------------------
+
+export async function reauthorizeUrl(id: string): Promise<ConnectChannelResponse> {
+  const { data } = await apiClient.post<ConnectChannelResponse>(
+    `/channels/${encodeURIComponent(id)}/reauthorize`,
+  )
+  return data
+}
+
+export async function reauthorizeExchange(
+  channelId: string,
+  code: string,
+  state: string,
+): Promise<ExchangeChannelResponse> {
+  const { data } = await apiClient.post<ExchangeChannelResponse>('/channels/reauthorize/exchange', {
+    code,
+    state,
+    channel_id: channelId,
+  })
   return data
 }

@@ -33,6 +33,14 @@ export async function refresh(): Promise<RefreshResponse> {
   // Mark so the response interceptor doesn't try to refresh on a refresh.
   const cfg = markRefreshCall({})
   const { data } = await authClient.post<RefreshResponse>('/refresh', undefined, cfg)
+  if (!data?.access_token) {
+    // No session (no refresh cookie): the backend answers 204 to keep the
+    // browser console free of 401 noise. Shape the error like a 401 so the
+    // existing fail-fast paths (bootstrap, interceptor reset) behave identically.
+    const err = new Error('no session') as Error & { response?: { status: number } }
+    err.response = { status: 401 }
+    throw err
+  }
   return data
 }
 
@@ -78,6 +86,31 @@ export async function resetPassword(
     `/reset-password?token=${encodeURIComponent(token)}`,
     { password },
   )
+  return data
+}
+
+export interface ChangePasswordResponse {
+  message: string
+  /**
+   * Fresh access token. The backend reissues the refresh + access cookies
+   * on success, so this only needs to replace the in-memory token (mirrors
+   * login). Other sessions are silently revoked.
+   */
+  access_token?: string
+}
+
+/**
+ * Change the authenticated user's password. Requires the current password;
+ * on success the current session stays valid with a freshly issued token.
+ */
+export async function changePassword(
+  currentPassword: string,
+  newPassword: string,
+): Promise<ChangePasswordResponse> {
+  const { data } = await authClient.post<ChangePasswordResponse>('/password', {
+    current_password: currentPassword,
+    new_password: newPassword,
+  })
   return data
 }
 
@@ -155,6 +188,25 @@ export async function googleExchange(
   state: string,
 ): Promise<LoginResponse> {
   const { data } = await authClient.post<LoginResponse>('/google/callback', { code, state })
+  return data
+}
+
+/**
+ * Link the caller's (authenticated) account to a Google identity. Requires
+ * the server-verified Google ID token obtained from the `link_required` 409
+ * response of the popup callback flow — the backend refuses to link without
+ * cryptographic proof of the Google identity.
+ */
+export async function linkGoogle(
+  email: string,
+  sub: string,
+  idToken: string,
+): Promise<{ message: string }> {
+  const { data } = await authClient.post<{ message: string }>('/google/link', {
+    email,
+    sub,
+    id_token: idToken,
+  })
   return data
 }
 

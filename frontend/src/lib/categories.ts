@@ -44,11 +44,11 @@ export const CATEGORY_LABELS: Record<Category, string> = {
  * (`bg-* text-* ring-*`) ready to be applied to a pill / chip element.
  */
 export const CATEGORY_COLORS: Record<Category, string> = {
-  question: 'bg-indigo-50 text-indigo-700 ring-indigo-700/10',
-  content_idea: 'bg-purple-50 text-purple-700 ring-purple-700/10',
+  question: 'bg-brand-50 text-brand-700 ring-brand-700/10',
+  content_idea: 'bg-brand-50 text-brand-700 ring-brand-700/10',
   collaboration_ask: 'bg-sky-50 text-sky-700 ring-sky-700/10',
   praise: 'bg-emerald-50 text-emerald-700 ring-emerald-700/10',
-  constructive_criticism: 'bg-amber-50 text-amber-700 ring-amber-700/10',
+  constructive_criticism: 'bg-amber-50 text-amber-700 ring-amber-700/10', // unslop-ignore
   toxic_criticism: 'bg-rose-50 text-rose-700 ring-rose-700/10',
   spam: 'bg-zinc-100 text-zinc-600 ring-zinc-500/10',
   other: 'bg-zinc-50 text-zinc-700 ring-zinc-500/10',

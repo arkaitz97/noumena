@@ -9,26 +9,8 @@ import {
   TOXIC_CATEGORIES,
   type Category,
 } from '../lib/categories'
-
-const INSIGHT_TYPE_LABELS: Record<InsightType, string> = {
-  video_idea: 'Video Ideas',
-  editing_tip: 'Editing Tips',
-  feature_request: 'Feature Requests',
-  collaboration_ask: 'Collaboration Asks',
-  improvement_suggestion: 'Improvements',
-  content_format_request: 'Format Requests',
-  other: 'Other',
-}
-
-const INSIGHT_TYPES: InsightType[] = [
-  'video_idea',
-  'editing_tip',
-  'feature_request',
-  'collaboration_ask',
-  'improvement_suggestion',
-  'content_format_request',
-  'other',
-]
+import { INSIGHT_TYPES, INSIGHT_TYPE_LABELS } from '../lib/insightTypes'
+import Card from './Card.vue'
 
 const props = defineProps<{
   filters: FeedFilters
@@ -99,6 +81,10 @@ function setInsightType(t: InsightType | null): void {
   emit('update:filters', { insight_type: t })
 }
 
+function setSort(sort: 'newest' | 'oldest'): void {
+  emit('update:filters', { sort })
+}
+
 type DatePreset = '7d' | '30d' | '90d' | 'custom' | null
 const datePreset = computed<DatePreset>(() => {
   if (!props.filters.date_from && !props.filters.date_to) return null
@@ -106,16 +92,24 @@ const datePreset = computed<DatePreset>(() => {
 })
 function setDatePreset(p: DatePreset): void {
   const today = new Date()
-  const iso = (d: Date) => d.toISOString().slice(0, 10)
+  // Local-timezone YYYY-MM-DD. `toISOString()` shifts by UTC offset and
+  // produced an off-by-one day for `date_to`.
+  const localIso = (d: Date) => {
+    const m = String(d.getMonth() + 1).padStart(2, '0')
+    const day = String(d.getDate()).padStart(2, '0')
+    return `${d.getFullYear()}-${m}-${day}`
+  }
   if (p === '7d' || p === '30d' || p === '90d') {
     const days = p === '7d' ? 7 : p === '30d' ? 30 : 90
     const from = new Date(today)
     from.setDate(from.getDate() - days)
-    emit('update:filters', { date_from: iso(from), date_to: iso(today) })
+    emit('update:filters', { date_from: localIso(from), date_to: localIso(today) })
   } else if (p === 'custom') {
+    const from = new Date(today)
+    from.setDate(from.getDate() - 30)
     emit('update:filters', {
-      date_from: props.filters.date_from ?? iso(new Date(today.getTime() - 30 * 86400000)),
-      date_to: props.filters.date_to ?? iso(today),
+      date_from: props.filters.date_from ?? localIso(from),
+      date_to: props.filters.date_to ?? localIso(today),
     })
   } else {
     emit('update:filters', { date_from: null, date_to: null })
@@ -141,24 +135,39 @@ function doReset(): void {
 </script>
 
 <template>
-  <div class="bg-white shadow-sm ring-1 ring-zinc-950/5 rounded-2xl p-4 sm:p-5 space-y-4">
+  <Card class="space-y-4">
     <div class="flex flex-col sm:flex-row gap-3">
       <div class="relative flex-1">
-        <Search class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-400" />
+        <Search class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-400 dark:text-zinc-500" />
         <input
           type="search"
           :value="searchInput"
           @input="onSearchInput"
           placeholder="Search comments…"
           aria-label="Search comments"
-          class="appearance-none block w-full pl-9 pr-4 py-2.5 border border-zinc-200 rounded-xl shadow-sm placeholder-zinc-400 text-sm focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900 transition-colors bg-zinc-50/50 focus:bg-white text-zinc-900"
+          class="appearance-none block w-full pl-9 pr-4 py-2.5 border border-zinc-200 dark:border-zinc-700 rounded-xl shadow-sm placeholder-zinc-400 text-sm focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900 transition-colors bg-zinc-50/50 focus:bg-white dark:bg-zinc-800 dark:focus:bg-zinc-800 text-zinc-900 dark:text-zinc-100"
         />
       </div>
       <div class="flex items-center gap-2">
+        <div v-if="isFeed" class="flex rounded-xl border border-zinc-200 dark:border-zinc-700 overflow-hidden" role="group" aria-label="Sort order">
+          <button
+            v-for="s in (['newest', 'oldest'] as const)"
+            :key="s"
+            type="button"
+            @click="setSort(s)"
+            :aria-pressed="filters.sort === s"
+            class="px-3 py-2.5 text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-zinc-900 dark:focus:ring-zinc-100"
+            :class="filters.sort === s
+              ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900'
+              : 'bg-white text-zinc-600 hover:bg-zinc-50 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700/50'"
+          >
+            {{ s === 'newest' ? 'Newest' : 'Oldest' }}
+          </button>
+        </div>
         <button
           type="button"
           @click="doReset"
-          class="inline-flex items-center gap-1.5 px-3 py-2.5 rounded-xl text-sm font-medium text-zinc-600 border border-zinc-200 hover:bg-zinc-50 transition-colors focus:outline-none focus:ring-2 focus:ring-zinc-900"
+          class="inline-flex items-center gap-1.5 px-3 py-2.5 rounded-xl text-sm font-medium text-zinc-600 dark:text-zinc-300 border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors focus:outline-none focus:ring-2 focus:ring-zinc-900"
           aria-label="Reset filters"
         >
           <RefreshCw class="w-4 h-4" /> Reset
@@ -168,20 +177,20 @@ function doReset(): void {
             type="button"
             @click="toggleExportMenu"
             :aria-expanded="exportOpen"
-            class="inline-flex items-center gap-1.5 px-3 py-2.5 rounded-xl text-sm font-medium text-white bg-zinc-900 hover:bg-zinc-800 transition-colors focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:ring-offset-2"
+            class="inline-flex items-center gap-1.5 px-3 py-2.5 rounded-xl text-sm font-medium text-white bg-zinc-900 hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-200 transition-colors focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:ring-offset-2"
           >
             <Download class="w-4 h-4" /> Export
           </button>
           <div
             v-if="exportOpen"
-            class="absolute right-0 mt-2 w-40 bg-white shadow-lg ring-1 ring-zinc-950/5 rounded-xl py-1 z-20"
+            class="absolute right-0 mt-2 w-40 bg-white dark:bg-zinc-900 shadow-lg ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl py-1 z-20"
             role="menu"
           >
             <button
               type="button"
               role="menuitem"
               @click="exportOpen = false; emit('export')"
-              class="w-full text-left px-3 py-2 text-sm text-zinc-700 hover:bg-zinc-50"
+              class="w-full text-left px-3 py-2 text-sm text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
             >
               Open export…
             </button>
@@ -191,7 +200,7 @@ function doReset(): void {
     </div>
 
     <div v-if="channels.length > 0">
-      <p class="text-xs font-medium text-zinc-500 uppercase tracking-wider mb-2">Channels</p>
+      <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider mb-2">Channels</p>
       <div class="flex flex-wrap gap-1.5">
         <button
           v-for="c in channels"
@@ -202,8 +211,8 @@ function doReset(): void {
           :class="[
             'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium ring-1 ring-inset transition-colors',
             filters.channels.includes(c.id)
-              ? 'bg-zinc-900 text-white ring-zinc-900'
-              : 'bg-white text-zinc-700 ring-zinc-200 hover:bg-zinc-50',
+              ? 'bg-zinc-900 text-white ring-zinc-900 dark:bg-zinc-100 dark:text-zinc-900 dark:ring-zinc-100'
+              : 'bg-white text-zinc-700 ring-zinc-200 hover:bg-zinc-50 dark:bg-zinc-800 dark:text-zinc-300 dark:ring-zinc-700 dark:hover:bg-zinc-700/50',
           ]"
         >
           {{ c.display_name || c.platform_channel_id }}
@@ -213,13 +222,13 @@ function doReset(): void {
 
     <div>
       <div class="flex items-center justify-between mb-2">
-        <p class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Categories</p>
-        <label v-if="isFeed" class="inline-flex items-center gap-1.5 text-xs text-zinc-600 cursor-pointer">
+        <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Categories</p>
+        <label v-if="isFeed" class="inline-flex items-center gap-1.5 text-xs text-zinc-600 dark:text-zinc-300 cursor-pointer">
           <input
             type="checkbox"
             :checked="filters.include_toxic"
             @change="toggleIncludeToxic"
-            class="h-3.5 w-3.5 rounded border-zinc-300 text-zinc-900 focus:ring-zinc-900"
+            class="h-3.5 w-3.5 rounded border-zinc-300 text-zinc-900 focus:ring-zinc-900 dark:border-zinc-600"
           />
           Include toxic / spam
         </label>
@@ -233,7 +242,7 @@ function doReset(): void {
           :aria-pressed="isCategoryActive(c)"
           :class="[
             'inline-flex items-center px-2.5 py-1 rounded-md text-xs font-semibold tracking-wide ring-1 ring-inset transition-colors',
-            isCategoryActive(c) ? CATEGORY_COLORS[c] : 'bg-white text-zinc-500 ring-zinc-200 hover:bg-zinc-50',
+            isCategoryActive(c) ? CATEGORY_COLORS[c] : 'bg-white text-zinc-500 ring-zinc-200 hover:bg-zinc-50 dark:bg-zinc-800 dark:text-zinc-400 dark:ring-zinc-700 dark:hover:bg-zinc-700/50',
           ]"
         >
           {{ CATEGORY_LABELS[c] }}
@@ -242,7 +251,7 @@ function doReset(): void {
     </div>
 
     <div v-if="isFeed">
-      <p class="text-xs font-medium text-zinc-500 uppercase tracking-wider mb-2">Insight type</p>
+      <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider mb-2">Insight type</p>
       <div class="flex flex-wrap gap-1.5">
         <button
           type="button"
@@ -251,8 +260,8 @@ function doReset(): void {
           :class="[
             'inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium ring-1 ring-inset transition-colors',
             filters.insight_type === null
-              ? 'bg-zinc-900 text-white ring-zinc-900'
-              : 'bg-white text-zinc-700 ring-zinc-200 hover:bg-zinc-50',
+              ? 'bg-zinc-900 text-white ring-zinc-900 dark:bg-zinc-100 dark:text-zinc-900 dark:ring-zinc-100'
+              : 'bg-white text-zinc-700 ring-zinc-200 hover:bg-zinc-50 dark:bg-zinc-800 dark:text-zinc-300 dark:ring-zinc-700 dark:hover:bg-zinc-700/50',
           ]"
         >
           All
@@ -266,8 +275,8 @@ function doReset(): void {
           :class="[
             'inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium ring-1 ring-inset transition-colors',
             filters.insight_type === t
-              ? 'bg-indigo-600 text-white ring-indigo-600'
-              : 'bg-white text-zinc-700 ring-zinc-200 hover:bg-zinc-50',
+              ? 'bg-brand-600 text-white ring-brand-600'
+              : 'bg-white text-zinc-700 ring-zinc-200 hover:bg-zinc-50 dark:bg-zinc-800 dark:text-zinc-300 dark:ring-zinc-700 dark:hover:bg-zinc-700/50',
           ]"
         >
           {{ INSIGHT_TYPE_LABELS[t] }}
@@ -276,7 +285,7 @@ function doReset(): void {
     </div>
 
     <div>
-      <p class="text-xs font-medium text-zinc-500 uppercase tracking-wider mb-2">Date range</p>
+      <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider mb-2">Date range</p>
       <div class="flex flex-wrap items-center gap-1.5">
         <button
           v-for="p in (['7d', '30d', '90d', 'custom'] as DatePreset[])"
@@ -287,8 +296,8 @@ function doReset(): void {
           :class="[
             'inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium ring-1 ring-inset transition-colors',
             datePreset === p
-              ? 'bg-zinc-900 text-white ring-zinc-900'
-              : 'bg-white text-zinc-700 ring-zinc-200 hover:bg-zinc-50',
+              ? 'bg-zinc-900 text-white ring-zinc-900 dark:bg-zinc-100 dark:text-zinc-900 dark:ring-zinc-100'
+              : 'bg-white text-zinc-700 ring-zinc-200 hover:bg-zinc-50 dark:bg-zinc-800 dark:text-zinc-300 dark:ring-zinc-700 dark:hover:bg-zinc-700/50',
           ]"
         >
           {{ p === 'custom' ? 'Custom' : p?.toUpperCase() }}
@@ -297,7 +306,7 @@ function doReset(): void {
           v-if="filters.date_from || filters.date_to"
           type="button"
           @click="setDatePreset(null)"
-          class="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs text-zinc-500 hover:text-zinc-900 hover:bg-zinc-50 transition-colors"
+          class="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors"
         >
           <X class="w-3 h-3" /> clear
         </button>
@@ -308,17 +317,17 @@ function doReset(): void {
           :value="filters.date_from ?? ''"
           @change="emit('update:filters', { date_from: ($event.target as HTMLInputElement).value || null })"
           aria-label="Date from"
-          class="appearance-none px-3 py-2 text-sm border border-zinc-200 rounded-xl bg-zinc-50/50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900"
+          class="appearance-none px-3 py-2 text-sm border border-zinc-200 dark:border-zinc-700 rounded-xl bg-zinc-50/50 focus:bg-white dark:bg-zinc-800 dark:focus:bg-zinc-800 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900"
         />
-        <span class="text-xs text-zinc-400">to</span>
+        <span class="text-xs text-zinc-400 dark:text-zinc-500">to</span>
         <input
           type="date"
           :value="filters.date_to ?? ''"
           @change="emit('update:filters', { date_to: ($event.target as HTMLInputElement).value || null })"
           aria-label="Date to"
-          class="appearance-none px-3 py-2 text-sm border border-zinc-200 rounded-xl bg-zinc-50/50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900"
+          class="appearance-none px-3 py-2 text-sm border border-zinc-200 dark:border-zinc-700 rounded-xl bg-zinc-50/50 focus:bg-white dark:bg-zinc-800 dark:focus:bg-zinc-800 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900"
         />
       </div>
     </div>
-  </div>
+  </Card>
 </template>

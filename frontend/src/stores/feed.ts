@@ -13,6 +13,7 @@ import type {
   ApiErrorBody,
   Comment,
   ExportFormat,
+  ExportJob,
   FeedFilters,
 } from '../services/types'
 
@@ -48,6 +49,9 @@ export const useFeedStore = defineStore('feed', () => {
   const hasMore = ref(false)
   const loading = ref(false)
   const loadingMore = ref(false)
+  // Tracked independently of `comments.length`: optimistic unstar splices a
+  // row, and using list length as offset would re-request already-seen rows.
+  const feedOffset = ref(0)
 
   // ---- /dashboard/saved ----
   const savedComments = ref<Comment[]>([])
@@ -55,6 +59,47 @@ export const useFeedStore = defineStore('feed', () => {
   const savedHasMore = ref(false)
   const savedLoading = ref(false)
   const savedLoadingMore = ref(false)
+  const savedOffset = ref(0)
+
+  // ---- async comment export (fix-frontend-plumbing) ----
+  const exportJob = ref<ExportJob | null>(null)
+  const exportPolling = ref(false)
+  let exportTimer: number | null = null
+
+  function stopExportPolling(): void {
+    if (exportTimer !== null) {
+      window.clearInterval(exportTimer)
+      exportTimer = null
+    }
+    exportPolling.value = false
+  }
+
+  function clearExportJob(): void {
+    stopExportPolling()
+    exportJob.value = null
+  }
+
+  function startExportPolling(jobId: string): void {
+    stopExportPolling()
+    exportPolling.value = true
+    exportTimer = window.setInterval(async () => {
+      if (!exportJob.value || exportJob.value.job_id !== jobId) {
+        stopExportPolling()
+        return
+      }
+      try {
+        const next = await commentsApi.exportStatus(jobId)
+        exportJob.value = next
+        if (next.status === 'completed' || next.status === 'failed') {
+          stopExportPolling()
+          if (next.status === 'completed') toast.success('Export ready — download below.')
+          else toast.error('Export failed. Please try again.')
+        }
+      } catch {
+        // Transient — keep polling; the interval stops on completion/nav.
+      }
+    }, 5000)
+  }
 
   function applyFilters(partial: Partial<FeedFilters>): void {
     filters.value = { ...filters.value, ...partial }
@@ -72,12 +117,14 @@ export const useFeedStore = defineStore('feed', () => {
       loadingMore.value = true
     }
     try {
-      const offset = reset ? 0 : comments.value.length
+      const offset = reset ? 0 : feedOffset.value
       const res = await commentsApi.feed(filters.value, { offset, limit: PAGE_SIZE })
       if (reset) {
         comments.value = res.comments
+        feedOffset.value = res.comments.length
       } else {
         comments.value = [...comments.value, ...res.comments]
+        feedOffset.value += res.comments.length
       }
       total.value = res.total
       hasMore.value = res.has_more
@@ -108,12 +155,14 @@ export const useFeedStore = defineStore('feed', () => {
       savedLoadingMore.value = true
     }
     try {
-      const offset = reset ? 0 : savedComments.value.length
+      const offset = reset ? 0 : savedOffset.value
       const res = await commentsApi.saved(filters.value, { offset, limit: PAGE_SIZE })
       if (reset) {
         savedComments.value = res.comments
+        savedOffset.value = res.comments.length
       } else {
         savedComments.value = [...savedComments.value, ...res.comments]
+        savedOffset.value += res.comments.length
       }
       savedTotal.value = res.total
       savedHasMore.value = res.has_more
@@ -183,9 +232,19 @@ export const useFeedStore = defineStore('feed', () => {
     try {
       const res = await commentsApi.requestExport(filters.value, format)
       if (res.status === 'sync' && res.download_url) {
-        window.location.assign(res.download_url)
-      } else if (res.status === 'async') {
-        toast.success("Export queued — we'll prepare your file.")
+        exportJob.value = {
+          job_id: res.job_id ?? '',
+          status: 'completed',
+          download_url: res.download_url,
+          expires_at: res.expires_at,
+        }
+        toast.success('Export ready — download below.')
+        return
+      }
+      if (res.status === 'async' && res.job_id) {
+        exportJob.value = { job_id: res.job_id, status: 'queued' }
+        toast.success("Export queued — we'll show the download here when it's ready.")
+        startExportPolling(res.job_id)
       }
     } catch {
       toast.error('Could not start your export. Please try again.')
@@ -222,5 +281,10 @@ export const useFeedStore = defineStore('feed', () => {
     starComment,
     unstarComment,
     requestExport,
+    // export result surface
+    exportJob,
+    exportPolling,
+    stopExportPolling,
+    clearExportJob,
   }
 })

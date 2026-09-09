@@ -7,44 +7,49 @@ const router = createRouter({
     {
       path: '/',
       name: 'landing',
+      meta: { title: 'Noumena', publicOnly: false },
       component: () => import('../views/public/LandingView.vue'),
-      meta: { publicOnly: false },
     },
     {
       path: '/login',
       name: 'login',
+      meta: { title: 'Log in' },
       component: () => import('../views/auth/LoginView.vue'),
     },
     {
       path: '/signup',
       name: 'signup',
+      meta: { title: 'Sign up' },
       component: () => import('../views/auth/SignupView.vue'),
     },
     {
       path: '/verify-email',
       name: 'verify',
+      meta: { title: 'Verify email', requiresAuth: true },
       component: () => import('../views/auth/VerifyEmailView.vue'),
-      meta: { requiresAuth: true },
     },
     {
       path: '/forgot-password',
       name: 'forgot-password',
+      meta: { title: 'Reset password' },
       component: () => import('../views/auth/ForgotPasswordView.vue'),
     },
     {
       path: '/reset-password',
       name: 'reset-password',
+      meta: { title: 'Reset password' },
       component: () => import('../views/auth/ResetPasswordView.vue'),
     },
     {
       path: '/onboarding',
       name: 'onboarding',
+      meta: { title: 'Get started', requiresAuth: true, requiresVerified: true },
       component: () => import('../views/auth/OnboardingView.vue'),
-      meta: { requiresAuth: true, requiresVerified: true },
     },
     {
       path: '/oauth/callback',
       name: 'oauth-callback',
+      meta: { title: 'Connecting…' },
       component: () => import('../views/auth/OAuthCallbackView.vue'),
     },
     {
@@ -55,11 +60,13 @@ const router = createRouter({
         {
           path: '',
           name: 'dashboard',
+      meta: { title: 'Insights Feed' },
           component: () => import('../views/dashboard/InsightsFeed.vue'),
         },
         {
           path: 'saved',
           name: 'saved-comments',
+      meta: { title: 'Saved Comments' },
           component: () => import('../views/dashboard/SavedCommentsView.vue'),
         },
       ],
@@ -72,19 +79,33 @@ const router = createRouter({
         {
           path: 'channels',
           name: 'channels',
+      meta: { title: 'Channels' },
           component: () => import('../views/settings/ChannelsView.vue'),
+        },
+        {
+          path: 'members',
+          name: 'members',
+      meta: { title: 'Members' },
+          component: () => import('../views/settings/MembersView.vue'),
         },
         {
           path: 'billing',
           name: 'billing',
+      meta: { title: 'Billing' },
           component: () => import('../views/settings/BillingView.vue'),
         },
         {
           path: 'account',
           name: 'account',
+      meta: { title: 'Account' },
           component: () => import('../views/settings/AccountView.vue'),
         },
       ],
+    },
+    {
+      path: '/:pathMatch(.*)*',
+      name: 'not-found',
+      redirect: '/',
     },
   ],
 })
@@ -120,6 +141,12 @@ router.beforeEach((to) => {
   }
 
   return true
+})
+
+router.afterEach((to) => {
+  if (typeof document === 'undefined') return
+  const title = to.meta.title as string | undefined
+  document.title = title ? `${title} · Noumena` : 'Noumena'
 })
 
 export default router

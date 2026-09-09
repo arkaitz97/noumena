@@ -122,6 +122,11 @@ export async function exportStatus(jobId: string): Promise<ExportJob> {
   return data
 }
 
+export async function recentExports(): Promise<ExportJob[]> {
+  const { data } = await apiClient.get<ExportJob[] | null>('/comments/export/recent')
+  return data ?? []
+}
+
 export function exportDownloadUrl(jobId: string): string {
   // Browser navigation; we just need an absolute URL. apiBaseURL may be
   // either `/api` or a fully qualified origin.

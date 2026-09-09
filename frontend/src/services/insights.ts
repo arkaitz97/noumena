@@ -59,6 +59,33 @@ export async function trends(
   return data
 }
 
+// Sentiment trend — GET /api/insights/sentiment?channel_id=&days=.
+// channel_id is optional: when omitted the series aggregates across every
+// channel the caller tracks (global trend); when present it must be tracked
+// by the caller (403 otherwise). days ∈ {7,30,90} (default 7); series may
+// be empty but is never null. The endpoint is feature-gated server-side
+// (503) — callers degrade gracefully to an empty chart.
+
+export interface SentimentDay {
+  date: string
+  negative: number
+  neutral: number
+  positive: number
+  score: number
+}
+
+export interface SentimentData {
+  days: number
+  series: SentimentDay[]
+}
+
+export async function getSentiment(channelId?: string, days = 7): Promise<SentimentData> {
+  const params: Record<string, string | number> = { days }
+  if (channelId) params.channel_id = channelId
+  const { data } = await apiClient.get<SentimentData>('/insights/sentiment', { params })
+  return data
+}
+
 export async function latestDigest(): Promise<WeeklyDigest | null> {
   try {
     const { data } = await apiClient.get<WeeklyDigest>('/insights/digest/latest')

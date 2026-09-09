@@ -20,6 +20,7 @@ export async function me(): Promise<UserProfile> {
     created_at: data.created_at,
     weekly_digest_opt_in: data.weekly_digest_opt_in ?? null,
     deletion_requested_at: data.deletion_requested_at ?? null,
+    pending_email: data.pending_email ?? null,
   }
 }
 
@@ -38,6 +39,7 @@ export async function patchProfile(
     created_at: data.created_at,
     weekly_digest_opt_in: data.weekly_digest_opt_in ?? null,
     deletion_requested_at: data.deletion_requested_at ?? null,
+    pending_email: data.pending_email ?? null,
   }
 }
 
@@ -46,13 +48,13 @@ export async function updateEmail(email: string): Promise<UserProfile> {
 }
 
 export async function requestExport(): Promise<ExportJob> {
-  const { data } = await apiClient.get<ExportJob>('/user/export')
+  const { data } = await apiClient.post<ExportJob>('/user/data-export')
   return data
 }
 
 export async function exportStatus(jobId: string): Promise<ExportJob> {
   const { data } = await apiClient.get<ExportJob>(
-    `/user/export/${encodeURIComponent(jobId)}/status`,
+    `/user/data-export/${encodeURIComponent(jobId)}/status`,
   )
   return data
 }

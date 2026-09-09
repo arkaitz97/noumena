@@ -87,6 +87,9 @@ export interface Comment {
   id: string
   channel_id: string
   channel_display_name?: string | null
+  platform_channel_id?: string | null
+  video_id?: string | null
+  video_title?: string | null
   platform_comment_id?: string | null
   author_handle?: string | null
   author_display_name?: string | null
@@ -108,7 +111,7 @@ export interface FeedFilters {
   date_to: string | null
   search: string
   include_toxic: boolean
-  sort: 'newest'
+  sort: 'newest' | 'oldest'
 }
 
 export interface FeedResponse {
@@ -183,11 +186,14 @@ export interface BillingStatus {
   interval: BillingInterval | null
   channels_used: number
   channels_limit: number
+  channels_unlimited: boolean
   comments_used: number
   comments_limit: number
   period_end: string | null
   overage_cost_usd?: number | null
   has_payment_method?: boolean
+  /** ISO timestamp when the free-trial window ends, when a trial is active. */
+  trial_ends_at?: string | null
 }
 
 export type ExportFormat = 'csv' | 'json'
@@ -201,6 +207,9 @@ export interface ExportJob {
   export_url?: string | null
   expires_at?: string | null
   error?: string | null
+  /** Present on recent-exports list rows. */
+  format?: string | null
+  created_at?: string | null
 }
 
 export interface ChannelStatus {
@@ -222,4 +231,6 @@ export interface UserProfile {
   created_at?: string
   weekly_digest_opt_in?: boolean | null
   deletion_requested_at?: string | null
+  /** Set while an email change awaits verification (fix-frontend-plumbing). */
+  pending_email?: string | null
 }

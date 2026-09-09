@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRouter, RouterLink } from 'vue-router'
 import { useAuthStore } from '../../stores/auth'
 import { toast } from '../../lib/toast'
 import { generateState, openOAuthPopup } from '../../lib/oauthPopup'
@@ -59,6 +59,13 @@ async function pollOnce(): Promise<void> {
       toast.success('Sync complete! Your insights are ready.')
       stopPolling()
       setTimeout(() => router.push('/dashboard'), 1200)
+      return
+    }
+    // Failed: the channel reports an error. Stop polling and offer the
+    // escape hatch so the user can manage channels instead.
+    if (s.recent_error) {
+      escapeHatchVisible.value = true
+      stopPolling()
     }
   } catch (err) {
     // Transient failure — continue polling.
@@ -73,7 +80,9 @@ function schedulePoll() {
   }
   pollTimer = window.setTimeout(async () => {
     await pollOnce()
-    if (progressPct.value < PROGRESS_THRESHOLD) {
+    // Keep polling until the backfill completes or fails — the old
+    // "progress >= 10%" gate froze the bar mid-sync.
+    if (progressPct.value < 100 && !syncStatus.value?.recent_error) {
       schedulePoll()
     }
   }, pollIntervalMs.value)
@@ -86,7 +95,7 @@ async function startBackfillPolling() {
   lastProgress.value = null
   escapeHatchVisible.value = false
   await pollOnce()
-  if (progressPct.value < PROGRESS_THRESHOLD) schedulePoll()
+  if (progressPct.value < 100 && !syncStatus.value?.recent_error) schedulePoll()
 }
 
 onBeforeUnmount(() => {
@@ -168,15 +177,15 @@ function finishOnboarding() {
     <div class="px-6 sm:px-12">
       <div class="h-1.5 bg-zinc-200 dark:bg-zinc-800 rounded-full overflow-hidden">
         <div
-          class="h-full bg-gradient-to-r from-indigo-500 to-purple-500 transition-all duration-500"
+          class="h-full bg-brand-500 transition-all duration-500"
           :style="{ width: ((step / 4) * 100) + '%' }"
         ></div>
       </div>
     </div>
 
     <main class="flex-1 flex items-center justify-center px-6 sm:px-12 py-12">
-      <div class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-2xl max-w-xl w-full p-8 sm:p-12 relative overflow-hidden">
-        <div class="absolute top-0 right-0 -mt-16 -mr-16 w-48 h-48 bg-gradient-to-br from-indigo-500 to-purple-400 rounded-full blur-[80px] opacity-20 pointer-events-none"></div>
+      <div class="bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl max-w-xl w-full p-8 sm:p-12 relative overflow-hidden">
+        <div class="absolute top-0 right-0 -mt-16 -mr-16 w-48 h-48 bg-gradient-to-br from-brand-500 to-brand-400 rounded-full blur-[80px] opacity-20 pointer-events-none" data-unslop-ignore></div>
 
         <!-- STEP 1: Welcome -->
         <template v-if="step === 1">
@@ -250,7 +259,7 @@ function finishOnboarding() {
             </div>
             <div class="h-2 bg-zinc-100 dark:bg-zinc-800 rounded-full overflow-hidden">
               <div
-                class="h-full bg-gradient-to-r from-indigo-500 to-purple-500 transition-all duration-500"
+                class="h-full bg-brand-500 transition-all duration-500"
                 :style="{ width: Math.min(100, progressPct) + '%' }"
               ></div>
             </div>
@@ -261,6 +270,9 @@ function finishOnboarding() {
 
           <p v-if="escapeHatchVisible" class="text-sm text-zinc-500 dark:text-zinc-400 mb-6">
             This is taking longer than usual — you can continue and we'll keep syncing in the background.
+            <RouterLink to="/settings/channels" class="underline font-medium text-zinc-700 dark:text-zinc-300">
+              Manage channels
+            </RouterLink>.
           </p>
 
           <PrimaryButton full-width :disabled="!continueEnabled" @click="continueToStep4">

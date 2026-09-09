@@ -6,6 +6,7 @@
 import { ref } from 'vue'
 import { defineStore } from 'pinia'
 import * as insightsApi from '../services/insights'
+import type { SentimentData } from '../services/insights'
 import { toast } from '../lib/toast'
 import type {
   InsightAggregatesResponse,
@@ -36,6 +37,7 @@ export const useInsightsStore = defineStore('insights', () => {
   const insightsByKey = ref<Record<string, CacheEntry<InsightAggregatesResponse>>>({})
   const toxicityByKey = ref<Record<string, CacheEntry<ToxicityResponse>>>({})
   const trendsByKey = ref<Record<string, CacheEntry<TrendsResponse>>>({})
+  const sentimentByKey = ref<Record<string, CacheEntry<SentimentData>>>({})
   const latestDigest = ref<WeeklyDigest | null>(null)
   const digestFetchedAt = ref<number>(0)
   const loadingDigest = ref(false)
@@ -43,6 +45,7 @@ export const useInsightsStore = defineStore('insights', () => {
   const actionableInsights = ref<InsightAggregatesResponse | null>(null)
   const toxicity = ref<ToxicityResponse | null>(null)
   const trends = ref<TrendsResponse | null>(null)
+  const sentiment = ref<SentimentData | null>(null)
 
   async function fetchActionableInsights(
     channelId?: string,
@@ -113,6 +116,34 @@ export const useInsightsStore = defineStore('insights', () => {
     }
   }
 
+  // Sentiment series — channel_id is optional: when no channel filter is
+  // selected the backend aggregates across every tracked channel (global
+  // trend); a selected channel scopes the series to that channel. Feature-
+  // gated 503s and other errors keep the previous value instead of clearing
+  // the chart.
+  async function fetchSentiment(
+    channelId?: string,
+    days = 7,
+    opts: { force?: boolean } = {},
+  ): Promise<SentimentData | null> {
+    const key = cacheKey(channelId ?? 'all', `d${days}`)
+    if (!opts.force) {
+      const hit = fresh(sentimentByKey.value[key])
+      if (hit) {
+        sentiment.value = hit
+        return hit
+      }
+    }
+    try {
+      const res = await insightsApi.getSentiment(channelId, days)
+      sentimentByKey.value[key] = { fetchedAt: Date.now(), value: res }
+      sentiment.value = res
+      return res
+    } catch {
+      return sentiment.value
+    }
+  }
+
   async function fetchLatestDigest(opts: { force?: boolean } = {}): Promise<void> {
     if (!opts.force && Date.now() - digestFetchedAt.value < CACHE_MS && latestDigest.value !== null)
       return
@@ -131,11 +162,13 @@ export const useInsightsStore = defineStore('insights', () => {
     actionableInsights,
     toxicity,
     trends,
+    sentiment,
     latestDigest,
     loadingDigest,
     fetchActionableInsights,
     fetchToxicity,
     fetchTrends,
+    fetchSentiment,
     fetchLatestDigest,
   }
 })

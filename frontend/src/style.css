@@ -1,8 +1,27 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
 @import "tailwindcss";
 
-:root {
-  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
-  color-scheme: light dark;
+@theme {
+  /* Brand: electric cyan — "analytics engine" identity for a comment-insights
+     product. Chosen deliberately over framework indigo; 600 tuned for text
+     contrast (5.4:1 on white), 500 is the vivid accent. */
+  --color-brand-50: #ecfeff;
+  --color-brand-100: #cffafe;
+  --color-brand-200: #a5f3fc;
+  --color-brand-300: #67e8f9;
+  --color-brand-400: #22d3ee;
+  --color-brand-500: #06b6d4;
+  --color-brand-600: #0e7490;
+  --color-brand-700: #0c6478;
+  --color-brand-800: #0a5165;
+  --color-brand-900: #0c4557;
+  --color-brand-950: #072f3d;
+
+  /* Type: IBM Plex Sans body + IBM Plex Mono for data/numeric accents.
+     A coherent technical pair (information-systems heritage) instead of
+     the Inter default. */
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 button:not(:disabled), [role="button"]:not(:disabled) {
@@ -11,4 +30,17 @@ button:not(:disabled), [role="button"]:not(:disabled) {
 
 button:disabled {
   cursor: not-allowed;
+}
+
+/* Respect reduced-motion preferences: collapse all animation/transition
+   durations so nothing flashes or slides for vestibular-sensitive users. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

@@ -51,8 +51,8 @@ async function handleResend() {
 
 <template>
   <div class="min-h-screen bg-zinc-50 flex flex-col justify-center py-12 sm:px-6 lg:px-8 relative overflow-hidden">
-    <div class="absolute top-[-10%] left-[10%] w-[30rem] h-[30rem] bg-indigo-200 rounded-full mix-blend-multiply filter blur-[100px] opacity-40"></div>
-    <div class="absolute bottom-[-10%] right-[10%] w-[30rem] h-[30rem] bg-blue-100 rounded-full mix-blend-multiply filter blur-[100px] opacity-40"></div>
+    <div class="absolute top-[-10%] left-[10%] w-[30rem] h-[30rem] bg-brand-200 rounded-full mix-blend-multiply filter blur-[100px] opacity-40" data-unslop-ignore></div>
+    <div class="absolute bottom-[-10%] right-[10%] w-[30rem] h-[30rem] bg-blue-100 rounded-full mix-blend-multiply filter blur-[100px] opacity-40" data-unslop-ignore></div>
 
     <div class="sm:mx-auto sm:w-full sm:max-w-md relative z-10 text-center">
       <div class="flex items-center justify-center gap-2 mb-10">
@@ -73,7 +73,7 @@ async function handleResend() {
       <!-- Success -->
       <template v-else-if="phase === 'success'">
         <div class="flex justify-center mb-6">
-          <div class="h-20 w-20 bg-emerald-50 rounded-2xl flex items-center justify-center ring-1 ring-emerald-600/20">
+          <div class="h-20 w-20 bg-emerald-50 rounded-xl flex items-center justify-center ring-1 ring-emerald-600/20">
             <svg class="h-10 w-10 text-emerald-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
             </svg>
@@ -86,7 +86,7 @@ async function handleResend() {
       <!-- Invalid token -->
       <template v-else-if="phase === 'invalid'">
         <div class="flex justify-center mb-6">
-          <div class="h-20 w-20 bg-rose-50 rounded-2xl flex items-center justify-center ring-1 ring-rose-600/20">
+          <div class="h-20 w-20 bg-rose-50 rounded-xl flex items-center justify-center ring-1 ring-rose-600/20">
             <svg class="h-10 w-10 text-rose-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
             </svg>
@@ -99,8 +99,8 @@ async function handleResend() {
       <!-- Idle (no ?token) — show inbox prompt + resend -->
       <template v-else>
         <div class="flex justify-center mb-6">
-          <div class="h-20 w-20 bg-white rounded-2xl flex items-center justify-center shadow-sm border border-zinc-100 ring-4 ring-zinc-50">
-            <svg class="h-10 w-10 text-indigo-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <div class="h-20 w-20 bg-white rounded-xl flex items-center justify-center shadow-sm border border-zinc-100 ring-4 ring-zinc-50">
+            <svg class="h-10 w-10 text-brand-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
             </svg>
           </div>

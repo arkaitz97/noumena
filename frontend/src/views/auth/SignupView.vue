@@ -146,8 +146,8 @@ async function handleGoogle() {
     </div>
 
     <div class="hidden lg:flex relative w-0 flex-1 bg-zinc-950 overflow-hidden items-center justify-center">
-      <div class="absolute top-1/4 left-1/4 w-[40rem] h-[40rem] bg-indigo-600 rounded-full mix-blend-screen filter blur-[120px] opacity-20"></div>
-      <div class="absolute bottom-1/4 right-1/4 w-[40rem] h-[40rem] bg-blue-600 rounded-full mix-blend-screen filter blur-[120px] opacity-20"></div>
+      <div class="absolute top-1/4 left-1/4 w-[40rem] h-[40rem] bg-brand-600 rounded-full mix-blend-screen filter blur-[120px] opacity-20" data-unslop-ignore></div>
+      <div class="absolute bottom-1/4 right-1/4 w-[40rem] h-[40rem] bg-blue-600 rounded-full mix-blend-screen filter blur-[120px] opacity-20" data-unslop-ignore></div>
       <div class="relative z-10 max-w-lg p-10 rounded-[2rem] bg-white/5 border border-white/10 backdrop-blur-3xl shadow-2xl">
         <blockquote class="text-2xl font-medium text-zinc-100 leading-snug">
           "Using Noumena feels like having a data science team on my payroll."

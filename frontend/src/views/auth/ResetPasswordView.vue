@@ -49,7 +49,7 @@ async function handleSubmit() {
 
 <template>
   <div class="min-h-screen bg-zinc-50 flex flex-col justify-center py-12 sm:px-6 lg:px-8 relative overflow-hidden">
-    <div class="absolute top-0 right-0 -mt-16 -mr-16 w-[28rem] h-[28rem] bg-gradient-to-br from-indigo-400 to-purple-400 rounded-full blur-[80px] opacity-20 pointer-events-none"></div>
+    <div class="absolute top-0 right-0 -mt-16 -mr-16 w-[28rem] h-[28rem] bg-gradient-to-br from-brand-500 to-brand-300 rounded-full blur-[80px] opacity-20 pointer-events-none" data-unslop-ignore></div>
 
     <div class="sm:mx-auto sm:w-full sm:max-w-md relative z-10">
       <div class="flex items-center justify-center gap-2 mb-8">
@@ -61,7 +61,7 @@ async function handleSubmit() {
         <span class="text-xl font-bold tracking-tight text-zinc-900">Noumena</span>
       </div>
 
-      <div class="bg-white py-10 px-8 shadow-sm ring-1 ring-zinc-950/5 rounded-2xl">
+      <div class="bg-white py-10 px-8 shadow-sm ring-1 ring-zinc-950/5 rounded-xl">
         <h2 class="text-2xl font-semibold tracking-tight text-zinc-900 mb-2">Set a new password</h2>
         <p class="text-zinc-500 text-sm mb-8">Choose a strong password you don't use anywhere else.</p>
 
