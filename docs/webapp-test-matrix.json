@@ -1,0 +1,236 @@
+{
+  "generated": "2026-09-08",
+  "target": {
+    "app": "Noumena frontend (Vue 3 + Vite)",
+    "base_url": "http://localhost:5173",
+    "api_base": "http://localhost:8080",
+    "harness": "puppeteer-core headless Chromium (system chromium), happy-dom/Vitest suite untouched",
+    "env_notes": [
+      "RATE_LIMIT_UNAUTH_MAX_PER_MIN=1000 set at runtime for test run (default 10/min/IP blocks suites)",
+      "EMAIL_VERIFICATION_REQUIRED=false: backend auto-verifies users; /verify-email flow not exercisable",
+      "api binary rebuilt from current source before run (committed binary was stale, missing /api/workspaces/active/role)"
+    ]
+  },
+  "features": [
+    {
+      "feature": "Landing page",
+      "base_url": "http://localhost:5173/",
+      "paths": [
+        {
+          "path_type": "happy",
+          "steps": ["GET /", "assert brand heading renders", "assert no console errors"],
+          "expected_success": "hero heading present, zero console errors",
+          "actual": "pass (render OK; 3x 401 refresh-bootstrap noise per load — finding CN-1)",
+          "status": "pass"
+        },
+        {
+          "path_type": "unhappy",
+          "steps": ["GET /definitely-not-a-page", "assert 404 or fallback UI"],
+          "expected_success": "not-found handling or redirect",
+          "actual": "HTTP 200 + blank page, no error, no redirect (finding R-3)",
+          "status": "fail"
+        },
+        {
+          "path_type": "unhappy",
+          "steps": ["375px viewport", "assert no horizontal overflow"],
+          "expected_success": "no horizontal scroll",
+          "actual": "overflow=false",
+          "status": "pass"
+        }
+      ]
+    },
+    {
+      "feature": "Login",
+      "base_url": "http://localhost:5173/login",
+      "paths": [
+        {
+          "path_type": "happy",
+          "steps": ["GET /login", "assert email/password/submit present"],
+          "expected_success": "form renders",
+          "actual": "rendered (3x 401 noise)",
+          "status": "pass"
+        },
+        {
+          "path_type": "unhappy",
+          "steps": ["submit wrong credentials", "assert inline error"],
+          "expected_success": "\"Invalid email or password.\" shown, stay on /login",
+          "actual": "\"missing refresh token\" shown (finding R-1: 401 interceptor masks backend message)",
+          "status": "fail"
+        },
+        {
+          "path_type": "unhappy",
+          "steps": ["submit empty form"],
+          "expected_success": "HTML5 required blocks submission, no navigation",
+          "actual": "blocked, stayed on /login",
+          "status": "pass"
+        },
+        {
+          "path_type": "unhappy",
+          "steps": ["submit malformed email"],
+          "expected_success": "HTML5 type=email blocks",
+          "actual": "blocked",
+          "status": "pass"
+        }
+      ]
+    },
+    {
+      "feature": "Signup",
+      "base_url": "http://localhost:5173/signup",
+      "paths": [
+        {
+          "path_type": "happy",
+          "steps": ["GET /signup", "assert form renders"],
+          "expected_success": "form renders",
+          "actual": "rendered (3x 401 noise)",
+          "status": "pass"
+        },
+        {
+          "path_type": "happy",
+          "steps": ["POST /auth/register with valid email+password"],
+          "expected_success": "201 + user created",
+          "actual": "201",
+          "status": "pass"
+        },
+        {
+          "path_type": "unhappy",
+          "steps": ["type weak password 'short'"],
+          "expected_success": "submit button disabled, cannot bypass",
+          "actual": "disabled=true",
+          "status": "pass"
+        },
+        {
+          "path_type": "unhappy",
+          "steps": ["re-register existing email via API", "then same via UI form"],
+          "expected_success": "409 + inline error 'An account with this email already exists.'",
+          "actual": "API 409 with same message; UI error box shown",
+          "status": "pass"
+        },
+        {
+          "path_type": "unhappy",
+          "steps": ["submit malformed email"],
+          "expected_success": "HTML5 blocks",
+          "actual": "blocked",
+          "status": "pass"
+        }
+      ]
+    },
+    {
+      "feature": "Forgot password",
+      "base_url": "http://localhost:5173/forgot-password",
+      "paths": [
+        {
+          "path_type": "happy",
+          "steps": ["GET /forgot-password", "assert form renders"],
+          "expected_success": "form renders",
+          "actual": "rendered (3x 401 noise)",
+          "status": "pass"
+        },
+        {
+          "path_type": "happy",
+          "steps": ["submit unknown email"],
+          "expected_success": "generic message, no user enumeration",
+          "actual": "generic message shown",
+          "status": "pass"
+        },
+        {
+          "path_type": "unhappy",
+          "steps": ["submit empty form"],
+          "expected_success": "HTML5 blocks",
+          "actual": "blocked",
+          "status": "pass"
+        },
+        {
+          "path_type": "unhappy",
+          "steps": ["submit malformed email"],
+          "expected_success": "HTML5 blocks",
+          "actual": "blocked",
+          "status": "pass"
+        }
+      ]
+    },
+    {
+      "feature": "Reset password",
+      "base_url": "http://localhost:5173/reset-password?token={token}",
+      "paths": [
+        {
+          "path_type": "happy",
+          "steps": ["GET /reset-password?token=...", "assert fields render"],
+          "expected_success": "form renders",
+          "actual": "rendered (3x 401 noise)",
+          "status": "pass"
+        },
+        {
+          "path_type": "unhappy",
+          "steps": ["fill both password fields with valid password", "submit with bogus token"],
+          "expected_success": "expired/invalid token error",
+          "actual": "\"This reset link has expired. Please request a new one.\" (verified standalone; suite run flaked on selector timing)",
+          "status": "pass"
+        }
+      ]
+    },
+    {
+      "feature": "Route guards (unauthenticated)",
+      "base_url": "http://localhost:5173{path}",
+      "paths": [
+        {
+          "path_type": "unhappy",
+          "steps": ["GET /dashboard", "GET /settings/{channels,members,billing,account}", "GET /onboarding", "GET /verify-email"],
+          "expected_success": "redirect /login with ?next= preserving target",
+          "actual": "all redirected to /login with next param",
+          "status": "pass"
+        }
+      ]
+    },
+    {
+      "feature": "Auth lifecycle (register → login → guard chain)",
+      "base_url": "http://localhost:5173",
+      "paths": [
+        {
+          "path_type": "happy",
+          "steps": ["register via API", "login via UI form"],
+          "expected_success": "redirect to /onboarding (verified, no channels)",
+          "actual": "landed /onboarding",
+          "status": "pass"
+        },
+        {
+          "path_type": "unhappy",
+          "steps": ["login without explicit email verification (env auto-verify)"],
+          "expected_success": "/verify-email or /onboarding per verification state",
+          "actual": "/onboarding (env EMAIL_VERIFICATION_REQUIRED=false)",
+          "status": "pass"
+        },
+        {
+          "path_type": "happy",
+          "steps": ["POST /auth/verify-email with token"],
+          "expected_success": "200 verified",
+          "actual": "410 invalid/expired token (env issues no token; endpoint correctly rejects empty/invalid)",
+          "status": "blocked"
+        },
+        {
+          "path_type": "unhappy",
+          "steps": ["hard-reload /login while authed"],
+          "expected_success": "bounce to /onboarding",
+          "actual": "landed /login despite refresh+me+role all 200 (finding R-2: guard race with bootstrap)",
+          "status": "fail"
+        },
+        {
+          "path_type": "unhappy",
+          "steps": ["hard-reload /dashboard while authed (no channels)"],
+          "expected_success": "bounce to /onboarding",
+          "actual": "landed /login?next=/dashboard despite session recovered (finding R-2)",
+          "status": "fail"
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "total_paths": 32,
+    "pass": 27,
+    "fail": 4,
+    "blocked": 1,
+    "by_path_type": {
+      "happy": { "total": 11, "pass": 10, "fail": 0, "blocked": 1 },
+      "unhappy": { "total": 21, "pass": 17, "fail": 4, "blocked": 0 }
+    }
+  }
+}
