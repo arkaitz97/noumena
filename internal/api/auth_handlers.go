@@ -759,6 +759,18 @@ func (h *AuthHandler) processGoogleCallback(ctx context.Context, code, state str
 	if err != nil {
 		return nil, fmt.Errorf("failed to create user: %w", err)
 	}
+	if claims.Name != "" {
+		trimmed := strings.TrimSpace(claims.Name)
+		if len(trimmed) > 100 {
+			trimmed = trimmed[:100]
+		}
+		if trimmed != "" {
+			_, _ = h.Queries.UpsertUserProfile(ctx, &db.UserProfile{
+				UserID:      user.ID,
+				DisplayName: &trimmed,
+			})
+		}
+	}
 	if h.DefaultWorkspaceCreator != nil {
 		_ = h.DefaultWorkspaceCreator(user.ID)
 	}

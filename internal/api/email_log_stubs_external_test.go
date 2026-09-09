@@ -98,3 +98,12 @@ func (m *MockQuery) ClearExportStoragePath(context.Context, string) error { retu
 func (m *MockQuery) GetUserExportBundle(context.Context, string) (*db.UserExportBundle, error) {
 	return nil, nil
 }
+
+func (m *MockQuery) GetUserProfile(context.Context, string) (*db.UserProfile, error) {
+	return nil, nil
+}
+
+func (m *MockQuery) UpsertUserProfile(_ context.Context, p *db.UserProfile) (*db.UserProfile, error) {
+	return p, nil
+}
+

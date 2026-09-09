@@ -46,6 +46,61 @@ hydration. Use it when you only need `{ id, email, email_verified }`.
   banners without extra round trips.
 - **Errors:** `401 unauthorized`, `404 not found`.
 
+### GET /api/user/profile
+
+- **Auth:** access JWT + email-verification.
+- **Response:** `200 OK`,
+  ```json
+  {
+    "user_id":                      "<uuid>",
+    "user_type":                    "creator",
+    "primary_goal":                 "understand_audience",
+    "primary_platform":             "youtube",
+    "content_topics":               ["tech", "software", "reviews"],
+    "audience_size_bucket":         "10k_50k",
+    "weekly_comment_volume_bucket": "100_1k",
+    "success_metric":               "engagement",
+    "role":                         "owner",
+    "team_size_bucket":             "solo",
+    "publishing_frequency_bucket":  "weekly",
+    "insight_priorities":           ["questions", "content_ideas"],
+    "current_workflow":             "native_tools",
+    "biggest_pain":                 "too_many_comments",
+    "created_at":                   "2026-01-15T11:22:33Z",
+    "updated_at":                   "2026-01-15T11:22:33Z"
+  }
+  ```
+  If the profile has not yet been initialized by the user, returns HTTP 200 with an empty default object where fields are `null` and arrays are `[]`.
+- **Errors:** `401 unauthorized`.
+
+### PATCH /api/user/profile
+
+- **Auth:** access JWT + email-verification.
+- **Request:** Partial JSON object with the fields to update:
+  ```json
+  {
+    "user_type": "creator",
+    "primary_goal": "generate_content_ideas",
+    "primary_platform": "youtube",
+    "role": "owner",
+    "content_topics": ["tech", "ai", "coding"],
+    "current_workflow": "native_tools",
+    "biggest_pain": "too_many_comments"
+  }
+  ```
+- **Validation:**
+  - `user_type`: `creator`, `agency`, `brand`, `other`.
+  - `primary_goal`: `understand_audience`, `generate_content_ideas`, `improve_retention`, `win_sponsorships`, `reduce_toxicity`, `report_to_clients`, `other`.
+  - `primary_platform`: `youtube`, `tiktok`, `instagram`, `other`.
+  - `role`: `owner`, `strategist`, `analyst`, `moderator`, `viewer`, `other`.
+  - `content_topics`: Array of up to 10 strings, max 40 characters each.
+  - `insight_priorities`: Array of up to 3 strings (`questions`, `content_ideas`, `criticism`, `toxicity`, `collaboration`, `sentiment`).
+  - Buckets (`audience_size_bucket`, `weekly_comment_volume_bucket`, `team_size_bucket`, `publishing_frequency_bucket`), `success_metric`, `current_workflow`, `biggest_pain`: validated against allowed enum options.
+- **Response:** `200 OK` with the upserted profile object.
+- **Errors:**
+  - `400 invalid request body` (unsupported enum values, length limits exceeded, malformed JSON).
+  - `401 unauthorized`.
+
 ### DELETE /api/user/account
 
 - **Auth:** access JWT + email-verification.
@@ -141,6 +196,16 @@ returns `202` with the existing reversible timestamp — idempotent.
 ## Example
 
 ```sh
+# Fetch creator profile
+curl -i https://api.noumena/api/user/profile \
+  -H "Authorization: Bearer ${ACCESS_TOKEN}"
+
+# Update creator profile
+curl -i -X PATCH https://api.noumena/api/user/profile \
+  -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  -d '{"user_type":"creator","primary_goal":"generate_content_ideas","content_topics":["tech","ai"]}'
+
 # Request account deletion
 curl -i -X DELETE https://api.noumena/api/user/account \
   -H "Authorization: Bearer ${ACCESS_TOKEN}" \
@@ -164,4 +229,5 @@ curl -i -X POST https://api.noumena/api/user/data-export \
   — support workflows + the `cancel_deletion` CLI.
 - Configuration variables in [`.env.example`](../../.env.example):
   `ACCOUNT_LIFECYCLE_API_ENABLED`, `LIFECYCLE_WORKERS_ENABLED`,
-  `DELETION_REVERSIBLE_HOURS`, `EXPORT_SIGNED_URL_SECRET`.
+  `DELETION_REVERSIBLE_HOURS`, `EXPORT_SIGNED_URL_SECRET`,
+  `DIGEST_PROFILE_CONTEXT_ENABLED`.

@@ -304,11 +304,19 @@ func (w *Worker) runUserDigest(ctx context.Context, user *db.User, weekStart, we
 
 	truth := w.computeTruth(ctx, user, weekStart, comments)
 
+	var profile *db.UserProfile
+	if isProfileContextEnabled() {
+		if p, err := w.Queries.GetUserProfile(ctx, user.ID); err == nil {
+			profile = p
+		}
+	}
+
 	prompt := BuildDigestPrompt(DigestPromptInputs{
 		Aggregates:     truth,
 		TopTopics:      computeTopTopics(comments, 10),
 		CategoryCounts: computeCategoryDistribution(comments),
 		SampleComments: selectSampleComments(comments, digestSampleLimit),
+		Profile:        profile,
 	})
 
 	// Per-user deadline so one stuck LLM chain can't stall the run loop.

@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"noumena/internal/db"
 )
 
 func newMockOpenCode(t *testing.T, raw string, errStr string, delay time.Duration) *opencodeClient {
@@ -154,3 +156,51 @@ func TestBuildDigestPrompt_ContainsGroundTruth(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildDigestPrompt_ProfileContext(t *testing.T) {
+	name := "Jane Developer"
+	userType := "creator"
+	goal := "understand_audience"
+	topics := []string{"golang", "systems"}
+	profile := &db.UserProfile{
+		DisplayName:   &name,
+		UserType:      &userType,
+		PrimaryGoal:   &goal,
+		ContentTopics: topics,
+	}
+
+	in := DigestPromptInputs{
+		Aggregates:     truthFixture(),
+		TopTopics:      []TopicAgg{{Topic: "videos", Count: 7}},
+		CategoryCounts: map[string]int{"praise": 12},
+		SampleComments: []string{"loved the last video"},
+		Profile:        profile,
+	}
+
+	// 1. Without flag enabled
+	t.Setenv("DIGEST_PROFILE_CONTEXT_ENABLED", "false")
+	outWithout := BuildDigestPrompt(in)
+	if strings.Contains(outWithout, "CREATOR PROFILE CONTEXT") {
+		t.Errorf("prompt should not contain profile context when flag is disabled")
+	}
+
+	// 2. With flag enabled
+	t.Setenv("DIGEST_PROFILE_CONTEXT_ENABLED", "true")
+	outWith := BuildDigestPrompt(in)
+	if !strings.Contains(outWith, "CREATOR PROFILE CONTEXT") {
+		t.Errorf("prompt should contain profile context when flag is enabled")
+	}
+	if !strings.Contains(outWith, "Creator Name: Jane Developer") {
+		t.Errorf("prompt missing creator name")
+	}
+	if !strings.Contains(outWith, "Role/Type: creator") {
+		t.Errorf("prompt missing creator role")
+	}
+	if !strings.Contains(outWith, "Primary Goal: understand_audience") {
+		t.Errorf("prompt missing understand_audience goal")
+	}
+	if !strings.Contains(outWith, "Topics of Interest: golang, systems") {
+		t.Errorf("prompt missing topics")
+	}
+}
+

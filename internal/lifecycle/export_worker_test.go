@@ -1,6 +1,7 @@
 package lifecycle
 
 import (
+	"archive/zip"
 	"context"
 	"errors"
 	"io"
@@ -233,3 +234,63 @@ func TestExportWorkerMarkFailureLeavesNoOrphan(t *testing.T) {
 		t.Fatalf("orphan zip left behind: %v", err)
 	}
 }
+
+func TestExportWorkerIncludesUserProfile(t *testing.T) {
+	ctx := context.Background()
+	database := dbtest.SetupTestDB(t)
+	q := db.NewSQLiteQuery(database).(*db.SQLiteQuery)
+	user := seedExportUser(t, q, "profile_export@example.com")
+
+	userType := "creator"
+	goal := "understand_audience"
+	topics := []string{"tech", "coding"}
+	if _, err := q.UpsertUserProfile(ctx, &db.UserProfile{
+		UserID:        user.ID,
+		UserType:      &userType,
+		PrimaryGoal:   &goal,
+		ContentTopics: topics,
+	}); err != nil {
+		t.Fatalf("UpsertUserProfile: %v", err)
+	}
+
+	job, err := q.EnqueueDataExport(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("EnqueueDataExport: %v", err)
+	}
+
+	w, cfg := newTestExportWorker(t, q)
+	w.processOne(ctx)
+
+	zipPath := filepath.Join(cfg.ExportStorageDir, user.ID, job.ID+".zip")
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		t.Fatalf("open zip: %v", err)
+	}
+	defer zr.Close()
+
+	var foundProfile bool
+	for _, f := range zr.File {
+		if f.Name == "profile/profile.json" {
+			foundProfile = true
+			rc, err := f.Open()
+			if err != nil {
+				t.Fatalf("open profile/profile.json: %v", err)
+			}
+			data, err := io.ReadAll(rc)
+			rc.Close()
+			if err != nil {
+				t.Fatalf("read profile/profile.json: %v", err)
+			}
+			if !strings.Contains(string(data), `"creator"`) {
+				t.Errorf("profile JSON missing 'creator': %s", string(data))
+			}
+			if !strings.Contains(string(data), `"understand_audience"`) {
+				t.Errorf("profile JSON missing 'understand_audience': %s", string(data))
+			}
+		}
+	}
+	if !foundProfile {
+		t.Errorf("profile/profile.json not found in ZIP export")
+	}
+}
+

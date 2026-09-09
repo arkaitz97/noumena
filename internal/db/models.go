@@ -42,6 +42,26 @@ type User struct {
 	UpdatedAt            time.Time  `json:"updated_at"`
 }
 
+type UserProfile struct {
+	UserID                    string     `json:"user_id"`
+	DisplayName               *string    `json:"display_name,omitempty"`
+	UserType                  *string    `json:"user_type,omitempty"`
+	PrimaryGoal               *string    `json:"primary_goal,omitempty"`
+	PrimaryPlatform           *string    `json:"primary_platform,omitempty"`
+	ContentTopics             []string   `json:"content_topics,omitempty"`
+	AudienceSizeBucket        *string    `json:"audience_size_bucket,omitempty"`
+	WeeklyCommentVolumeBucket *string    `json:"weekly_comment_volume_bucket,omitempty"`
+	SuccessMetric             *string    `json:"success_metric,omitempty"`
+	Role                      *string    `json:"role,omitempty"`
+	TeamSizeBucket            *string    `json:"team_size_bucket,omitempty"`
+	PublishingFrequencyBucket *string    `json:"publishing_frequency_bucket,omitempty"`
+	InsightPriorities         []string   `json:"insight_priorities,omitempty"`
+	CurrentWorkflow           *string    `json:"current_workflow,omitempty"`
+	BiggestPain               *string    `json:"biggest_pain,omitempty"`
+	CreatedAt                 time.Time  `json:"created_at"`
+	UpdatedAt                 time.Time  `json:"updated_at"`
+}
+
 type PlatformChannel struct {
 	ID                  string     `json:"id"`
 	Platform            string     `json:"platform"`

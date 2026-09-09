@@ -86,6 +86,7 @@ type IDClaims struct {
 	EmailVerified bool   `json:"email_verified"`
 	Aud           string `json:"aud"`
 	Iss           string `json:"iss"`
+	Name          string `json:"name,omitempty"`
 	jwt.RegisteredClaims
 }
 

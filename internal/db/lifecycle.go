@@ -89,6 +89,7 @@ type UserChannelTrackingRow struct {
 
 type UserExportBundle struct {
 	User     *User
+	Profile  *UserProfile
 	Tracking []*UserChannelTracking
 	Comments []*Comment
 	Digests  []*WeeklyDigest
@@ -467,6 +468,7 @@ func (q *SQLiteQuery) DeleteUserGDPRData(ctx context.Context, tx *sql.Tx, userID
 		{`DELETE FROM user_channel_tracking WHERE user_id = ?`, userID},
 		{`DELETE FROM weekly_digests WHERE user_id = ?`, userID},
 		{`DELETE FROM data_export_jobs WHERE user_id = ?`, userID},
+		{`DELETE FROM user_profiles WHERE user_id = ?`, userID},
 	}
 	for _, s := range stmts {
 		if _, err := tx.ExecContext(ctx, s.sql, s.arg); err != nil {
@@ -722,6 +724,9 @@ func (q *SQLiteQuery) GetUserExportBundle(ctx context.Context, userID string) (*
 		return nil, err
 	}
 	bundle := &UserExportBundle{User: user}
+	if prof, err := q.GetUserProfile(ctx, userID); err == nil {
+		bundle.Profile = prof
+	}
 
 	// The bundle is the long read of the GDPR export flow; run it on the
 	// query_only export handle so it never occupies the main pool's

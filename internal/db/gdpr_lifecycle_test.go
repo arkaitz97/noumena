@@ -41,6 +41,7 @@ func seedGDPRUser(t *testing.T, ctx context.Context, q DBQuery, userID, wsCreate
 	mustExec(`INSERT INTO weekly_digests (id, user_id, week_start_date) VALUES ('wd1', ?, '2026-08-31')`, userID)
 	mustExec(`INSERT INTO data_export_jobs (id, user_id, status) VALUES ('de1', ?, 'completed')`, userID)
 	mustExec(`INSERT INTO account_deletion_jobs (id, user_id, status) VALUES ('ad1', ?, 'pending')`, userID)
+	mustExec(`INSERT INTO user_profiles (user_id, user_type) VALUES (?, 'creator')`, userID)
 }
 
 // userRowCount returns the number of rows in table for the given user_id
@@ -74,6 +75,7 @@ var gdprUserTables = []string{
 	"user_channel_tracking",
 	"weekly_digests",
 	"data_export_jobs",
+	"user_profiles",
 }
 
 func testGDPRWipe(t *testing.T, fkOff bool) {

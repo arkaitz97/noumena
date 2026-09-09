@@ -487,3 +487,25 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_user_created
 
 CREATE INDEX IF NOT EXISTS idx_audit_log_action_created
     ON audit_log(action, created_at DESC);
+
+-- Progressive user profile attributes
+CREATE TABLE IF NOT EXISTS user_profiles (
+    user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    display_name TEXT CHECK (display_name IS NULL OR length(display_name) <= 100),
+    user_type TEXT CHECK (user_type IS NULL OR user_type IN ('creator', 'agency', 'brand', 'other')),
+    primary_goal TEXT CHECK (primary_goal IS NULL OR primary_goal IN ('understand_audience', 'generate_content_ideas', 'improve_retention', 'win_sponsorships', 'reduce_toxicity', 'report_to_clients', 'other')),
+    primary_platform TEXT CHECK (primary_platform IS NULL OR primary_platform IN ('youtube', 'tiktok', 'instagram', 'other')),
+    content_topics TEXT,
+    audience_size_bucket TEXT CHECK (audience_size_bucket IS NULL OR audience_size_bucket IN ('under_1k', '1k_10k', '10k_50k', '50k_500k', '500k_1m', 'over_1m', 'prefer_not_to_say')),
+    weekly_comment_volume_bucket TEXT CHECK (weekly_comment_volume_bucket IS NULL OR weekly_comment_volume_bucket IN ('under_100', '100_1k', '1k_10k', '10k_100k', 'over_100k', 'prefer_not_to_say')),
+    success_metric TEXT CHECK (success_metric IS NULL OR success_metric IN ('views', 'watch_time', 'subscribers', 'engagement', 'sentiment', 'sponsor_deals', 'product_sales', 'client_reports', 'other')),
+    role TEXT CHECK (role IS NULL OR role IN ('owner', 'strategist', 'analyst', 'moderator', 'viewer', 'other')),
+    team_size_bucket TEXT CHECK (team_size_bucket IS NULL OR team_size_bucket IN ('solo', '2_5', '6_20', '21_plus', 'prefer_not_to_say')),
+    publishing_frequency_bucket TEXT CHECK (publishing_frequency_bucket IS NULL OR publishing_frequency_bucket IN ('daily', 'several_weekly', 'weekly', 'biweekly', 'monthly', 'irregular', 'prefer_not_to_say')),
+    insight_priorities TEXT,
+    current_workflow TEXT CHECK (current_workflow IS NULL OR current_workflow IN ('native_tools', 'spreadsheets', 'moderation_tool', 'agency_dashboard', 'none', 'other')),
+    biggest_pain TEXT CHECK (biggest_pain IS NULL OR biggest_pain IN ('too_many_comments', 'missed_feedback', 'toxicity', 'reporting_time', 'unclear_content_plan', 'team_visibility', 'other')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+

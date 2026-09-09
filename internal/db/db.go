@@ -150,6 +150,10 @@ type DBQuery interface {
 	GetUserByID(ctx context.Context, id string) (*User, error)
 	UpdateUserSubscription(ctx context.Context, userID, plan, stripeCustomerID string, quota int) error
 
+	// User Profiles (enrich-user-profiles)
+	GetUserProfile(ctx context.Context, userID string) (*UserProfile, error)
+	UpsertUserProfile(ctx context.Context, profile *UserProfile) (*UserProfile, error)
+
 	// Users (auth)
 	CreateUserWithPassword(ctx context.Context, email, passwordHash string) (*User, error)
 	CreateUserGoogle(ctx context.Context, email, googleSub string) (*User, error)

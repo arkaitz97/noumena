@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
+
+	"noumena/internal/db"
 )
 
 // digestCallTimeout is the per-call context timeout (Spec 06: per-call
@@ -19,6 +22,10 @@ const digestCallTimeout = 90 * time.Second
 // synthesis.
 const digestSampleLimit = 30
 
+func isProfileContextEnabled() bool {
+	return os.Getenv("DIGEST_PROFILE_CONTEXT_ENABLED") == "true"
+}
+
 // DigestPromptInputs is the structured payload BuildDigestPrompt converts
 // into the LLM-facing string. Keeping the inputs as a struct (rather than
 // passing 10 args) makes unit tests for the prompt builder readable.
@@ -27,6 +34,7 @@ type DigestPromptInputs struct {
 	TopTopics      []TopicAgg
 	CategoryCounts map[string]int
 	SampleComments []string
+	Profile        *db.UserProfile
 }
 
 // BuildDigestPrompt produces the LLM prompt described in Spec 06. Numeric
@@ -68,6 +76,28 @@ func BuildDigestPrompt(in DigestPromptInputs) string {
 		for i, s := range in.SampleComments {
 			s = strings.ReplaceAll(s, "\n", " ")
 			fmt.Fprintf(&b, "  [%d] %s\n", i, s)
+		}
+	}
+
+	if isProfileContextEnabled() && in.Profile != nil {
+		var profileParts []string
+		if in.Profile.DisplayName != nil && *in.Profile.DisplayName != "" {
+			profileParts = append(profileParts, fmt.Sprintf("Creator Name: %s", *in.Profile.DisplayName))
+		}
+		if in.Profile.UserType != nil && *in.Profile.UserType != "" {
+			profileParts = append(profileParts, fmt.Sprintf("Role/Type: %s", *in.Profile.UserType))
+		}
+		if in.Profile.PrimaryGoal != nil && *in.Profile.PrimaryGoal != "" {
+			profileParts = append(profileParts, fmt.Sprintf("Primary Goal: %s", *in.Profile.PrimaryGoal))
+		}
+		if len(in.Profile.ContentTopics) > 0 {
+			profileParts = append(profileParts, fmt.Sprintf("Topics of Interest: %s", strings.Join(in.Profile.ContentTopics, ", ")))
+		}
+		if len(profileParts) > 0 {
+			b.WriteString("\nCREATOR PROFILE CONTEXT (prioritize insights aligned with these declared goals):\n")
+			for _, part := range profileParts {
+				fmt.Fprintf(&b, "  - %s\n", part)
+			}
 		}
 	}
 

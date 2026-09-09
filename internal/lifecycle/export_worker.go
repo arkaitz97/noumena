@@ -315,6 +315,7 @@ func (w *ExportWorker) writeZip(path string, bundle *db.UserExportBundle) (bool,
 	}
 	sections := []section{
 		{"account/user.json", bundle.User},
+		{"profile/profile.json", bundle.Profile},
 		{"channels/tracking.json", bundle.Tracking},
 		{"comments/comments.json", bundle.Comments},
 		{"insights/digests.json", bundle.Digests},

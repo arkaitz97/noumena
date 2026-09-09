@@ -336,6 +336,9 @@ func main() {
 		Billing:  billingClient,
 		Cfg:      config.Default,
 	}
+	profileHandler := &api.ProfileHandler{
+		Queries: queries,
+	}
 	if config.Default.LifecycleWorkersEnabled {
 		if sq, ok := queries.(*db.SQLiteQuery); ok && sq.DB() != nil {
 			delWorker := &lifecycle.DeletionWorker{
@@ -526,20 +529,23 @@ func main() {
 			r.Get("/user/data-export/{id}/status", accountHandler.GetExportStatus)
 		}
 
+		r.Get("/user/rate-limit-status", userHandler.GetRateLimitStatus)
+		r.Get("/user/token-expiry", userHandler.GetTokenExpiry)
+		r.Get("/user/me", accountHandler.GetProfile)
+		r.Patch("/user/me", accountHandler.PatchProfile)
+		r.Get("/user/profile", profileHandler.GetProfile)
+		r.Patch("/user/profile", profileHandler.PatchProfile)
+		r.Patch("/user/preferences", digestHandler.UpdatePreferences)
+
 		r.Group(func(r chi.Router) {
 			r.Use(api.WorkspaceMiddleware(queries))
 
 			r.Get("/channels", channelHandler.List)
 			r.Get("/channels/{id}/status", channelHandler.Status)
 			r.Get("/channels/{id}/sync-status", channelHandler.SyncStatus)
-			r.Get("/user/rate-limit-status", userHandler.GetRateLimitStatus)
-			r.Get("/user/token-expiry", userHandler.GetTokenExpiry)
-			r.Get("/user/me", accountHandler.GetProfile)
-			r.Patch("/user/me", accountHandler.PatchProfile)
 
 			r.Get("/digests", digestHandler.List)
 			r.Get("/digests/latest", digestHandler.Latest)
-			r.Patch("/user/preferences", digestHandler.UpdatePreferences)
 
 			r.Post("/events", eventHandler.Track)
 
