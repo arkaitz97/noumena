@@ -1,0 +1,1 @@
+/home/arkaitz/Documents/world_kb/agents/linus-torvalds.md
