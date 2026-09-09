@@ -59,7 +59,10 @@ test.describe('channels', () => {
     await card.getByRole('button', { name: 'Remove channel' }).click()
     await page.getByRole('dialog').getByRole('button', { name: 'Cancel' }).click()
 
-    await expect(page.getByText('Cooking Lab', { exact: true })).toBeVisible()
+    // Modal closes (leave transition ~150ms) and the channel survives.
+    await expect(page.getByRole('dialog')).toHaveCount(0)
+    await expect(card).toBeVisible()
+    expect(mockState.channels.find((c) => c.display_name === 'Cooking Lab')).toBeTruthy()
   })
 
   test('connect modal offers the backfill window picker', async ({ page, mockState }) => {

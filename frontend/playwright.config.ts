@@ -9,13 +9,11 @@
 //   3. Isolated — a fresh MockState per test via the `test` fixture in
 //      support/fixtures.ts. No shared cookies, no shared database.
 //
-// Running against the real backend instead: set E2E_REAL_API=1 and point
-// PLAYWRIGHT_BASE_URL at a fully provisioned environment. The specs use
-// env-driven credentials (E2E_TEST_EMAIL / E2E_TEST_PASSWORD) and seed
-// nothing — they assume a verified, onboarded user exists.
+// Running against a deployed environment instead: point
+// PLAYWRIGHT_BASE_URL at it (specs assume a verified, onboarded user
+// exists there — see E2E_TEST_EMAIL / E2E_TEST_PASSWORD in the specs).
 import { defineConfig, devices } from '@playwright/test'
 
-const REAL_API = process.env.E2E_REAL_API === '1'
 const PORT = Number(process.env.PLAYWRIGHT_PORT ?? 5173)
 const BASE_URL = process.env.PLAYWRIGHT_BASE_URL ?? `http://localhost:${PORT}`
 
@@ -39,22 +37,15 @@ export default defineConfig({
     video: 'retain-on-failure',
   },
 
-  // The SPA is served by the Vite dev server. In mock mode no backend is
-  // required: all `/api` and `/auth` traffic is intercepted in the browser
-  // by the mock harness before it leaves the page.
-  webServer: REAL_API
-    ? {
-        command: 'npm run dev -- --port 5173 --strictPort',
-        url: BASE_URL,
-        reuseExistingServer: !process.env.CI,
-        timeout: 60_000,
-      }
-    : {
-        command: 'npm run dev -- --port 5173 --strictPort',
-        url: `${BASE_URL}/`,
-        reuseExistingServer: !process.env.CI,
-        timeout: 60_000,
-      },
+  // The SPA is served by `vite preview` of the PRODUCTION build — tests
+  // should exercise what ships, and Vite's dev-mode module transform can
+  // behave nondeterministically under parallel workers.
+  webServer: {
+    command: 'npm run build && npx vite preview --port 5173 --strictPort --host 127.0.0.1',
+    url: `${BASE_URL}/`,
+    reuseExistingServer: !process.env.CI,
+    timeout: 120_000,
+  },
 
   projects: [
     {

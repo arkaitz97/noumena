@@ -311,6 +311,7 @@ function handleApi(route: Route, state: MockState): boolean {
 
   // ---- exports ---------------------------------------------------------------
   if (path === '/api/comments/export' && method === 'POST') {
+    state.calls.push({ method, path, body: bodyOf(route) ?? {} })
     if (state.exportFails) return respond(route, 500, { error: 'export unavailable' })
     const body = bodyOf(route) ?? {}
     const format = String(body.format ?? 'csv')

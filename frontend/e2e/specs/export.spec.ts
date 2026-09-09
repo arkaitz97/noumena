@@ -43,7 +43,7 @@ test.describe('comment export', () => {
     await openExportModal(page)
     await page.getByRole('button', { name: 'Start export' }).click()
 
-    await expect(page.getByText('Export queued', { exact: false })).toBeVisible()
+    await expect(page.getByText(/Export queued — we'll show the download here when/)).toBeVisible()
     // The store polls /comments/export/:id/status every 5s; the mock
     // completes on the first poll. Generous budget for CI.
     await expect(page.getByText('Export Completed')).toBeVisible({ timeout: 20_000 })
@@ -57,7 +57,9 @@ test.describe('comment export', () => {
     await page.getByRole('button', { name: 'Start export' }).click()
     await expect(page.getByText('Export Completed')).toBeVisible()
 
-    await page.getByRole('button', { name: 'Dismiss' }).click()
+    // Panel dismiss button (the toast's own dismiss is aria-label-only,
+    // so the text match is unique to the export panel).
+    await page.getByText('Dismiss').click()
 
     await expect(page.getByText('Export Completed')).toHaveCount(0)
   })

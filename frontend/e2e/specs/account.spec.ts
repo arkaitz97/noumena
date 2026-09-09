@@ -47,7 +47,7 @@ test.describe('password change', () => {
     await page.getByLabel('Email').fill(VERIFIED_EMAIL)
     await page.getByLabel('Password', { exact: true }).fill(TEST_PASSWORD)
     await page.getByRole('button', { name: 'Sign in', exact: true }).click()
-    await expect(page.getByText('Invalid email or password.')).toBeVisible()
+    await expect(page.getByText('invalid credentials')).toBeVisible()
 
     await page.getByLabel('Password', { exact: true }).fill(NEW_PASSWORD)
     await page.getByRole('button', { name: 'Sign in', exact: true }).click()

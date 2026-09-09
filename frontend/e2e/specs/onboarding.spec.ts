@@ -38,6 +38,31 @@ test.describe('onboarding', () => {
     await expect(page.getByRole('heading', { name: 'Connect your YouTube channel' })).toBeVisible()
   })
 
+/** The popup helper attaches its message listener asynchronously (after the
+ *  auth-URL fetch resolves), so deliver the oauth-code message with a
+ *  bounded retry until the wizard advances to the sync step. The wizard
+ *  generates its own state token (sessionStorage) — echo it back. */
+async function deliverOauthCode(page: import('@playwright/test').Page): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const onStep3 = await page
+      .getByRole('heading', { name: 'Syncing your channel' })
+      .isVisible()
+      .catch(() => false)
+    if (onStep3) return
+    await page.evaluate(() => {
+      const state = sessionStorage.getItem('oauth_state_youtube') ?? ''
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          origin: window.location.origin,
+          data: { type: 'oauth-code', provider: 'youtube', code: 'mock-code', state },
+        }),
+      )
+    })
+    await page.waitForTimeout(250)
+  }
+  throw new Error('onboarding never reached the sync step — oauth message not accepted')
+}
+
 test('backfill progress below the threshold keeps Continue locked', async ({ page, mockState }) => {
     mockState.backfillProgress = 5
 
@@ -51,17 +76,8 @@ test('backfill progress below the threshold keeps Continue locked', async ({ pag
     await page.getByRole('button', { name: 'Get started' }).click()
     await page.getByRole('button', { name: 'Continue with YouTube' }).click()
 
-    // Deliver the oauth-code message AFTER the listener is attached.
-    await page.evaluate(() => {
-      window.dispatchEvent(
-        new MessageEvent('message', {
-          origin: window.location.origin,
-          data: { type: 'oauth-code', provider: 'youtube', code: 'mock-code', state: 'mock-youtube-state' },
-        }),
-      )
-    })
+    await deliverOauthCode(page)
 
-    await expect(page.getByRole('heading', { name: 'Syncing your channel' })).toBeVisible()
     await expect(page.getByRole('button', { name: /Syncing…/ })).toBeDisabled()
   })
 
@@ -74,14 +90,8 @@ test('backfill progress below the threshold keeps Continue locked', async ({ pag
     await gotoAs(page, mockState, 'no-channels', '/onboarding')
     await page.getByRole('button', { name: 'Get started' }).click()
     await page.getByRole('button', { name: 'Continue with YouTube' }).click()
-    await page.evaluate(() => {
-      window.dispatchEvent(
-        new MessageEvent('message', {
-          origin: window.location.origin,
-          data: { type: 'oauth-code', provider: 'youtube', code: 'mock-code', state: 'mock-youtube-state' },
-        }),
-      )
-    })
+
+    await deliverOauthCode(page)
 
     // The mock exchange registered the new channel, so after the sync
     // completes the wizard auto-navigates into the real dashboard.
