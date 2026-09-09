@@ -18,17 +18,27 @@ function makeFilters(overrides: Partial<FeedFilters> = {}): FeedFilters {
 }
 
 describe('FilterBar', () => {
-  it('renders the insight type filter in feed variant', () => {
+  async function openFiltersPanel(wrapper: ReturnType<typeof mount>) {
+    await wrapper.get('button[aria-label="Toggle filters"]').trigger('click')
+  }
+
+  async function openDateMenu(wrapper: ReturnType<typeof mount>) {
+    await wrapper.get('button[aria-label="Select date range"]').trigger('click')
+  }
+
+  it('renders the insight type filter in the feed filters panel', async () => {
     const wrapper = mount(FilterBar, {
       props: { filters: makeFilters(), channels: [], variant: 'feed' },
     })
+    await openFiltersPanel(wrapper)
     expect(wrapper.text()).toContain('Insight type')
   })
 
-  it('hides the insight type filter in saved variant', () => {
+  it('hides the insight type filter in saved variant', async () => {
     const wrapper = mount(FilterBar, {
       props: { filters: makeFilters(), channels: [], variant: 'saved' },
     })
+    await openFiltersPanel(wrapper)
     expect(wrapper.text()).not.toContain('Insight type')
   })
 
@@ -40,17 +50,22 @@ describe('FilterBar', () => {
     expect(wrapper.emitted('reset')).toBeTruthy()
   })
 
-  it('emits update:range when a date preset is clicked (screen-wide insights range)', async () => {
+  it('emits update:range when a date preset is picked in the range popover (screen-wide insights range)', async () => {
     const wrapper = mount(FilterBar, {
       props: { filters: makeFilters(), channels: [], variant: 'feed', range: '7d' as WindowKey },
     })
-    const preset = wrapper.findAll('button').find((b) => b.text() === '30D')
+    // Trigger labels the current range (Stripe-style).
+    expect(wrapper.get('button[aria-label="Select date range"]').text()).toContain('Last 7 days')
+    await openDateMenu(wrapper)
+    const preset = wrapper.findAll('button[role="menuitemradio"]').find((b) => b.text() === 'Last 30 days')
     expect(preset).toBeTruthy()
     await preset!.trigger('click')
     expect(wrapper.emitted('update:range')).toEqual([['30d']])
+    // Popover closes after picking.
+    expect(wrapper.find('[aria-label="Date range options"]').exists()).toBe(false)
   })
 
-  it('highlights the bound range preset, not the materialised custom dates', () => {
+  it('marks the bound range preset active in the popover, not the materialised custom dates', async () => {
     const wrapper = mount(FilterBar, {
       props: {
         filters: makeFilters({ date_from: '2026-08-10', date_to: '2026-09-09' }),
@@ -59,10 +74,9 @@ describe('FilterBar', () => {
         range: '30d' as WindowKey,
       },
     })
-    const presets = wrapper
-      .findAll('button')
-      .filter((b) => ['7D', '30D', '90D', 'CUSTOM'].includes(b.text()))
-    const active = presets.filter((b) => b.attributes('aria-pressed') === 'true')
-    expect(active.map((b) => b.text())).toEqual(['30D'])
+    await openDateMenu(wrapper)
+    const items = wrapper.findAll('button[role="menuitemradio"]')
+    const active = items.filter((b) => b.attributes('aria-pressed') === 'true')
+    expect(active.map((b) => b.text())).toEqual(['Last 30 days'])
   })
 })

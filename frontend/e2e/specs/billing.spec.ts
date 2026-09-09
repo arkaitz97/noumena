@@ -60,13 +60,4 @@ test.describe('billing', () => {
     const call = mockState.calls.find((c) => c.path === '/api/billing/checkout')!
     expect(call.body).toMatchObject({ plan: 'creator', interval: 'annual' })
   })
-
-  test('dashboard links to billing when the plan is near its limit', async ({ page, mockState }) => {
-    await gotoAs(page, mockState, 'verified', '/dashboard')
-
-    await expect(page.getByRole('link', { name: 'Upgrade plan →' })).toBeVisible()
-    await page.getByRole('link', { name: 'Upgrade plan →' }).click()
-
-    await expect(page).toHaveURL(/\/settings\/billing$/)
-  })
 })

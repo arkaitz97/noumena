@@ -105,7 +105,6 @@ interface InsightsState {
 - **Right sidebar** (desktop only):
   - Latest Weekly Digest preview card
   - Top topics cloud
-  - Sentiment mini chart (7-day sparkline)
 
 #### Interactions
 - Infinite scroll: offset-based, load next 20 when scrolling near bottom

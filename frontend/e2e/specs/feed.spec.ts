@@ -5,6 +5,11 @@ import { expect, gotoAs, test } from '../support/fixtures'
 const GPU_COMMENT = 'Love the deep dive on the new GPU'
 const SOURDOUGH_COMMENT = 'Does the sourdough method work at high altitude?'
 
+// Chip filters live behind the "Filters" popover in the compact bar.
+async function openFilters(page: import('@playwright/test').Page) {
+  await page.getByRole('button', { name: 'Toggle filters' }).click()
+}
+
 test.describe('feed rendering', () => {
   test('dashboard renders summary cards and comment list', async ({ page, mockState }) => {
     await gotoAs(page, mockState, 'verified', '/dashboard')
@@ -12,7 +17,7 @@ test.describe('feed rendering', () => {
     await expect(page.getByRole('heading', { name: 'Insights feed' })).toBeVisible()
     // Summary cards.
     await expect(page.getByText('Toxicity shield').first()).toBeVisible()
-    await expect(page.getByText('Quota', { exact: true })).toBeVisible()
+    await expect(page.getByText('Top insight type')).toBeVisible()
     // Real comment rows from the (mocked) feed.
     await expect(page.getByText(GPU_COMMENT)).toBeVisible()
     await expect(page.getByText(SOURDOUGH_COMMENT)).toBeVisible()
@@ -37,6 +42,7 @@ test.describe('filters', () => {
 
     // 'Praise' is active by default (high-signal set). Clicking the active
     // chip deactivates it → praise comments disappear, others remain.
+    await openFilters(page)
     await page.getByRole('button', { name: 'Praise', exact: true }).click()
 
     await expect(page.getByText(GPU_COMMENT)).toHaveCount(0)
@@ -48,6 +54,7 @@ test.describe('filters', () => {
     await gotoAs(page, mockState, 'verified', '/dashboard')
     await expect(page.getByText(GPU_COMMENT)).toBeVisible()
 
+    await openFilters(page)
     await page.getByRole('button', { name: 'Video Ideas' }).click()
 
     await expect(page.getByText('You should make a follow-up covering undervolting settings.')).toBeVisible()
@@ -58,6 +65,7 @@ test.describe('filters', () => {
   test('sort order persists to the URL', async ({ page, mockState }) => {
     await gotoAs(page, mockState, 'verified', '/dashboard')
 
+    await openFilters(page)
     await page.getByRole('button', { name: 'Oldest', exact: true }).click()
 
     await expect(page).toHaveURL(/sort=oldest/)

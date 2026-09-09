@@ -218,6 +218,10 @@ function dismissTokenExpiry() {
         </RouterLink>
       </div>
 
+      <div class="px-3 py-4 border-b border-zinc-100 dark:border-white/5">
+        <WorkspaceSwitcher />
+      </div>
+
       <nav class="flex-1 px-3 py-5 space-y-1">
         <p class="eyebrow px-3 pb-2">Workspace</p>
         <RouterLink
@@ -240,18 +244,93 @@ function dismissTokenExpiry() {
         </RouterLink>
       </nav>
 
-      <div class="px-6 py-4 border-t border-zinc-100 dark:border-zinc-800">
-        <p class="font-mono text-[11px] text-zinc-400 dark:text-zinc-600 tracking-wide">© {{ new Date().getFullYear() }} Noumena</p>
+      <div class="px-3 py-4 border-t border-zinc-100 dark:border-zinc-800 space-y-3">
+        <div ref="menuRef" class="relative" @keydown="onMenuKeydown">
+          <div class="flex items-center gap-2">
+            <button
+              ref="menuTriggerRef"
+              @click.stop="toggleMenu"
+              class="flex-1 min-w-0 flex items-center gap-2 pl-1.5 pr-2.5 py-1.5 min-h-10 rounded-full border border-zinc-200 dark:border-white/10 hover:border-zinc-300 dark:hover:border-white/20 hover:bg-zinc-50 dark:hover:bg-zinc-800/60 transition-all duration-200 ease-snappy active:scale-[0.98] shadow-card dark:shadow-none"
+              :aria-expanded="menuOpen"
+              aria-haspopup="menu"
+            >
+              <span class="h-7 w-7 shrink-0 rounded-full bg-gradient-to-br from-brand-400 to-brand-600 text-white font-bold text-xs flex items-center justify-center shadow-card ring-1 ring-white/20">
+                {{ userInitial }}
+              </span>
+              <span class="flex-1 min-w-0 text-left text-sm font-medium text-zinc-700 dark:text-zinc-300 truncate">
+                {{ auth.user?.email || 'Account' }}
+              </span>
+              <ChevronDown class="w-4 h-4 shrink-0 text-zinc-500 dark:text-zinc-400" :class="menuOpen && 'rotate-180'" />
+            </button>
+
+            <button
+              @click="toggleDarkMode"
+              class="flex items-center justify-center h-10 w-10 shrink-0 rounded-lg text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100/80 dark:hover:bg-white/5 hover:text-zinc-900 dark:hover:text-white transition-all duration-200 active:scale-95"
+              :aria-label="isDark ? 'Switch to light mode' : 'Switch to dark mode'"
+            >
+              <Sun v-if="isDark" class="w-4 h-4" />
+              <Moon v-else class="w-4 h-4" />
+            </button>
+          </div>
+
+          <transition name="menu">
+            <div
+              v-if="menuOpen"
+              role="menu"
+              aria-label="User menu"
+              class="absolute left-0 bottom-full mb-2 w-60 bg-white dark:bg-zinc-900 shadow-pop ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl py-2 origin-bottom-left z-50"
+            >
+              <div class="px-4 py-3 border-b border-zinc-100 dark:border-zinc-800">
+                <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400">Signed in as</p>
+                <p class="text-sm font-semibold text-zinc-900 dark:text-zinc-100 truncate">{{ auth.user?.email || '—' }}</p>
+              </div>
+              <div class="py-1">
+                <RouterLink
+                  to="/settings/account"
+                  role="menuitem"
+                  @click="menuOpen = false"
+                  class="flex items-center gap-2 px-4 py-2 text-sm text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                >
+                  <Settings class="w-4 h-4" /> Settings
+                </RouterLink>
+                <RouterLink
+                  v-if="isAdmin"
+                  to="/settings/members"
+                  role="menuitem"
+                  @click="menuOpen = false"
+                  class="flex items-center gap-2 px-4 py-2 text-sm text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                >
+                  <Users class="w-4 h-4" /> Manage members
+                </RouterLink>
+                <button
+                  role="menuitem"
+                  @click="handleLogout"
+                  class="w-full text-left flex items-center gap-2 px-4 py-2 text-sm text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                >
+                  <LogOut class="w-4 h-4" /> Log out
+                </button>
+                <button
+                  role="menuitem"
+                  @click="handleLogoutAll"
+                  class="w-full text-left flex items-center gap-2 px-4 py-2 text-sm text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/30"
+                >
+                  <Users class="w-4 h-4" /> Log out of all devices
+                </button>
+              </div>
+            </div>
+          </transition>
+        </div>
+
+        <p class="px-3 font-mono text-[11px] text-zinc-400 dark:text-zinc-600 tracking-wide">© {{ new Date().getFullYear() }} Noumena</p>
       </div>
     </aside>
 
     <!-- Main column -->
     <div class="flex-1 flex flex-col min-w-0">
-      <!-- Top bar -->
-      <header class="bg-white/70 dark:bg-zinc-950/70 backdrop-blur-xl border-b border-zinc-200/60 dark:border-white/5 sticky top-0 z-30 supports-[backdrop-filter]:bg-white/60 dark:supports-[backdrop-filter]:bg-zinc-900/60">
-        <div class="px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">
-          <!-- Mobile brand + hamburger -->
-          <div class="lg:hidden flex items-center gap-2 min-w-0">
+      <!-- Mobile top bar -->
+      <div class="lg:hidden sticky top-0 z-30 bg-white/70 dark:bg-zinc-950/70 backdrop-blur-xl border-b border-zinc-200/60 dark:border-white/5 supports-[backdrop-filter]:bg-white/60 dark:supports-[backdrop-filter]:bg-zinc-900/60">
+        <div class="px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
+          <div class="flex items-center gap-2 min-w-0">
             <button
               ref="hamburgerRef"
               type="button"
@@ -268,101 +347,30 @@ function dismissTokenExpiry() {
             </RouterLink>
           </div>
 
-          <div class="hidden lg:flex items-center gap-3 flex-1">
-            <WorkspaceSwitcher />
-          </div>
-
-          <div class="flex items-center gap-2">
-            <button
-              @click="toggleDarkMode"
-              class="flex items-center justify-center h-10 w-10 rounded-lg text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100/80 dark:hover:bg-white/5 hover:text-zinc-900 dark:hover:text-white transition-all duration-200 active:scale-95"
-              :aria-label="isDark ? 'Switch to light mode' : 'Switch to dark mode'"
-            >
-              <Sun v-if="isDark" class="w-4 h-4" />
-              <Moon v-else class="w-4 h-4" />
-            </button>
-
-            <div ref="menuRef" class="relative" @keydown="onMenuKeydown">
-              <button
-                ref="menuTriggerRef"
-                @click.stop="toggleMenu"
-                class="flex items-center gap-2 pl-1.5 pr-2.5 py-1.5 min-h-10 rounded-full border border-zinc-200 dark:border-white/10 hover:border-zinc-300 dark:hover:border-white/20 hover:bg-zinc-50 dark:hover:bg-zinc-800/60 transition-all duration-200 ease-snappy active:scale-[0.98] shadow-card dark:shadow-none"
-                :aria-expanded="menuOpen"
-                aria-haspopup="menu"
-              >
-                <span class="h-7 w-7 rounded-full bg-gradient-to-br from-brand-400 to-brand-600 text-white font-bold text-xs flex items-center justify-center shadow-card ring-1 ring-white/20">
-                  {{ userInitial }}
-                </span>
-                <span class="hidden sm:inline text-sm font-medium text-zinc-700 dark:text-zinc-300 max-w-[12rem] truncate">
-                  {{ auth.user?.email || 'Account' }}
-                </span>
-                <ChevronDown class="w-4 h-4 text-zinc-500 dark:text-zinc-400" />
-              </button>
-
-              <transition name="menu">
-                <div
-                  v-if="menuOpen"
-                  role="menu"
-                  aria-label="User menu"
-                  class="absolute right-0 mt-2 w-64 bg-white dark:bg-zinc-900 shadow-pop ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl py-2 origin-top-right"
-                >
-                  <div class="px-4 py-3 border-b border-zinc-100 dark:border-zinc-800">
-                    <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400">Signed in as</p>
-                    <p class="text-sm font-semibold text-zinc-900 dark:text-zinc-100 truncate">{{ auth.user?.email || '—' }}</p>
-                  </div>
-                  <div class="py-1">
-                    <RouterLink
-                      to="/settings/account"
-                      role="menuitem"
-                      @click="menuOpen = false"
-                      class="flex items-center gap-2 px-4 py-2 text-sm text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
-                    >
-                      <Settings class="w-4 h-4" /> Settings
-                    </RouterLink>
-                    <RouterLink
-                      v-if="isAdmin"
-                      to="/settings/members"
-                      role="menuitem"
-                      @click="menuOpen = false"
-                      class="flex items-center gap-2 px-4 py-2 text-sm text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
-                    >
-                      <Users class="w-4 h-4" /> Manage members
-                    </RouterLink>
-                    <button
-                      role="menuitem"
-                      @click="handleLogout"
-                      class="w-full text-left flex items-center gap-2 px-4 py-2 text-sm text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800"
-                    >
-                      <LogOut class="w-4 h-4" /> Log out
-                    </button>
-                    <button
-                      role="menuitem"
-                      @click="handleLogoutAll"
-                      class="w-full text-left flex items-center gap-2 px-4 py-2 text-sm text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/30"
-                    >
-                      <Users class="w-4 h-4" /> Log out of all devices
-                    </button>
-                  </div>
-                </div>
-              </transition>
-            </div>
-          </div>
+          <button
+            @click="toggleDarkMode"
+            class="flex items-center justify-center h-10 w-10 shrink-0 rounded-lg text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100/80 dark:hover:bg-white/5 hover:text-zinc-900 dark:hover:text-white transition-all duration-200 active:scale-95"
+            :aria-label="isDark ? 'Switch to light mode' : 'Switch to dark mode'"
+          >
+            <Sun v-if="isDark" class="w-4 h-4" />
+            <Moon v-else class="w-4 h-4" />
+          </button>
         </div>
+      </div>
 
-        <!-- Notifications -->
-        <div class="px-4 sm:px-6 lg:px-8 pb-3 space-y-2">
-          <RateLimitBanner
-            :visible="rateLimit.visible"
-            :retry-after-seconds="rateLimit.retryAfterSeconds"
-            @dismiss="dismissRateLimit"
-          />
-          <TokenExpiryBanner
-            :visible="!tokenExpiryDismissed && expiringChannels.length > 0"
-            :channels="expiringChannels"
-            @dismiss="dismissTokenExpiry"
-          />
-        </div>
-      </header>
+      <!-- Notifications -->
+      <div v-if="rateLimit.visible || (!tokenExpiryDismissed && expiringChannels.length > 0)" class="px-4 sm:px-6 lg:px-8 py-3 space-y-2">
+        <RateLimitBanner
+          :visible="rateLimit.visible"
+          :retry-after-seconds="rateLimit.retryAfterSeconds"
+          @dismiss="dismissRateLimit"
+        />
+        <TokenExpiryBanner
+          :visible="!tokenExpiryDismissed && expiringChannels.length > 0"
+          :channels="expiringChannels"
+          @dismiss="dismissTokenExpiry"
+        />
+      </div>
 
       <main class="flex-1">
         <RouterView />

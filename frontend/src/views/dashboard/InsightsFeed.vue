@@ -1,17 +1,19 @@
 <script setup lang="ts">
 // Insights feed (/dashboard) — primary working surface.
 //
-// Composes: FilterBar + 4 summary cards + infinite-scroll CommentCard list +
-// (desktop) sidebar with WeeklyDigestCard / topic chips / InsightTypeDistributionChart.
+// Composes: full-width sticky FilterBar on top, then a grid: right sidebar
+// (desktop) with the Toxicity-shield KPI card + SentimentChart /
+// InsightTypeDistributionChart / topic chips / WeeklyDigestCard (ordered by
+// actionability), left column
+// with the infinite-scroll CommentCard list and insight panels.
 // Pollers: feed at 60 s, insights at 5 min — both visibility-gated.
 
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { Download, MessageSquare, TrendingUp, X } from 'lucide-vue-next'
-import { RouterLink, useRoute } from 'vue-router'
+import { Download, MessageSquare, X } from 'lucide-vue-next'
+import { useRoute } from 'vue-router'
 import { useFeedStore } from '../../stores/feed'
 import { useInsightsStore } from '../../stores/insights'
 import { useChannelsStore } from '../../stores/channels'
-import { useBillingStore } from '../../stores/billing'
 import { useFilterUrlSync } from '../../lib/useFilterUrlSync'
 import { usePolling } from '../../lib/usePolling'
 import { useKeyboardShortcuts } from '../../composables/useKeyboardShortcuts'
@@ -25,16 +27,13 @@ import FilterBar from '../../components/FilterBar.vue'
 import ActionableInsightsPanel from '../../components/ActionableInsightsPanel.vue'
 import InsightTypeDistributionChart from '../../components/InsightTypeDistributionChart.vue'
 import SentimentChart from '../../components/SentimentChart.vue'
-import SentimentSparkline from '../../components/SentimentSparkline.vue'
 import ToxicityShield from '../../components/ToxicityShield.vue'
-import UsageBar from '../../components/UsageBar.vue'
 import WeeklyDigestCard from '../../components/WeeklyDigestCard.vue'
 import KeyboardHelpModal from '../../components/KeyboardHelpModal.vue'
 
 const feed = useFeedStore()
 const insights = useInsightsStore()
 const channels = useChannelsStore()
-const billing = useBillingStore()
 const route = useRoute()
 const { canExport } = useWorkspaceRole()
 
@@ -155,8 +154,6 @@ watch(widgetChannelId, () => {
   void refreshSentiment(true)
 })
 
-const totalCommentsCount = computed(() => insights.actionableInsights?.total_insights ?? null)
-
 const exportOpen = ref(false)
 const exportFormat = ref<ExportFormat>('csv')
 const exportSubmitting = ref(false)
@@ -233,7 +230,6 @@ const { helpVisible } = useKeyboardShortcuts({
 
 onMounted(async () => {
   void channels.fetchAll()
-  void billing.fetchStatus()
   void feed.fetchFeed({ reset: true })
   refreshRangeWidgets(true)
   void insights.fetchLatestDigest({ force: true })
@@ -281,83 +277,64 @@ usePolling(async () => {
       </button>
     </div>
 
-    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8 rise d3">
-      <Card>
-        <div class="eyebrow flex items-center gap-2">
-          <MessageSquare class="w-3.5 h-3.5" /> Insights ({{ range }})
-        </div>
-        <p class="mt-3 text-3xl font-bold tracking-tight text-zinc-900 dark:text-white font-mono tabular">
-          {{ totalCommentsCount !== null ? totalCommentsCount.toLocaleString() : '—' }}
-        </p>
-      </Card>
-
-      <Card class="flex items-center gap-4">
-        <ToxicityShield :data="insights.toxicity" :window-key="toxicityWindow" compact />
-        <div>
-          <p class="eyebrow">Toxicity shield</p>
-          <p class="text-[11px] text-zinc-500 dark:text-zinc-400 mt-1.5">
-            {{ insights.toxicity ? `${insights.toxicity.filtered_comments.toLocaleString()} filtered` : '—' }}
-          </p>
-        </div>
-      </Card>
-
-      <Card>
-        <div class="eyebrow mb-3">
-          Quota
-        </div>
-        <UsageBar
-          v-if="billing.status"
-          :used="billing.status.comments_used"
-          :limit="billing.status.comments_limit"
-          unit="comments"
-        />
-        <p v-else class="text-xs text-zinc-500 dark:text-zinc-400">Loading…</p>
-        <RouterLink
-          v-if="billing.nearLimit && billing.status?.plan === 'free'"
-          to="/settings/billing"
-          class="mt-2 inline-flex items-center text-xs font-semibold text-brand-600 dark:text-brand-400 hover:text-brand-700 dark:hover:text-brand-300 hover:underline underline-offset-2"
-        >
-          Upgrade plan →
-        </RouterLink>
-      </Card>
-
-      <Card>
-        <div class="eyebrow flex items-center gap-2">
-          <TrendingUp class="w-3.5 h-3.5" /> Top insight type
-        </div>
-        <p class="mt-3 text-xl font-bold tracking-tight text-zinc-900 dark:text-white capitalize">
-          {{
-            insights.actionableInsights?.distribution?.length
-              ? insights.actionableInsights.distribution.sort((a, b) => b.count - a.count)[0].type.replace(/_/g, ' ')
-              : '—'
-          }}
-        </p>
-        <p class="text-[11px] text-zinc-500 dark:text-zinc-400 mt-1.5 font-mono tabular">
-          {{
-            insights.actionableInsights?.distribution?.length
-              ? `${insights.actionableInsights.distribution.sort((a, b) => b.count - a.count)[0].count} mentions`
-              : 'vs prior ' + range
-          }}
-        </p>
-      </Card>
+    <div class="sticky top-16 z-20 mb-8">
+      <FilterBar
+        ref="filterBarRef"
+        :filters="feed.filters"
+        :channels="channels.channels"
+        :range="range"
+        variant="feed"
+        @update:filters="onUpdateFilters"
+        @update:range="range = $event"
+        @export="canExport && (exportOpen = true)"
+        @reset="onResetFilters"
+      />
     </div>
 
     <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
-      <div class="lg:col-span-3 space-y-4">
-        <div class="sticky top-16 z-20">
-          <FilterBar
-            ref="filterBarRef"
-            :filters="feed.filters"
-            :channels="channels.channels"
-            :range="range"
-            variant="feed"
-            @update:filters="onUpdateFilters"
-            @update:range="range = $event"
-            @export="canExport && (exportOpen = true)"
-            @reset="onResetFilters"
-          />
-        </div>
+      <aside class="order-1 lg:order-2 lg:col-span-1 space-y-4">
+        <Card class="rise d3 flex items-center gap-4">
+          <ToxicityShield :data="insights.toxicity" :window-key="toxicityWindow" compact />
+          <div>
+            <p class="eyebrow">Toxicity shield</p>
+            <p class="text-[11px] text-zinc-500 dark:text-zinc-400 mt-1.5">
+              {{ insights.toxicity ? `${insights.toxicity.filtered_comments.toLocaleString()} filtered` : '—' }}
+            </p>
+          </div>
+        </Card>
 
+        <div class="hidden lg:block space-y-4">
+          <SentimentChart :data="insights.sentiment" />
+
+          <InsightTypeDistributionChart
+            v-if="insights.actionableInsights && (insights.actionableInsights.distribution?.length ?? 0) > 0"
+            :distribution="insights.actionableInsights.distribution"
+          />
+
+          <section
+            v-if="insights.trends && insights.trends.top_topics.length > 0"
+            class="space-y-0"
+          >
+            <Card padding="none" class="p-5">
+              <p class="eyebrow mb-4">Top topics</p>
+              <div class="flex flex-wrap gap-1.5">
+                <span
+                  v-for="t in insights.trends.top_topics.slice(0, 12)"
+                  :key="t.topic"
+                  class="inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium bg-zinc-50 dark:bg-white/5 text-zinc-700 dark:text-zinc-300 ring-1 ring-inset ring-zinc-500/10 dark:ring-white/10 transition-colors hover:bg-brand-50 dark:hover:bg-brand-400/10 hover:text-brand-700 dark:hover:text-brand-300"
+                >
+                  {{ t.topic }}
+                  <span class="ml-1.5 text-zinc-400 dark:text-zinc-500 font-mono tabular-nums">{{ t.count }}</span>
+                </span>
+              </div>
+            </Card>
+          </section>
+
+          <WeeklyDigestCard :digest="insights.latestDigest" :loading="insights.loadingDigest" />
+        </div>
+      </aside>
+
+      <div class="order-2 lg:order-1 lg:col-span-3 space-y-4">
         <!-- Export result surface (fix-frontend-plumbing) -->
         <div
           v-if="feed.exportJob"
@@ -405,8 +382,6 @@ usePolling(async () => {
 
         <ActionableInsightsPanel :data="insights.actionableInsights" :type-filter="feed.filters.insight_type" />
 
-        <SentimentChart :data="insights.sentiment" />
-
         <div v-if="feed.isInitialLoad" class="space-y-3" role="status" aria-label="Loading comments">
           <div
             v-for="i in 4"
@@ -443,36 +418,7 @@ usePolling(async () => {
         </div>
       </div>
 
-      <aside class="hidden lg:block lg:col-span-1 space-y-4">
-        <WeeklyDigestCard :digest="insights.latestDigest" :loading="insights.loadingDigest" />
-
-        <section
-          v-if="insights.trends && insights.trends.top_topics.length > 0"
-          class="space-y-0"
-        >
-          <Card padding="none" class="p-5">
-            <p class="eyebrow mb-4">Top topics</p>
-            <div class="flex flex-wrap gap-1.5">
-              <span
-                v-for="t in insights.trends.top_topics.slice(0, 12)"
-                :key="t.topic"
-                class="inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium bg-zinc-50 dark:bg-white/5 text-zinc-700 dark:text-zinc-300 ring-1 ring-inset ring-zinc-500/10 dark:ring-white/10 transition-colors hover:bg-brand-50 dark:hover:bg-brand-400/10 hover:text-brand-700 dark:hover:text-brand-300"
-              >
-                {{ t.topic }}
-                <span class="ml-1.5 text-zinc-400 dark:text-zinc-500 font-mono tabular-nums">{{ t.count }}</span>
-              </span>
-            </div>
-          </Card>
-        </section>
-
-        <InsightTypeDistributionChart
-          v-if="insights.actionableInsights && (insights.actionableInsights.distribution?.length ?? 0) > 0"
-          :distribution="insights.actionableInsights.distribution"
-        />
-
-        <SentimentSparkline :data="insights.sentiment" />
-      </aside>
-    </div>
+      </div>
 
     <Teleport to="body">
       <div v-if="exportOpen" class="fixed z-50 inset-0 overflow-y-auto" role="dialog" aria-modal="true">

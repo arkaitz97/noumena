@@ -110,18 +110,18 @@ const label = computed(() => currentWorkspace.value?.name ?? 'Workspace')
 </script>
 
 <template>
-  <div class="relative" @click.outside="open = false">
+  <div class="relative w-full" @click.outside="open = false">
     <button
       ref="triggerRef"
       @click="toggle"
-      class="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-zinc-200 dark:border-white/10 hover:border-zinc-300 dark:hover:border-white/20 hover:bg-zinc-50 dark:hover:bg-zinc-800/60 transition-all duration-200 ease-snappy active:scale-[0.98] text-sm shadow-card dark:shadow-none"
+      class="w-full flex items-center gap-2 px-3 py-1.5 rounded-lg border border-zinc-200 dark:border-white/10 hover:border-zinc-300 dark:hover:border-white/20 hover:bg-zinc-50 dark:hover:bg-zinc-800/60 transition-all duration-200 ease-snappy active:scale-[0.98] text-sm shadow-card dark:shadow-none"
       :aria-expanded="open"
       aria-haspopup="menu"
       :aria-label="'Switch workspace, current: ' + label"
     >
-      <Building2 class="w-4 h-4 text-zinc-500 dark:text-zinc-400" />
-      <span class="max-w-[10rem] truncate font-medium text-zinc-700 dark:text-zinc-300">{{ label }}</span>
-      <ChevronDown class="w-3.5 h-3.5 text-zinc-400 dark:text-zinc-500" />
+      <Building2 class="w-4 h-4 shrink-0 text-zinc-500 dark:text-zinc-400" />
+      <span class="flex-1 min-w-0 truncate font-medium text-zinc-700 dark:text-zinc-300 text-left">{{ label }}</span>
+      <ChevronDown class="w-3.5 h-3.5 shrink-0 text-zinc-400 dark:text-zinc-500" />
     </button>
 
     <transition name="ws">
@@ -130,7 +130,7 @@ const label = computed(() => currentWorkspace.value?.name ?? 'Workspace')
         ref="menuRef"
         role="menu"
         aria-label="Switch workspace"
-        class="absolute left-0 mt-2 w-64 bg-white dark:bg-zinc-900 shadow-pop ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl py-1 z-50 origin-top-left"
+        class="absolute left-0 mt-2 w-full min-w-56 bg-white dark:bg-zinc-900 shadow-pop ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl py-1 z-50 origin-top-left"
         @keydown="onMenuKeydown"
       >
         <button

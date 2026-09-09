@@ -130,23 +130,23 @@ function scoreColor(score: number): string {
       </svg>
 
       <div class="mt-3">
-        <div class="flex items-center gap-2 text-[10px] font-medium text-zinc-400 uppercase tracking-wider px-1 pb-1">
-          <span class="w-24">Date</span>
-          <span class="w-8 text-right">Neg</span>
-          <span class="w-8 text-right">Neu</span>
-          <span class="w-8 text-right">Pos</span>
-          <span class="ml-auto">Score</span>
+        <div class="grid grid-cols-[minmax(0,1fr)_2rem_2rem_2rem_3.25rem] gap-x-2 items-center text-[10px] font-medium text-zinc-400 uppercase tracking-wider px-1 pb-1">
+          <span>Date</span>
+          <span class="text-right">Neg</span>
+          <span class="text-right">Neu</span>
+          <span class="text-right">Pos</span>
+          <span class="text-right">Score</span>
         </div>
         <div
           v-for="row in visibleRows"
           :key="row.date"
-          class="flex items-center gap-2 px-1 py-1 rounded-md text-xs odd:bg-zinc-50/60 dark:odd:bg-zinc-800/40"
+          class="grid grid-cols-[minmax(0,1fr)_2rem_2rem_2rem_3.25rem] gap-x-2 items-center px-1 py-1 rounded-md text-xs odd:bg-zinc-50/60 dark:odd:bg-zinc-800/40"
         >
-          <span class="w-24 text-zinc-600 dark:text-zinc-400 font-mono tabular-nums">{{ row.date }}</span>
-          <span class="w-8 text-right text-rose-600 font-mono tabular-nums">{{ row.negative }}</span>
-          <span class="w-8 text-right text-zinc-500 font-mono tabular-nums">{{ row.neutral }}</span>
-          <span class="w-8 text-right text-emerald-600 font-mono tabular-nums">{{ row.positive }}</span>
-          <span class="ml-auto font-medium font-mono tabular-nums" :class="scoreColor(row.score)">
+          <span class="min-w-0 truncate text-zinc-600 dark:text-zinc-400 font-mono tabular-nums">{{ row.date }}</span>
+          <span class="text-right text-rose-600 font-mono tabular-nums">{{ row.negative }}</span>
+          <span class="text-right text-zinc-500 font-mono tabular-nums">{{ row.neutral }}</span>
+          <span class="text-right text-emerald-600 font-mono tabular-nums">{{ row.positive }}</span>
+          <span class="text-right font-medium font-mono tabular-nums" :class="scoreColor(row.score)">
             {{ row.score > 0 ? `+${row.score}` : row.score }}
           </span>
         </div>
@@ -155,7 +155,7 @@ function scoreColor(score: number): string {
         </p>
       </div>
 
-      <div class="mt-3 pt-3 border-t border-zinc-100 dark:border-zinc-800 flex items-center gap-3 text-xs text-zinc-500 dark:text-zinc-400">
+      <div class="mt-3 pt-3 border-t border-zinc-100 dark:border-zinc-800 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-zinc-500 dark:text-zinc-400">
         <span><span class="font-semibold text-rose-600 font-mono tabular-nums">{{ totals.negative }}</span> negative</span>
         <span><span class="font-semibold text-zinc-600 dark:text-zinc-300 font-mono tabular-nums">{{ totals.neutral }}</span> neutral</span>
         <span><span class="font-semibold text-emerald-600 font-mono tabular-nums">{{ totals.positive }}</span> positive</span>

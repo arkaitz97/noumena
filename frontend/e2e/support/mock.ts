@@ -389,13 +389,12 @@ function handleApi(route: Route, state: MockState): boolean {
   }
   if (path === '/api/insights/sentiment') {
     return respond(route, 200, {
-      window: query.get('window') ?? '7d',
+      days: Number(query.get('days') ?? 7),
       channel_id: query.get('channel_id') ?? null,
       series: [
-        { date: '2026-08-01', positive: 0.6, neutral: 0.3, negative: 0.1 },
-        { date: '2026-08-02', positive: 0.7, neutral: 0.2, negative: 0.1 },
+        { date: '2026-08-01', negative: 1, neutral: 2, positive: 3, score: 0.25 },
+        { date: '2026-08-02', negative: 0, neutral: 1, positive: 2, score: 0.66 },
       ],
-      overall: { positive: 0.65, neutral: 0.25, negative: 0.1 },
     })
   }
   if (path === '/api/insights/digest/latest' || path === '/api/digests/latest') {
