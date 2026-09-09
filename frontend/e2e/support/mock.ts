@@ -410,6 +410,11 @@ function handleApi(route: Route, state: MockState): boolean {
     })
   }
 
+  // ---- UI telemetry ---------------------------------------------------------------
+  if (path === '/api/events' && method === 'POST') {
+    return noContent(route)
+  }
+
   // ---- billing ------------------------------------------------------------------
   if (path === '/api/billing/status') {
     return respond(route, 200, state.billing)

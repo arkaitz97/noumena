@@ -328,6 +328,8 @@ func main() {
 
 	userHandler := &api.UserHandler{Queries: queries, Cfg: config.Default}
 
+	eventHandler := &api.EventHandler{}
+
 	accountHandler := &api.AccountHandler{
 		Queries:  queries,
 		Pipeline: emailPipeline,
@@ -538,6 +540,8 @@ func main() {
 			r.Get("/digests", digestHandler.List)
 			r.Get("/digests/latest", digestHandler.Latest)
 			r.Patch("/user/preferences", digestHandler.UpdatePreferences)
+
+			r.Post("/events", eventHandler.Track)
 
 			r.Get("/workspaces/{id}", workspaceHandler.GetWorkspaceByID)
 			r.Get("/workspaces/active/role", workspaceHandler.ActiveWorkspaceRole)

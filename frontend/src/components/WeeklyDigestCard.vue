@@ -4,6 +4,7 @@ import { ChevronDown, Sparkles } from 'lucide-vue-next'
 import type { WeeklyDigest } from '../services/types'
 import { shortDate } from '../lib/relativeTime'
 import { insightTypeLabel } from '../lib/insightTypes'
+import { trackEvent, type DigestSection } from '../services/events'
 import Card from './Card.vue'
 
 defineProps<{ digest: WeeklyDigest | null; loading?: boolean }>()
@@ -12,6 +13,19 @@ const openIdeas = ref(true)
 const openQuestions = ref(true)
 const openInsights = ref(false)
 const openHealth = ref(false)
+
+const openBySection: Record<DigestSection, typeof openIdeas> = {
+  ideas: openIdeas,
+  questions: openQuestions,
+  insights: openInsights,
+  health: openHealth,
+}
+
+function toggleSection(section: DigestSection): void {
+  const open = openBySection[section]
+  open.value = !open.value
+  trackEvent('digest_section_toggled', { section })
+}
 </script>
 
 <template>
@@ -45,7 +59,7 @@ const openHealth = ref(false)
       <div class="rounded-xl border border-zinc-200/70 dark:border-white/5">
         <button
           type="button"
-          @click="openIdeas = !openIdeas"
+          @click="toggleSection('ideas')"
           :aria-expanded="openIdeas"
           class="w-full flex items-center justify-between px-3 py-2 text-left text-xs font-semibold text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100/80 dark:hover:bg-white/5 rounded-xl transition-all duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60"
         >
@@ -64,7 +78,7 @@ const openHealth = ref(false)
       <div class="rounded-xl border border-zinc-200/70 dark:border-white/5">
         <button
           type="button"
-          @click="openQuestions = !openQuestions"
+          @click="toggleSection('questions')"
           :aria-expanded="openQuestions"
           class="w-full flex items-center justify-between px-3 py-2 text-left text-xs font-semibold text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100/80 dark:hover:bg-white/5 rounded-xl transition-all duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60"
         >
@@ -83,7 +97,7 @@ const openHealth = ref(false)
       <div class="rounded-xl border border-zinc-200/70 dark:border-white/5">
         <button
           type="button"
-          @click="openInsights = !openInsights"
+          @click="toggleSection('insights')"
           :aria-expanded="openInsights"
           class="w-full flex items-center justify-between px-3 py-2 text-left text-xs font-semibold text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100/80 dark:hover:bg-white/5 rounded-xl transition-all duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60"
         >
@@ -111,7 +125,7 @@ const openHealth = ref(false)
       <div class="rounded-xl border border-zinc-200/70 dark:border-white/5">
         <button
           type="button"
-          @click="openHealth = !openHealth"
+          @click="toggleSection('health')"
           :aria-expanded="openHealth"
           class="w-full flex items-center justify-between px-3 py-2 text-left text-xs font-semibold text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100/80 dark:hover:bg-white/5 rounded-xl transition-all duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60"
         >
