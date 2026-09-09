@@ -251,9 +251,76 @@ async function submitDelete(): Promise<void> {
   router.push('/login')
 }
 
+// ---- Creator Profile ----------------------------------------------------
+const profileDisplayName = ref<string>('')
+const profileUserType = ref<string>('')
+const profilePrimaryGoal = ref<string>('')
+const profilePrimaryPlatform = ref<string>('')
+const profileRole = ref<string>('')
+const profileCurrentWorkflow = ref<string>('')
+const profileBiggestPain = ref<string>('')
+const profileTopicsInput = ref('')
+const profileError = ref<string | null>(null)
+
+watch(
+  () => account.creatorProfile,
+  (cp) => {
+    if (cp) {
+      profileDisplayName.value = cp.display_name || ''
+      profileUserType.value = cp.user_type || ''
+      profilePrimaryGoal.value = cp.primary_goal || ''
+      profilePrimaryPlatform.value = cp.primary_platform || ''
+      profileRole.value = cp.role || ''
+      profileCurrentWorkflow.value = cp.current_workflow || ''
+      profileBiggestPain.value = cp.biggest_pain || ''
+      profileTopicsInput.value = (cp.content_topics || []).join(', ')
+    }
+  },
+  { immediate: true },
+)
+
+async function submitProfileChange(): Promise<void> {
+  profileError.value = null
+  const name = profileDisplayName.value.trim()
+  if (name.length > 100) {
+    profileError.value = 'Display name cannot exceed 100 characters.'
+    return
+  }
+
+  const topics = profileTopicsInput.value
+    ? profileTopicsInput.value
+        .split(',')
+        .map((t) => t.trim())
+        .filter((t) => t.length > 0)
+        .slice(0, 10)
+    : []
+
+  for (const topic of topics) {
+    if (topic.length > 40) {
+      profileError.value = `Topic "${topic}" exceeds 40 characters.`
+      return
+    }
+  }
+
+  const ok = await account.saveCreatorProfile({
+    display_name: name || null,
+    user_type: (profileUserType.value || null) as any,
+    primary_goal: (profilePrimaryGoal.value || null) as any,
+    primary_platform: (profilePrimaryPlatform.value || null) as any,
+    role: (profileRole.value || null) as any,
+    current_workflow: (profileCurrentWorkflow.value || null) as any,
+    biggest_pain: (profileBiggestPain.value || null) as any,
+    content_topics: topics,
+  })
+  if (!ok) {
+    profileError.value = account.creatorProfileError || 'Failed to save profile. Please check your inputs and try again.'
+  }
+}
+
 // ---- mount ---------------------------------------------------------------
 onMounted(() => {
   void account.fetchProfile()
+  void account.fetchCreatorProfile()
   void loadRecentExports()
 })
 
@@ -295,13 +362,13 @@ function downloadRecent(j: ExportJob): void {
     </div>
 
     <!-- Profile / email -->
-    <section class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-6 sm:p-8">
-      <div class="md:grid md:grid-cols-3 md:gap-8">
-        <div class="md:col-span-1">
+    <section class="@container bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-6 sm:p-8">
+      <div class="@md:grid @md:grid-cols-3 @md:gap-8">
+        <div class="@md:col-span-1">
           <h2 class="text-base font-semibold text-zinc-900 dark:text-white">Profile</h2>
           <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400 pr-4">Your sign-in email and verification status.</p>
         </div>
-        <div class="mt-5 md:mt-0 md:col-span-2 space-y-6">
+        <div class="mt-5 @md:mt-0 @md:col-span-2 space-y-6">
           <div>
             <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Current email</p>
             <div class="mt-1 flex items-center gap-2">
@@ -408,14 +475,155 @@ function downloadRecent(j: ExportJob): void {
       </div>
     </section>
 
+    <!-- Work Profile -->
+    <section class="@container bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-6 sm:p-8">
+      <div class="@md:grid @md:grid-cols-3 @md:gap-8">
+        <div class="@md:col-span-1">
+          <h2 class="text-base font-semibold text-zinc-900 dark:text-white">Work Profile</h2>
+          <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400 pr-4">Your creator persona, goals, role, and workflow preferences to personalize your insights.</p>
+        </div>
+        <div class="mt-5 @md:mt-0 @md:col-span-2">
+          <form class="space-y-4" @submit.prevent="submitProfileChange">
+            <div v-if="profileError" role="alert" class="bg-rose-50 dark:bg-rose-500/10 p-4 rounded-xl text-rose-700 dark:text-rose-300 text-sm border border-rose-100 dark:border-rose-500/20">
+              {{ profileError }}
+            </div>
+
+            <TextInput
+              v-model="profileDisplayName"
+              id="profile-display-name"
+              label="Display name"
+              placeholder="Your name or channel alias"
+              hint="How you prefer to be addressed in emails, digests, and workspaces."
+            />
+
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label for="profile-user-type" class="block text-xs font-semibold uppercase tracking-wider text-zinc-600 dark:text-zinc-400 mb-1.5">Profile type</label>
+                <select
+                  id="profile-user-type"
+                  v-model="profileUserType"
+                  class="w-full rounded-xl border border-zinc-200 bg-white py-2.5 px-3 text-sm text-zinc-800 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-brand-500"
+                >
+                  <option value="">Select profile type</option>
+                  <option value="creator">Content Creator</option>
+                  <option value="agency">Agency / Manager</option>
+                  <option value="brand">Brand / Sponsor</option>
+                  <option value="other">Other</option>
+                </select>
+              </div>
+
+              <div>
+                <label for="profile-role" class="block text-xs font-semibold uppercase tracking-wider text-zinc-600 dark:text-zinc-400 mb-1.5">Your role</label>
+                <select
+                  id="profile-role"
+                  v-model="profileRole"
+                  class="w-full rounded-xl border border-zinc-200 bg-white py-2.5 px-3 text-sm text-zinc-800 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-brand-500"
+                >
+                  <option value="">Select your role</option>
+                  <option value="owner">Channel Owner / Creator</option>
+                  <option value="strategist">Content Strategist</option>
+                  <option value="analyst">Data / Audience Analyst</option>
+                  <option value="moderator">Community Moderator</option>
+                  <option value="viewer">Viewer / Follower</option>
+                  <option value="other">Other</option>
+                </select>
+              </div>
+
+              <div>
+                <label for="profile-primary-goal" class="block text-xs font-semibold uppercase tracking-wider text-zinc-600 dark:text-zinc-400 mb-1.5">Primary goal</label>
+                <select
+                  id="profile-primary-goal"
+                  v-model="profilePrimaryGoal"
+                  class="w-full rounded-xl border border-zinc-200 bg-white py-2.5 px-3 text-sm text-zinc-800 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-brand-500"
+                >
+                  <option value="">Select your main goal</option>
+                  <option value="understand_audience">Understand my audience deeper</option>
+                  <option value="generate_content_ideas">Generate fresh content ideas</option>
+                  <option value="improve_retention">Improve audience retention</option>
+                  <option value="win_sponsorships">Win brand sponsorships</option>
+                  <option value="reduce_toxicity">Reduce comment toxicity</option>
+                  <option value="report_to_clients">Report insights to clients</option>
+                  <option value="other">Other</option>
+                </select>
+              </div>
+
+              <div>
+                <label for="profile-primary-platform" class="block text-xs font-semibold uppercase tracking-wider text-zinc-600 dark:text-zinc-400 mb-1.5">Primary platform</label>
+                <select
+                  id="profile-primary-platform"
+                  v-model="profilePrimaryPlatform"
+                  class="w-full rounded-xl border border-zinc-200 bg-white py-2.5 px-3 text-sm text-zinc-800 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-brand-500"
+                >
+                  <option value="">Select platform</option>
+                  <option value="youtube">YouTube</option>
+                  <option value="tiktok">TikTok</option>
+                  <option value="instagram">Instagram</option>
+                  <option value="other">Other</option>
+                </select>
+              </div>
+
+              <div>
+                <label for="profile-workflow" class="block text-xs font-semibold uppercase tracking-wider text-zinc-600 dark:text-zinc-400 mb-1.5">Current workflow</label>
+                <select
+                  id="profile-workflow"
+                  v-model="profileCurrentWorkflow"
+                  class="w-full rounded-xl border border-zinc-200 bg-white py-2.5 px-3 text-sm text-zinc-800 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-brand-500"
+                >
+                  <option value="">Select current workflow</option>
+                  <option value="native_tools">Native platform analytics (YouTube Studio, etc.)</option>
+                  <option value="spreadsheets">Manual spreadsheets</option>
+                  <option value="moderation_tool">Third-party moderation tool</option>
+                  <option value="agency_dashboard">Agency / client dashboard</option>
+                  <option value="none">No formal workflow</option>
+                  <option value="other">Other</option>
+                </select>
+              </div>
+
+              <div>
+                <label for="profile-pain" class="block text-xs font-semibold uppercase tracking-wider text-zinc-600 dark:text-zinc-400 mb-1.5">Biggest pain point</label>
+                <select
+                  id="profile-pain"
+                  v-model="profileBiggestPain"
+                  class="w-full rounded-xl border border-zinc-200 bg-white py-2.5 px-3 text-sm text-zinc-800 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-brand-500"
+                >
+                  <option value="">Select biggest pain</option>
+                  <option value="too_many_comments">Too many comments to read</option>
+                  <option value="missed_feedback">Missing feedback & questions</option>
+                  <option value="toxicity">Troll and spam management</option>
+                  <option value="reporting_time">Too much time making client reports</option>
+                  <option value="unclear_content_plan">Unclear what content to make next</option>
+                  <option value="team_visibility">Poor team visibility across channels</option>
+                  <option value="other">Other</option>
+                </select>
+              </div>
+            </div>
+
+            <TextInput
+              v-model="profileTopicsInput"
+              id="profile-topics"
+              label="Content topics"
+              placeholder="e.g. technology, gaming, software tutorials"
+              hint="Up to 10 topics separated by commas (max 40 chars each)."
+            />
+
+            <div class="flex justify-end pt-2">
+              <PrimaryButton type="submit" :loading="account.savingCreatorProfile">
+                Save work profile
+              </PrimaryButton>
+            </div>
+          </form>
+        </div>
+      </div>
+    </section>
+
     <!-- Preferences -->
-    <section class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-6 sm:p-8">
-      <div class="md:grid md:grid-cols-3 md:gap-8">
-        <div class="md:col-span-1">
+    <section class="@container bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-6 sm:p-8">
+      <div class="@md:grid @md:grid-cols-3 @md:gap-8">
+        <div class="@md:col-span-1">
           <h2 class="text-base font-semibold text-zinc-900 dark:text-white">Preferences</h2>
           <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400 pr-4">Notification and digest options.</p>
         </div>
-        <div class="mt-5 md:mt-0 md:col-span-2">
+        <div class="mt-5 @md:mt-0 @md:col-span-2">
           <label class="flex items-start justify-between gap-4">
             <span class="flex-1">
               <span class="block text-sm font-medium text-zinc-900 dark:text-white">Weekly digest email</span>
@@ -443,13 +651,13 @@ function downloadRecent(j: ExportJob): void {
     </section>
 
     <!-- GDPR data export -->
-    <section class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-6 sm:p-8">
-      <div class="md:grid md:grid-cols-3 md:gap-8">
-        <div class="md:col-span-1">
+    <section class="@container bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-6 sm:p-8">
+      <div class="@md:grid @md:grid-cols-3 @md:gap-8">
+        <div class="@md:col-span-1">
           <h2 class="text-base font-semibold text-zinc-900 dark:text-white">Your data</h2>
           <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400 pr-4">Download a portable copy of everything we hold for you.</p>
         </div>
-        <div class="mt-5 md:mt-0 md:col-span-2 space-y-3">
+        <div class="mt-5 @md:mt-0 @md:col-span-2 space-y-3">
           <div v-if="!account.exportJob">
             <button
               type="button"
@@ -514,13 +722,13 @@ function downloadRecent(j: ExportJob): void {
     </section>
 
     <!-- Recent comment exports -->
-    <section class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-6 sm:p-8">
-      <div class="md:grid md:grid-cols-3 md:gap-8">
-        <div class="md:col-span-1">
+    <section class="@container bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-6 sm:p-8">
+      <div class="@md:grid @md:grid-cols-3 @md:gap-8">
+        <div class="@md:col-span-1">
           <h2 class="text-base font-semibold text-zinc-900 dark:text-white">Recent exports</h2>
           <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400 pr-4">Comment exports you've requested from the feed.</p>
         </div>
-        <div class="mt-5 md:mt-0 md:col-span-2">
+        <div class="mt-5 @md:mt-0 @md:col-span-2">
           <p v-if="recentLoading" class="text-sm text-zinc-500 dark:text-zinc-400">Loading…</p>
           <ul v-else-if="recent.length > 0" class="divide-y divide-zinc-200/70 dark:divide-white/5">
             <li
@@ -552,13 +760,13 @@ function downloadRecent(j: ExportJob): void {
     </section>
 
     <!-- Danger zone -->
-    <section class="bg-rose-50/50 dark:bg-rose-500/[0.06] ring-1 ring-rose-200 dark:ring-rose-500/30 rounded-xl p-6 sm:p-8">
-      <div class="md:grid md:grid-cols-3 md:gap-8">
-        <div class="md:col-span-1">
+    <section class="@container bg-rose-50/50 dark:bg-rose-500/[0.06] ring-1 ring-rose-200 dark:ring-rose-500/30 rounded-xl p-6 sm:p-8">
+      <div class="@md:grid @md:grid-cols-3 @md:gap-8">
+        <div class="@md:col-span-1">
           <h2 class="text-base font-semibold text-rose-700 dark:text-rose-300">Danger zone</h2>
           <p class="mt-1 text-sm text-rose-600/80 dark:text-rose-400 pr-4">Irreversible account actions.</p>
         </div>
-        <div class="mt-5 md:mt-0 md:col-span-2">
+        <div class="mt-5 @md:mt-0 @md:col-span-2">
           <p class="text-sm text-rose-700/80 dark:text-rose-300 mb-4">
             Deleting your account schedules permanent removal of your channels, saved comments, and personal data.
           </p>
@@ -612,12 +820,12 @@ function downloadRecent(j: ExportJob): void {
       </template>
 
       <template #footer>
-        <div class="w-full flex flex-col sm:flex-row-reverse gap-3">
+        <div class="w-full flex flex-col @sm:flex-row-reverse gap-3">
           <button
             v-if="deleteStep === 1"
             type="button"
             @click="deleteStep = 2"
-            class="w-full sm:w-auto inline-flex justify-center items-center py-2.5 px-5 rounded-xl text-sm font-medium text-white bg-rose-600 hover:bg-rose-700 transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-rose-500"
+            class="w-full @sm:w-auto inline-flex justify-center items-center py-2.5 px-5 rounded-xl text-sm font-medium text-white bg-rose-600 hover:bg-rose-700 transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-rose-500"
           >
             I understand, continue
           </button>
@@ -626,7 +834,7 @@ function downloadRecent(j: ExportJob): void {
             type="button"
             :disabled="!deleteEmailMatches || deleteSubmitting"
             @click="submitDelete"
-            class="w-full sm:w-auto inline-flex justify-center items-center py-2.5 px-5 rounded-xl text-sm font-medium text-white bg-rose-600 hover:bg-rose-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-rose-500"
+            class="w-full @sm:w-auto inline-flex justify-center items-center py-2.5 px-5 rounded-xl text-sm font-medium text-white bg-rose-600 hover:bg-rose-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-rose-500"
           >
             {{ deleteSubmitting ? 'Deleting…' : 'Permanently delete my account' }}
           </button>
@@ -634,7 +842,7 @@ function downloadRecent(j: ExportJob): void {
             type="button"
             data-modal-cancel="true"
             @click="closeDelete"
-            class="w-full sm:w-auto inline-flex justify-center items-center py-2.5 px-5 rounded-xl text-sm font-medium text-zinc-700 dark:text-zinc-200 bg-white dark:bg-zinc-800/60 border border-zinc-200 dark:border-white/10 hover:border-zinc-300 hover:bg-zinc-50 dark:hover:border-white/20 dark:hover:bg-zinc-800 transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900"
+            class="w-full @sm:w-auto inline-flex justify-center items-center py-2.5 px-5 rounded-xl text-sm font-medium text-zinc-700 dark:text-zinc-200 bg-white dark:bg-zinc-800/60 border border-zinc-200 dark:border-white/10 hover:border-zinc-300 hover:bg-zinc-50 dark:hover:border-white/20 dark:hover:bg-zinc-800 transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900"
           >
             Cancel
           </button>

@@ -17,6 +17,7 @@ import {
   X,
 } from 'lucide-vue-next'
 import { useAuthStore } from '../../stores/auth'
+import { useAccountStore } from '../../stores/account'
 import { useDarkMode } from '../../composables/useDarkMode'
 import { useWorkspaceRole } from '../../composables/useWorkspaceRole'
 import { useRateLimitStore } from '../../stores/rateLimit'
@@ -32,6 +33,7 @@ import type { TokenExpiryChannel } from '../../services/tokenExpiry'
 const route = useRoute()
 const router = useRouter()
 const auth = useAuthStore()
+const account = useAccountStore()
 const { isDark, toggleDarkMode } = useDarkMode()
 const { isAdmin } = useWorkspaceRole()
 const rateLimit = useRateLimitStore()
@@ -59,13 +61,21 @@ function toggleMenu() {
 
 function closeMenuOnOutside(event: MouseEvent) {
   if (!menuRef.value) return
-  if (!menuRef.value.contains(event.target as Node)) menuOpen.value = false
+  if (event.target && menuRef.value.contains(event.target as Node)) return
+  menuOpen.value = false
 }
 
 document.addEventListener('click', closeMenuOnOutside)
 onBeforeUnmount(() => document.removeEventListener('click', closeMenuOnOutside))
 
-const userInitial = computed(() => (auth.user?.email || '?').slice(0, 1).toUpperCase())
+const userDisplayName = computed(() => {
+  return account.creatorProfile?.display_name?.trim() || auth.user?.email || 'Account'
+})
+
+const userInitial = computed(() => {
+  const name = account.creatorProfile?.display_name?.trim() || auth.user?.email || '?'
+  return name.slice(0, 1).toUpperCase()
+})
 
 // Mobile navigation drawer (< lg)
 const drawerOpen = ref(false)
@@ -193,6 +203,9 @@ const tokenExpiryPoll = usePolling(refreshTokenExpiry, 60_000)
 
 onMounted(() => {
   void tokenExpiryPoll.trigger()
+  if (!account.creatorProfile) {
+    void account.fetchCreatorProfile()
+  }
 })
 
 watch(
@@ -258,7 +271,7 @@ function dismissTokenExpiry() {
                 {{ userInitial }}
               </span>
               <span class="flex-1 min-w-0 text-left text-sm font-medium text-zinc-700 dark:text-zinc-300 truncate">
-                {{ auth.user?.email || 'Account' }}
+                {{ userDisplayName }}
               </span>
               <ChevronDown class="w-4 h-4 shrink-0 text-zinc-500 dark:text-zinc-400" :class="menuOpen && 'rotate-180'" />
             </button>
@@ -282,7 +295,10 @@ function dismissTokenExpiry() {
             >
               <div class="px-4 py-3 border-b border-zinc-100 dark:border-zinc-800">
                 <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400">Signed in as</p>
-                <p class="text-sm font-semibold text-zinc-900 dark:text-zinc-100 truncate">{{ auth.user?.email || '—' }}</p>
+                <p class="text-sm font-semibold text-zinc-900 dark:text-zinc-100 truncate">{{ userDisplayName }}</p>
+                <p v-if="account.creatorProfile?.display_name?.trim() && auth.user?.email" class="text-xs text-zinc-500 dark:text-zinc-400 truncate mt-0.5">
+                  {{ auth.user.email }}
+                </p>
               </div>
               <div class="py-1">
                 <RouterLink

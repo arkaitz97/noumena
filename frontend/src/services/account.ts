@@ -3,7 +3,7 @@
 // support lands) `weekly_digest_opt_in`.
 
 import apiClient from './api'
-import type { ExportJob, UserProfile } from './types'
+import type { CreatorProfile, ExportJob, UserProfile } from './types'
 
 export async function me(): Promise<UserProfile> {
   const { data } = await apiClient.get<UserProfile & { email_verified?: boolean }>('/user/me')
@@ -64,3 +64,16 @@ export async function requestDeletion(emailConfirmation: string): Promise<void> 
     data: { email_confirmation: emailConfirmation },
   })
 }
+
+export async function getCreatorProfile(): Promise<CreatorProfile> {
+  const { data } = await apiClient.get<CreatorProfile>('/user/profile')
+  return data
+}
+
+export async function patchCreatorProfile(
+  patch: Partial<CreatorProfile>,
+): Promise<CreatorProfile> {
+  const { data } = await apiClient.patch<CreatorProfile>('/user/profile', patch)
+  return data
+}
+

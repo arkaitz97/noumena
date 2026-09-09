@@ -7,7 +7,7 @@ import { defineStore } from 'pinia'
 import { AxiosError } from 'axios'
 import * as accountApi from '../services/account'
 import { toast } from '../lib/toast'
-import type { ApiErrorBody, ExportJob, UserProfile } from '../services/types'
+import type { ApiErrorBody, CreatorProfile, ExportJob, UserProfile } from '../services/types'
 
 export interface EmailUpdateError {
   status: number
@@ -18,6 +18,10 @@ export interface EmailUpdateError {
 export const useAccountStore = defineStore('account', () => {
   const profile = ref<UserProfile | null>(null)
   const loading = ref(false)
+  const creatorProfile = ref<CreatorProfile | null>(null)
+  const creatorProfileLoading = ref(false)
+  const savingCreatorProfile = ref(false)
+  const creatorProfileError = ref<string | null>(null)
   const exportJob = ref<ExportJob | null>(null)
   const exportLoading = ref(false)
   const updatingEmail = ref(false)
@@ -30,6 +34,41 @@ export const useAccountStore = defineStore('account', () => {
       toast.error('Could not load your account profile.')
     } finally {
       loading.value = false
+    }
+  }
+
+  async function fetchCreatorProfile(): Promise<void> {
+    creatorProfileLoading.value = true
+    try {
+      creatorProfile.value = await accountApi.getCreatorProfile()
+    } catch {
+      toast.error('Could not load work profile.')
+    } finally {
+      creatorProfileLoading.value = false
+    }
+  }
+
+  async function saveCreatorProfile(patch: Partial<CreatorProfile>): Promise<boolean> {
+    savingCreatorProfile.value = true
+    creatorProfileError.value = null
+    try {
+      const updated = await accountApi.patchCreatorProfile(patch)
+      creatorProfile.value = updated
+      toast.success('Work profile updated.')
+      return true
+    } catch (err) {
+      if (err instanceof AxiosError && err.response) {
+        const body = err.response.data as ApiErrorBody | undefined
+        const msg = body?.error ?? body?.message ?? 'Could not update work profile.'
+        creatorProfileError.value = msg
+        toast.error(msg)
+      } else {
+        creatorProfileError.value = 'Could not update work profile.'
+        toast.error('Could not update work profile.')
+      }
+      return false
+    } finally {
+      savingCreatorProfile.value = false
     }
   }
 
@@ -122,12 +161,18 @@ export const useAccountStore = defineStore('account', () => {
   return {
     profile,
     loading,
+    creatorProfile,
+    creatorProfileLoading,
+    savingCreatorProfile,
+    creatorProfileError,
     updatingEmail,
     exportJob,
     exportLoading,
     isVerified,
     supportsDigestOptIn,
     fetchProfile,
+    fetchCreatorProfile,
+    saveCreatorProfile,
     updateEmail,
     setDigestOptIn,
     requestExport,

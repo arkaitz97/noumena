@@ -63,12 +63,17 @@ vi.mock('../services/auth', () => ({ forgotPassword: vi.fn().mockResolvedValue({
 vi.mock('../stores/account', () => ({
   useAccountStore: () => ({
     profile: null,
+    creatorProfile: null,
+    creatorProfileLoading: false,
+    savingCreatorProfile: false,
     isVerified: false,
     supportsDigestOptIn: false,
     exportJob: null,
     exportLoading: false,
     updatingEmail: false,
     fetchProfile: vi.fn().mockResolvedValue(undefined),
+    fetchCreatorProfile: vi.fn().mockResolvedValue(undefined),
+    saveCreatorProfile: vi.fn().mockResolvedValue(true),
     requestExport: vi.fn().mockResolvedValue(undefined),
     pollExport: vi.fn().mockResolvedValue(null),
     clearExport: vi.fn(),

@@ -5,7 +5,8 @@ import { useAuthStore } from '../../stores/auth'
 import { toast } from '../../lib/toast'
 import { generateState, openOAuthPopup } from '../../lib/oauthPopup'
 import * as channels from '../../services/channels'
-import type { SyncStatus } from '../../services/types'
+import { patchCreatorProfile } from '../../services/account'
+import type { PrimaryGoal, SyncStatus, UserType } from '../../services/types'
 import PrimaryButton from '../../components/forms/PrimaryButton.vue'
 import SecondaryButton from '../../components/forms/SecondaryButton.vue'
 import AppLogo from '../../components/AppLogo.vue'
@@ -16,6 +17,12 @@ const auth = useAuthStore()
 type StepIdx = 1 | 2 | 3 | 4
 const step = ref<StepIdx>(1)
 const stepLabels = ['Welcome', 'Connect', 'Backfill', 'Tour']
+
+// Step 1 profile state
+const displayNameInput = ref('')
+const userType = ref<UserType | ''>('')
+const primaryGoal = ref<PrimaryGoal | ''>('')
+const contentTopicsInput = ref('')
 
 // Step 2 state
 const connecting = ref(false)
@@ -108,7 +115,30 @@ function goToStep(s: StepIdx) {
   step.value = s
 }
 
-function startOnboarding() {
+async function startOnboarding() {
+  if (displayNameInput.value || userType.value || primaryGoal.value || contentTopicsInput.value) {
+    const topics = contentTopicsInput.value
+      ? contentTopicsInput.value
+          .split(',')
+          .map((t) => t.trim())
+          .filter((t) => t.length > 0)
+          .slice(0, 10)
+      : []
+    try {
+      await patchCreatorProfile({
+        display_name: displayNameInput.value.trim() || null,
+        user_type: userType.value || null,
+        primary_goal: primaryGoal.value || null,
+        content_topics: topics,
+      })
+    } catch {
+      // non-blocking
+    }
+  }
+  goToStep(2)
+}
+
+function skipProfile() {
   goToStep(2)
 }
 
@@ -181,34 +211,96 @@ function finishOnboarding() {
       <div class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl max-w-xl w-full p-8 sm:p-12 relative overflow-hidden">
         <div class="absolute top-0 right-0 -mt-16 -mr-16 w-48 h-48 bg-gradient-to-br from-brand-500 to-brand-400 rounded-full blur-[80px] opacity-20 pointer-events-none"></div>
 
-        <!-- STEP 1: Welcome -->
+        <!-- STEP 1: Welcome & About your work -->
         <template v-if="step === 1">
           <h1 class="text-3xl font-semibold tracking-tight text-zinc-900 dark:text-white mb-3">Welcome to Noumena</h1>
-          <p class="text-zinc-500 dark:text-zinc-400 leading-relaxed mb-8">
-            Let's connect your first channel. We'll automatically pull in your latest comments and
-            start surfacing the insights hidden in them.
+          <p class="text-zinc-500 dark:text-zinc-400 leading-relaxed mb-6">
+            Tell us a bit about your work so we can tailor your insights, or jump straight to connecting your channel.
           </p>
-          <ul class="space-y-3 text-sm text-zinc-700 dark:text-zinc-300 mb-10">
-            <li class="flex items-start gap-3">
-              <span class="mt-1 w-5 h-5 rounded-full bg-emerald-50 dark:bg-emerald-400/10 text-emerald-600 dark:text-emerald-400 flex items-center justify-center ring-1 ring-emerald-600/20">
-                <svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7" /></svg>
-              </span>
-              Read-only access — we never post or modify anything.
-            </li>
-            <li class="flex items-start gap-3">
-              <span class="mt-1 w-5 h-5 rounded-full bg-emerald-50 dark:bg-emerald-400/10 text-emerald-600 dark:text-emerald-400 flex items-center justify-center ring-1 ring-emerald-600/20">
-                <svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7" /></svg>
-              </span>
-              First insights ready in under 30 minutes.
-            </li>
-            <li class="flex items-start gap-3">
-              <span class="mt-1 w-5 h-5 rounded-full bg-emerald-50 dark:bg-emerald-400/10 text-emerald-600 dark:text-emerald-400 flex items-center justify-center ring-1 ring-emerald-600/20">
-                <svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7" /></svg>
-              </span>
-              You can disconnect at any time from Settings.
-            </li>
-          </ul>
-          <PrimaryButton full-width @click="startOnboarding">Get started</PrimaryButton>
+
+          <div class="space-y-4 mb-8">
+            <div>
+              <label for="onboarding-name" class="block text-xs font-semibold uppercase tracking-wider text-zinc-600 dark:text-zinc-400 mb-1">Your name or handle:</label>
+              <input
+                id="onboarding-name"
+                type="text"
+                v-model="displayNameInput"
+                placeholder="e.g. Alex Smith or TechReviews"
+                maxlength="100"
+                class="w-full rounded-lg border border-zinc-200 bg-white py-2 px-3 text-sm text-zinc-800 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-brand-500"
+              />
+            </div>
+
+            <div>
+              <label class="block text-xs font-semibold uppercase tracking-wider text-zinc-600 dark:text-zinc-400 mb-2">I describe myself as a:</label>
+              <div class="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                <label
+                  v-for="t in [
+                    { value: 'creator', label: 'Creator' },
+                    { value: 'agency', label: 'Agency' },
+                    { value: 'brand', label: 'Brand' },
+                    { value: 'other', label: 'Other' },
+                  ]"
+                  :key="t.value"
+                  :class="[
+                    'py-2 px-3 text-xs font-medium rounded-lg border text-center transition-all cursor-pointer select-none',
+                    userType === t.value
+                      ? 'border-brand-500 bg-brand-50 text-brand-700 dark:bg-brand-900/30 dark:border-brand-400 dark:text-brand-300 ring-1 ring-brand-500'
+                      : 'border-zinc-200 bg-white text-zinc-700 dark:bg-zinc-800 dark:border-zinc-700 dark:text-zinc-300 hover:border-zinc-300'
+                  ]"
+                >
+                  <input
+                    type="radio"
+                    name="onboarding-user-type"
+                    :value="t.value"
+                    v-model="userType"
+                    class="sr-only"
+                  />
+                  {{ t.label }}
+                </label>
+              </div>
+            </div>
+
+            <div>
+              <label for="onboarding-goal" class="block text-xs font-semibold uppercase tracking-wider text-zinc-600 dark:text-zinc-400 mb-2">Primary goal:</label>
+              <select
+                id="onboarding-goal"
+                v-model="primaryGoal"
+                class="w-full rounded-lg border border-zinc-200 bg-white py-2 px-3 text-sm text-zinc-800 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-brand-500"
+              >
+                <option value="">Select your main goal (optional)</option>
+                <option value="understand_audience">Understand my audience deeper</option>
+                <option value="generate_content_ideas">Generate fresh content ideas</option>
+                <option value="improve_retention">Improve audience retention</option>
+                <option value="win_sponsorships">Win brand sponsorships</option>
+                <option value="reduce_toxicity">Reduce comment toxicity</option>
+                <option value="report_to_clients">Report insights to clients</option>
+                <option value="other">Other</option>
+              </select>
+            </div>
+
+            <div>
+              <label for="onboarding-topics" class="block text-xs font-semibold uppercase tracking-wider text-zinc-600 dark:text-zinc-400 mb-1">Content topics (comma-separated):</label>
+              <input
+                id="onboarding-topics"
+                type="text"
+                v-model="contentTopicsInput"
+                placeholder="e.g. tech, coding, tutorials"
+                class="w-full rounded-lg border border-zinc-200 bg-white py-2 px-3 text-sm text-zinc-800 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-brand-500"
+              />
+            </div>
+          </div>
+
+          <div class="space-y-3">
+            <PrimaryButton full-width @click="startOnboarding">Get started</PrimaryButton>
+            <button
+              type="button"
+              @click="skipProfile"
+              class="w-full text-center text-xs font-medium text-zinc-500 dark:text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 py-2 transition-colors"
+            >
+              Skip for now
+            </button>
+          </div>
         </template>
 
         <!-- STEP 2: Connect -->

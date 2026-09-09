@@ -236,3 +236,92 @@ export interface UserProfile {
   /** Set while an email change awaits verification (fix-frontend-plumbing). */
   pending_email?: string | null
 }
+
+export type UserType = 'creator' | 'agency' | 'brand' | 'other'
+export type PrimaryGoal =
+  | 'understand_audience'
+  | 'generate_content_ideas'
+  | 'improve_retention'
+  | 'win_sponsorships'
+  | 'reduce_toxicity'
+  | 'report_to_clients'
+  | 'other'
+export type PrimaryPlatform = 'youtube' | 'tiktok' | 'instagram' | 'other'
+export type AudienceSizeBucket =
+  | 'under_1k'
+  | '1k_10k'
+  | '10k_50k'
+  | '50k_500k'
+  | '500k_1m'
+  | 'over_1m'
+  | 'prefer_not_to_say'
+export type WeeklyCommentVolumeBucket =
+  | 'under_100'
+  | '100_1k'
+  | '1k_10k'
+  | '10k_100k'
+  | 'over_100k'
+  | 'prefer_not_to_say'
+export type SuccessMetric =
+  | 'views'
+  | 'watch_time'
+  | 'subscribers'
+  | 'engagement'
+  | 'sentiment'
+  | 'sponsor_deals'
+  | 'product_sales'
+  | 'client_reports'
+  | 'other'
+export type ProfileRole = 'owner' | 'strategist' | 'analyst' | 'moderator' | 'viewer' | 'other'
+export type TeamSizeBucket = 'solo' | '2_5' | '6_20' | '21_plus' | 'prefer_not_to_say'
+export type PublishingFrequencyBucket =
+  | 'daily'
+  | 'several_weekly'
+  | 'weekly'
+  | 'biweekly'
+  | 'monthly'
+  | 'irregular'
+  | 'prefer_not_to_say'
+export type InsightPriority =
+  | 'questions'
+  | 'content_ideas'
+  | 'criticism'
+  | 'toxicity'
+  | 'collaboration'
+  | 'sentiment'
+export type CurrentWorkflow =
+  | 'native_tools'
+  | 'spreadsheets'
+  | 'moderation_tool'
+  | 'agency_dashboard'
+  | 'none'
+  | 'other'
+export type BiggestPain =
+  | 'too_many_comments'
+  | 'missed_feedback'
+  | 'toxicity'
+  | 'reporting_time'
+  | 'unclear_content_plan'
+  | 'team_visibility'
+  | 'other'
+
+export interface CreatorProfile {
+  user_id?: string
+  display_name?: string | null
+  user_type?: UserType | null
+  primary_goal?: PrimaryGoal | null
+  primary_platform?: PrimaryPlatform | null
+  content_topics?: string[]
+  audience_size_bucket?: AudienceSizeBucket | null
+  weekly_comment_volume_bucket?: WeeklyCommentVolumeBucket | null
+  success_metric?: SuccessMetric | null
+  role?: ProfileRole | null
+  team_size_bucket?: TeamSizeBucket | null
+  publishing_frequency_bucket?: PublishingFrequencyBucket | null
+  insight_priorities?: InsightPriority[]
+  current_workflow?: CurrentWorkflow | null
+  biggest_pain?: BiggestPain | null
+  created_at?: string | null
+  updated_at?: string | null
+}
+
