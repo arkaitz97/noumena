@@ -52,6 +52,21 @@ const VALID_INSIGHT_TYPES: InsightType[] = [
   'content_format_request', 'other',
 ]
 
+const RANGE_DAYS: Record<WindowKey, number> = { '7d': 7, '30d': 30, '90d': 90 }
+
+// Preset ranges materialise into date_from/date_to; the URL carries only the
+// dates, not the range. Reverse-map the span back to its window so a reload
+// restores the preset (and its widget fetches) instead of defaulting to 7d.
+function rangeFromQuery(query: Record<string, unknown>): WindowKey | null {
+  const from = asString(query.date_from)
+  const to = asString(query.date_to)
+  if (!from || !to) return null
+  const span = Math.round((Date.parse(to) - Date.parse(from)) / 86_400_000)
+  return (Object.keys(RANGE_DAYS) as WindowKey[]).find((k) => RANGE_DAYS[k] === span) ?? null
+}
+
+const range = ref<WindowKey>(rangeFromQuery(route.query) ?? '7d')
+
 const serialiseFilters = (f: FeedFilters): Record<string, string> => {
   const q: Record<string, string> = {}
   if (f.channels.length > 0) q.channels = f.channels.join(',')
@@ -108,6 +123,8 @@ watch(
   () => route.query,
   (q) => {
     if (JSON.stringify(q) === JSON.stringify(serialiseFilters(feed.filters))) return
+    const nextRange = rangeFromQuery(q as Record<string, unknown>)
+    if (nextRange && nextRange !== range.value) range.value = nextRange
     feed.applyFilters(parseFilters(q as Record<string, unknown>))
     void feed.fetchFeed({ reset: true })
   },
@@ -126,8 +143,7 @@ function onResetFilters(): void {
 // Widgets follow the FilterBar: one channel (first selected), the screen
 // range, and — for the actionable panel — the insight-type filter.
 const widgetChannelId = computed(() => feed.filters.channels[0] ?? null)
-const range = ref<WindowKey>('7d')
-const rangeDays = computed(() => ({ '7d': 7, '30d': 30, '90d': 90 })[range.value])
+const rangeDays = computed(() => RANGE_DAYS[range.value])
 const toxicityWindow = computed<WindowKey>(() => range.value)
 
 async function refreshInsights(force = false): Promise<void> {
