@@ -1,13 +1,55 @@
+# Databases and journals
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
 noumena.db
 noumena.db-wal
 noumena.db-shm
-*.db-journal
-seed_db
+
+# Compiled binaries
 /api
+/seed_db
+*.test
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Environment configs
 .env
+.env.local
+.env.*.local
+
+# Backups and exports
 backups/
 exports/
+
+# Go coverage and test artifacts
+coverage.out
+coverage.txt
+coverage.html
+profile.out
+
+# Frontend dependencies, builds, and test artifacts
 frontend/node_modules/
 frontend/dist/
 frontend/coverage/
+frontend/test-results/
+playwright-report/
+test-results/
+
+# OpenCode plugin dependencies
 .opencode/node_modules/
+.opencode/package.json
+.opencode/package-lock.json
+.opencode/bun.lock
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+*.swo
+*~
