@@ -60,6 +60,19 @@ type Config struct {
 	// the worker skips per-user OAuth token acquisition for search.list /
 	// commentThreads.list / comments.list. Public-data only.
 	YouTubeAPIKey string
+	// YouTube quota budget (optimize-youtube-api-quota). YouTubeDailyQuotaUnits
+	// mirrors the project's daily Data API v3 quota (default 10,000 units);
+	// the client stops issuing requests once the local accounting hits the
+	// budget. The per-job ceilings cap how much of the daily budget a single
+	// channel job may consume.
+	YouTubeDailyQuotaUnits         int
+	IngestionMaxRequestsPerJob     int
+	IngestionMaxVideosPerJob       int
+	IngestionMaxThreadPagesPerJob  int
+	IngestionMaxReplyFetchesPerJob int
+	// Adaptive polling bounds: inactive channels back off from
+	// IngestionPollIntervalMinutes up to x IngestionPollIntervalMaxMultiplier.
+	IngestionPollIntervalMaxMultiplier int
 
 	// LLM batch-processing (llm-processing change)
 	LLMProcessorEnabled       bool
@@ -184,13 +197,19 @@ var Default = &Config{
 	TokenExpiryWarningDays:    7,
 	OAuthStateTTL:             10 * time.Minute,
 
-	IngestionWorkerEnabled:       true,
-	IngestionTickInterval:        30 * time.Second,
-	IngestionPollIntervalMinutes: 30,
-	IngestionMaxRetries:          5,
-	IngestionJobDeadline:         5 * time.Minute,
-	IngestionMaxConcurrency:      8,
-	IngestionDeadLetterAlertTo:   "",
+	IngestionWorkerEnabled:             true,
+	IngestionTickInterval:              30 * time.Second,
+	IngestionPollIntervalMinutes:       30,
+	IngestionMaxRetries:                5,
+	IngestionJobDeadline:               5 * time.Minute,
+	IngestionMaxConcurrency:            8,
+	IngestionDeadLetterAlertTo:         "",
+	YouTubeDailyQuotaUnits:             10000,
+	IngestionMaxRequestsPerJob:         150,
+	IngestionMaxVideosPerJob:           100,
+	IngestionMaxThreadPagesPerJob:      25,
+	IngestionMaxReplyFetchesPerJob:     100,
+	IngestionPollIntervalMaxMultiplier: 8,
 
 	// LLM processor defaults from llm-processing/proposal.md.
 	LLMProcessorEnabled:       false, // gated until smoke-tested
@@ -451,6 +470,31 @@ func Load(strict bool) (*Config, error) {
 	}
 	c.IngestionDeadLetterAlertTo = os.Getenv("INGESTION_DEAD_LETTER_ALERT_TO")
 	c.YouTubeAPIKey = os.Getenv("YOUTUBE_API_KEY")
+	if v := os.Getenv("YOUTUBE_DAILY_QUOTA_UNITS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("YOUTUBE_DAILY_QUOTA_UNITS must be a non-negative integer")
+		}
+		c.YouTubeDailyQuotaUnits = n
+	}
+	for _, env := range []struct {
+		name string
+		dest *int
+	}{
+		{"INGESTION_MAX_REQUESTS_PER_JOB", &c.IngestionMaxRequestsPerJob},
+		{"INGESTION_MAX_VIDEOS_PER_JOB", &c.IngestionMaxVideosPerJob},
+		{"INGESTION_MAX_THREAD_PAGES_PER_JOB", &c.IngestionMaxThreadPagesPerJob},
+		{"INGESTION_MAX_REPLY_FETCHES_PER_JOB", &c.IngestionMaxReplyFetchesPerJob},
+		{"INGESTION_POLL_INTERVAL_MAX_MULTIPLIER", &c.IngestionPollIntervalMaxMultiplier},
+	} {
+		if v := os.Getenv(env.name); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 0 {
+				return nil, fmt.Errorf("%s must be a non-negative integer", env.name)
+			}
+			*env.dest = n
+		}
+	}
 
 	// --- LLM processing ----------------------------------------------------
 	if v := os.Getenv("LLM_PROCESSOR_ENABLED"); v != "" {

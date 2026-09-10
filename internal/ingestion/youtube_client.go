@@ -3,11 +3,13 @@ package ingestion
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"noumena/internal/db"
@@ -52,6 +54,198 @@ func (e *CommentsDisabledError) Error() string {
 	return fmt.Sprintf("youtube comments disabled: %s", e.Path)
 }
 
+// QuotaExhaustedError indicates the request was suppressed locally because
+// the project's daily YouTube quota budget (or a recorded quotaExceeded
+// hard-stop) is spent. Callers should stop the current job and defer the
+// channel WITHOUT consuming retry budget.
+type QuotaExhaustedError struct {
+	UnitsSpent int64
+	DailyLimit int64
+	RetryAt    time.Time
+}
+
+func (e *QuotaExhaustedError) Error() string {
+	return fmt.Sprintf("youtube quota exhausted: spent=%d limit=%d retry_at=%s",
+		e.UnitsSpent, e.DailyLimit, e.RetryAt.UTC().Format(time.RFC3339))
+}
+
+// JobBudgetExceededError indicates a per-job ceiling was reached (requests,
+// videos, pages, or replies). Like quota exhaustion it is a clean stop, not
+// a failure.
+type JobBudgetExceededError struct {
+	Kind  string // requests | videos | pages | replies
+	Limit int
+}
+
+func (e *JobBudgetExceededError) Error() string {
+	return fmt.Sprintf("youtube job %s ceiling reached: limit=%d", e.Kind, e.Limit)
+}
+
+// ============================================================================
+// Quota accounting — centralized method costs, daily budget, job ceilings.
+// ============================================================================
+
+// youtubeMethodUnits centralizes Data API v3 quota costs (units per request)
+// for every method the ingestion worker calls. search.list is the 100-unit
+// outlier this change exists to avoid.
+var youtubeMethodUnits = map[string]int64{
+	"search.list":         100,
+	"playlistItems.list":  1,
+	"channels.list":       1,
+	"commentThreads.list": 1,
+	"comments.list":       1,
+}
+
+// youtubeMethodAndUnits maps a client request path (e.g. "/commentThreads?...")
+// to its API method name and quota cost. Unknown paths cost 1 unit.
+func youtubeMethodAndUnits(path string) (string, int64) {
+	name := path
+	if i := strings.IndexAny(name, "?"); i >= 0 {
+		name = name[:i]
+	}
+	name = strings.TrimPrefix(name, "/")
+	key := name + ".list"
+	if u, ok := youtubeMethodUnits[key]; ok {
+		return key, u
+	}
+	return name, 1
+}
+
+// QuotaAccounting tracks consumed units against a daily project budget and
+// records hard stops (quotaExceeded responses) until the next UTC day. Safe
+// for concurrent use; a shared YouTubeClient may be driven by many workers.
+type QuotaAccounting struct {
+	mu            sync.Mutex
+	day           string // UTC date of the current budget window
+	units         int64
+	dailyLimit    int64 // 0 = unlimited
+	hardStopUntil time.Time
+}
+
+// NewQuotaAccounting returns accounting for a daily unit budget. dailyLimit
+// of 0 disables budget enforcement (requests are still metered).
+func NewQuotaAccounting(dailyLimit int64) *QuotaAccounting {
+	return &QuotaAccounting{dailyLimit: dailyLimit, day: utcDay(time.Now())}
+}
+
+func utcDay(t time.Time) string { return t.UTC().Format("2006-01-02") }
+
+// nextUTCDay is the UTC-midnight budget reset instant after t.
+func nextUTCDay(t time.Time) time.Time {
+	return t.UTC().Truncate(24 * time.Hour).Add(24 * time.Hour)
+}
+
+// ytErrorStatus buckets a doGET error into the closed status set recorded
+// on noumena_youtube_requests_total{status}.
+func ytErrorStatus(err error) string {
+	var tok *TokenInvalidError
+	var rl *RateLimitError
+	var cd *CommentsDisabledError
+	var qe *QuotaExhaustedError
+	var jb *JobBudgetExceededError
+	switch {
+	case errors.As(err, &tok):
+		return "unauthorized"
+	case errors.As(err, &rl):
+		return "rate_limited"
+	case errors.As(err, &cd):
+		return "comments_disabled"
+	case errors.As(err, &qe):
+		return "quota_exhausted"
+	case errors.As(err, &jb):
+		return "job_ceiling"
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return "ctx_error"
+	default:
+		return "error"
+	}
+}
+
+// TryReserve consumes units for an outgoing request, returning false when the
+// budget is spent or a hard stop is active. A new UTC day rolls the window.
+func (a *QuotaAccounting) TryReserve(units int64, now time.Time) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if d := utcDay(now); d != a.day {
+		a.day, a.units = d, 0
+	}
+	if now.Before(a.hardStopUntil) {
+		return false
+	}
+	if a.dailyLimit > 0 && a.units+units > a.dailyLimit {
+		return false
+	}
+	a.units += units
+	return true
+}
+
+// MarkExhausted records a server-side quotaExceeded rejection and stops
+// admission until the next UTC midnight (when Google's daily budget resets).
+func (a *QuotaAccounting) MarkExhausted(now time.Time) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	next := now.UTC().Truncate(24 * time.Hour).Add(24 * time.Hour)
+	if next.After(a.hardStopUntil) {
+		a.hardStopUntil = next
+	}
+	if a.dailyLimit > 0 {
+		a.units = a.dailyLimit
+	}
+}
+
+// Spend records units for a request the accounting did not admit (e.g. a
+// quota rejection that still consumed the unit window).
+func (a *QuotaAccounting) Spend(units int64, now time.Time) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if d := utcDay(now); d != a.day {
+		a.day, a.units = d, 0
+	}
+	a.units += units
+}
+
+// UnitsSpent returns the units consumed in the current window.
+func (a *QuotaAccounting) UnitsSpent() int64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.units
+}
+
+// jobBudget carries a per-job request ceiling through context so the
+// stateless, shared client can admit or suppress requests per job without
+// global state. Zero remaining ⇒ JobBudgetExceededError.
+type jobBudget struct {
+	mu    sync.Mutex
+	used  int
+	limit int
+}
+
+type jobBudgetKey struct{}
+
+// WithJobRequestBudget bounds the number of YouTube requests made while ctx
+// is used. limit <= 0 means unlimited.
+func WithJobRequestBudget(ctx context.Context, limit int) context.Context {
+	if limit <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, jobBudgetKey{}, &jobBudget{limit: limit})
+}
+
+func jobBudgetFrom(ctx context.Context) *jobBudget {
+	jb, _ := ctx.Value(jobBudgetKey{}).(*jobBudget)
+	return jb
+}
+
+func (jb *jobBudget) take() bool {
+	jb.mu.Lock()
+	defer jb.mu.Unlock()
+	if jb.used >= jb.limit {
+		return false
+	}
+	jb.used++
+	return true
+}
+
 // ============================================================================
 // YouTubeClient
 // ============================================================================
@@ -67,6 +261,9 @@ type YouTubeClient struct {
 	// (search/commentThreads/comments). OAuth-only endpoints (channels?mine)
 	// still require a token.
 	APIKey string
+	// Quota, when non-nil, meters every request against the project's daily
+	// unit budget and suppresses calls once it is spent.
+	Quota *QuotaAccounting
 }
 
 // NewYouTubeClient returns a client with sensible defaults.
@@ -106,6 +303,12 @@ type CommentThread struct {
 	PostedAt        time.Time
 	VideoID         string
 	VideoTitle      string
+
+	// Reply-gating metadata, set on TOP-LEVEL records only
+	// (optimize-youtube-api-quota): callers must fetch deep replies via
+	// comments.list only when TotalReplyCount > EmbeddedReplyCount.
+	TotalReplyCount    int
+	EmbeddedReplyCount int
 }
 
 func (t *CommentThread) ToDBComment(platformChannelID string) *db.Comment {
@@ -180,6 +383,7 @@ func (c *YouTubeClient) ListVideos(ctx context.Context, accessToken, channelID s
 		q.Set("type", "video")
 		q.Set("order", "date")
 		q.Set("maxResults", "50")
+		q.Set("fields", "nextPageToken,items(id/videoId,snippet/publishedAt,snippet/title)")
 		if !publishedAfter.IsZero() {
 			q.Set("publishedAfter", publishedAfter.UTC().Format(time.RFC3339))
 		}
@@ -201,6 +405,124 @@ func (c *YouTubeClient) ListVideos(ctx context.Context, accessToken, channelID s
 			}
 			pubAt, _ := time.Parse(time.RFC3339, it.Snippet.PublishedAt)
 			buffer = append(buffer, VideoRef{ID: it.ID.VideoID, Title: it.Snippet.Title, PublishedAt: pubAt})
+		}
+		bufferIdx = 0
+		pageToken = parsed.NextPageToken
+		if pageToken == "" && len(buffer) == 0 {
+			exhausted = true
+		}
+		return nil
+	}
+
+	return func() (VideoRef, bool, error) {
+		if exhausted {
+			return VideoRef{}, false, nil
+		}
+		if bufferIdx >= len(buffer) {
+			if pageToken == "" && buffer != nil {
+				exhausted = true
+				return VideoRef{}, false, nil
+			}
+			if err := fetchPage(); err != nil {
+				return VideoRef{}, false, err
+			}
+			if exhausted {
+				return VideoRef{}, false, nil
+			}
+		}
+		ref := buffer[bufferIdx]
+		bufferIdx++
+		return ref, true, nil
+	}
+}
+
+// ============================================================================
+// playlistItems.list — quota-efficient uploads-playlist discovery
+// ============================================================================
+
+type playlistItemsResponse struct {
+	NextPageToken string `json:"nextPageToken"`
+	Items         []struct {
+		ContentDetails struct {
+			VideoID string `json:"videoId"`
+		} `json:"contentDetails"`
+		Snippet struct {
+			PublishedAt string `json:"publishedAt"`
+			Title       string `json:"title"`
+		} `json:"snippet"`
+	} `json:"items"`
+}
+
+// ResolveUploadsPlaylist returns the channel's uploads playlist id via
+// channels.list(part=contentDetails) — 1 unit, resolved once per channel and
+// persisted by the worker.
+func (c *YouTubeClient) ResolveUploadsPlaylist(ctx context.Context, accessToken, channelID string) (string, error) {
+	q := url.Values{}
+	q.Set("part", "contentDetails")
+	q.Set("id", channelID)
+	q.Set("fields", "items/contentDetails/relatedPlaylists/uploads")
+	body, err := c.doGET(ctx, accessToken, "/channels?"+q.Encode())
+	if err != nil {
+		return "", err
+	}
+	var parsed struct {
+		Items []struct {
+			ContentDetails struct {
+				RelatedPlaylists struct {
+					Uploads string `json:"uploads"`
+				} `json:"relatedPlaylists"`
+			} `json:"contentDetails"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return "", fmt.Errorf("decode channels.list (uploads): %w", err)
+	}
+	if len(parsed.Items) == 0 || parsed.Items[0].ContentDetails.RelatedPlaylists.Uploads == "" {
+		return "", fmt.Errorf("channel %s has no uploads playlist", channelID)
+	}
+	return parsed.Items[0].ContentDetails.RelatedPlaylists.Uploads, nil
+}
+
+// ListUploads paginates playlistItems.list for a channel's uploads playlist
+// (1 unit/page vs 100 units for search.list). Uploads are newest-first, so
+// when stopBefore is non-zero the iteration stops early at the first video
+// published before it — the per-sync watermark boundary.
+func (c *YouTubeClient) ListUploads(ctx context.Context, accessToken, playlistID string, stopBefore time.Time) func() (VideoRef, bool, error) {
+	pageToken := ""
+	bufferIdx := 0
+	var buffer []VideoRef
+	exhausted := false
+
+	fetchPage := func() error {
+		q := url.Values{}
+		q.Set("part", "snippet,contentDetails")
+		q.Set("playlistId", playlistID)
+		q.Set("maxResults", "50")
+		q.Set("fields", "nextPageToken,items(contentDetails/videoId,snippet/publishedAt,snippet/title)")
+		if pageToken != "" {
+			q.Set("pageToken", pageToken)
+		}
+		body, err := c.doGET(ctx, accessToken, "/playlistItems?"+q.Encode())
+		if err != nil {
+			return err
+		}
+		var parsed playlistItemsResponse
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			return fmt.Errorf("decode playlistItems.list: %w", err)
+		}
+		buffer = buffer[:0]
+		for _, it := range parsed.Items {
+			if it.ContentDetails.VideoID == "" {
+				continue
+			}
+			pubAt, _ := time.Parse(time.RFC3339, it.Snippet.PublishedAt)
+			// Descending publishedAt: everything after the first item
+			// older than the watermark is already ingested.
+			if !stopBefore.IsZero() && !pubAt.IsZero() && pubAt.Before(stopBefore) {
+				exhausted = true
+				break
+			}
+			buffer = append(buffer, VideoRef{ID: it.ContentDetails.VideoID, Title: it.Snippet.Title, PublishedAt: pubAt})
 		}
 		bufferIdx = 0
 		pageToken = parsed.NextPageToken
@@ -283,6 +605,7 @@ func (c *YouTubeClient) ListReplies(ctx context.Context, accessToken, parentComm
 		q.Set("parentId", parentCommentID)
 		q.Set("maxResults", "100")
 		q.Set("textFormat", "plainText")
+		q.Set("fields", "nextPageToken,items(id,snippet(authorDisplayName,textDisplay,textOriginal,publishedAt,parentId,videoId))")
 		if pageToken != "" {
 			q.Set("pageToken", pageToken)
 		}
@@ -353,17 +676,31 @@ func (c *YouTubeClient) ListReplies(ctx context.Context, accessToken, parentComm
 // video. Both top-level comments and their replies are flattened into a
 // single stream; replies carry ParentCommentID = top-level comment id.
 func (c *YouTubeClient) ListCommentThreads(ctx context.Context, accessToken, videoID string) func() (CommentThread, bool, error) {
-	pageToken := ""
+	return c.ListCommentThreadsPaged(ctx, accessToken, videoID, "", nil)
+}
+
+// ListCommentThreadsPaged is ListCommentThreads with incremental-sync
+// support (optimize-youtube-api-quota): iteration starts from startToken
+// ("" = first page) and afterPage is invoked after every fetched page with
+// the token used to fetch that page plus the token that resumes after it,
+// letting the worker persist durable checkpoints that survive deadlines and
+// restarts (resuming at the current page's token is always safe — the
+// unique comment constraints deduplicate the replay).
+func (c *YouTubeClient) ListCommentThreadsPaged(ctx context.Context, accessToken, videoID, startToken string, afterPage func(fetchedWith, nextToken string)) func() (CommentThread, bool, error) {
+	pageToken := startToken
 	var pending []CommentThread
 	idx := 0
 	exhausted := false
+	fetchedWith := ""
 
 	fetchPage := func() error {
+		fetchedWith = pageToken
 		q := url.Values{}
 		q.Set("part", "snippet,replies")
 		q.Set("videoId", videoID)
 		q.Set("maxResults", "100")
 		q.Set("order", "time")
+		q.Set("fields", "nextPageToken,items(snippet/topLevelComment(id,snippet(authorDisplayName,textDisplay,textOriginal,publishedAt,videoId)),snippet/totalReplyCount,replies/comments(id,snippet(authorDisplayName,textDisplay,textOriginal,publishedAt,parentId,videoId)))")
 		if pageToken != "" {
 			q.Set("pageToken", pageToken)
 		}
@@ -386,7 +723,7 @@ func (c *YouTubeClient) ListCommentThreads(ctx context.Context, accessToken, vid
 			if body == "" {
 				body = tlc.Snippet.TextOriginal
 			}
-			pending = append(pending, CommentThread{
+			top := CommentThread{
 				CommentID:       tlc.ID,
 				ParentCommentID: nil,
 				ReplyDepth:      0,
@@ -394,7 +731,10 @@ func (c *YouTubeClient) ListCommentThreads(ctx context.Context, accessToken, vid
 				Body:            body,
 				PostedAt:        topPosted,
 				VideoID:         tlc.Snippet.VideoID,
-			})
+				TotalReplyCount: item.Snippet.TotalReplyCount,
+			}
+			topIdx := len(pending)
+			pending = append(pending, top)
 			if item.Replies != nil {
 				for _, reply := range item.Replies.Comments {
 					if reply.ID == "" {
@@ -419,11 +759,15 @@ func (c *YouTubeClient) ListCommentThreads(ctx context.Context, accessToken, vid
 						PostedAt:        rPosted,
 						VideoID:         reply.Snippet.VideoID,
 					})
+					pending[topIdx].EmbeddedReplyCount++
 				}
 			}
 		}
 		idx = 0
 		pageToken = parsed.NextPageToken
+		if afterPage != nil {
+			afterPage(fetchedWith, pageToken)
+		}
 		if pageToken == "" && len(pending) == 0 {
 			exhausted = true
 		}
@@ -502,6 +846,7 @@ func (c *YouTubeClient) ResolveChannelRef(ctx context.Context, ref string) (*Cha
 	}
 	q := url.Values{}
 	q.Set("part", "snippet")
+	q.Set("fields", "items(id,snippet/title)")
 	if channelID != "" {
 		q.Set("id", channelID)
 	} else {
@@ -537,7 +882,42 @@ func (c *YouTubeClient) ResolveChannelRef(ctx context.Context, ref string) (*Cha
 // and returns the body. It surfaces typed errors for 401 and rate-limit
 // conditions; all other non-2xx responses become a plain error. There are NO
 // internal retries — retry policy is owned by the worker.
+//
+// Quota admission (optimize-youtube-api-quota): before hitting the network
+// the request must pass the per-job ceiling (context jobBudget) and the
+// daily project budget (c.Quota). Suppressed requests never leave the
+// process and are recorded on noumena_youtube_requests_suppressed_total.
 func (c *YouTubeClient) doGET(ctx context.Context, accessToken, path string) ([]byte, error) {
+	method, units := youtubeMethodAndUnits(path)
+	if jb := jobBudgetFrom(ctx); jb != nil && !jb.take() {
+		recordYoutubeSuppressed(ctx, "job_ceiling")
+		return nil, &JobBudgetExceededError{Kind: "requests", Limit: jb.limit}
+	}
+	if c.Quota != nil && !c.Quota.TryReserve(units, time.Now()) {
+		recordYoutubeSuppressed(ctx, "daily_budget")
+		return nil, &QuotaExhaustedError{
+			UnitsSpent: c.Quota.UnitsSpent(),
+			RetryAt:    nextUTCDay(time.Now()),
+		}
+	}
+	body, err := c.doGETUnmetered(ctx, accessToken, path)
+	status := "ok"
+	if err != nil {
+		status = ytErrorStatus(err)
+		// A server-side quotaExceeded means the whole project budget is
+		// gone: hard-stop admission until the next UTC day.
+		var rl *RateLimitError
+		if errors.As(err, &rl) && rl.Reason == "quotaExceeded" && c.Quota != nil {
+			c.Quota.MarkExhausted(time.Now())
+		}
+	}
+	recordYoutubeRequest(ctx, method, status, units)
+	return body, err
+}
+
+// doGETUnmetered is the raw HTTP layer, split out so doGET can account for
+// every request exactly once.
+func (c *YouTubeClient) doGETUnmetered(ctx context.Context, accessToken, path string) ([]byte, error) {
 	if c.APIKey != "" {
 		sep := "?"
 		if strings.Contains(path, "?") {

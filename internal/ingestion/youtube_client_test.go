@@ -439,6 +439,279 @@ func TestYouTubeClient_ListReplies_ParentIdExtraction(t *testing.T) {
 	}
 }
 
+// --- uploads-playlist discovery (optimize-youtube-api-quota) ---------------
+
+func TestYouTubeClient_ResolveUploadsPlaylist(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path + "?" + r.URL.RawQuery
+		_, _ = w.Write([]byte(`{"items":[{"contentDetails":{"relatedPlaylists":{"uploads":"UU123"}}}]}`))
+	}))
+	defer srv.Close()
+	c := &YouTubeClient{HTTP: srv.Client(), BaseURL: srv.URL}
+	id, err := c.ResolveUploadsPlaylist(context.Background(), "tok", "UC1")
+	if err != nil {
+		t.Fatalf("ResolveUploadsPlaylist: %v", err)
+	}
+	if id != "UU123" {
+		t.Fatalf("got %q, want UU123", id)
+	}
+	if !strings.Contains(gotPath, "part=contentDetails") || !strings.Contains(gotPath, "fields=") {
+		t.Fatalf("missing part/fields projection: %s", gotPath)
+	}
+}
+
+func TestYouTubeClient_ListUploads_PaginationAndFields(t *testing.T) {
+	calls := 0
+	var sawFields bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Query().Get("fields") != "" {
+			sawFields = true
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch calls {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"nextPageToken":"P2",
+				"items":[
+					{"contentDetails":{"videoId":"v1"},"snippet":{"publishedAt":"2025-01-03T10:00:00Z","title":"One"}},
+					{"contentDetails":{"videoId":"v2"},"snippet":{"publishedAt":"2025-01-02T10:00:00Z","title":"Two"}}
+				]}`))
+		case 2:
+			_, _ = w.Write([]byte(`{
+				"items":[
+					{"contentDetails":{"videoId":"v3"},"snippet":{"publishedAt":"2025-01-01T10:00:00Z","title":"Three"}}
+				]}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := &YouTubeClient{HTTP: srv.Client(), BaseURL: srv.URL}
+	next := c.ListUploads(context.Background(), "tok", "UU1", time.Time{})
+	var ids []string
+	for {
+		v, ok, err := next()
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if !ok {
+			break
+		}
+		ids = append(ids, v.ID)
+	}
+	if got := strings.Join(ids, ","); got != "v1,v2,v3" {
+		t.Fatalf("expected v1,v2,v3 got %s", got)
+	}
+	if calls != 2 || !sawFields {
+		t.Fatalf("calls=%d sawFields=%v", calls, sawFields)
+	}
+}
+
+func TestYouTubeClient_ListUploads_StopsAtWatermark(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		// Newest-first page entirely older than the stop boundary.
+		_, _ = w.Write([]byte(`{
+			"nextPageToken":"P2",
+			"items":[
+				{"contentDetails":{"videoId":"v1"},"snippet":{"publishedAt":"2025-01-01T10:00:00Z"}},
+				{"contentDetails":{"videoId":"v2"},"snippet":{"publishedAt":"2024-12-31T10:00:00Z"}}
+			]}`))
+	}))
+	defer srv.Close()
+
+	c := &YouTubeClient{HTTP: srv.Client(), BaseURL: srv.URL}
+	stop := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+	next := c.ListUploads(context.Background(), "tok", "UU1", stop)
+	v, ok, err := next()
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if ok || v.ID != "" {
+		t.Fatalf("expected immediate stop at watermark, got %q ok=%v", v.ID, ok)
+	}
+	if calls != 1 {
+		t.Fatalf("expected single page then stop, got %d calls", calls)
+	}
+}
+
+// --- reply gating metadata (1.5) ---------------------------------------------
+
+func TestYouTubeClient_ThreadReplyCountsPreserved(t *testing.T) {
+	resp := commentThreadsResponse{
+		Items: []commentThreadItem{
+			{
+				ID: "T1",
+				Snippet: struct {
+					TopLevelComment ytComment `json:"topLevelComment"`
+					TotalReplyCount int       `json:"totalReplyCount"`
+				}{
+					TopLevelComment: ytComment{ID: "top", Snippet: commentSnippet{
+						AuthorDisplayName: "A", TextDisplay: "t", PublishedAt: "2025-01-01T10:00:00Z",
+					}},
+					TotalReplyCount: 5,
+				},
+				Replies: &struct {
+					Comments []ytComment `json:"comments"`
+				}{Comments: []ytComment{
+					{ID: "r1", Snippet: commentSnippet{TextDisplay: "x", PublishedAt: "2025-01-01T11:00:00Z", ParentID: "top"}},
+					{ID: "r2", Snippet: commentSnippet{TextDisplay: "y", PublishedAt: "2025-01-01T12:00:00Z", ParentID: "top"}},
+				}},
+			},
+		},
+	}
+	body, _ := json.Marshal(resp)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	c := &YouTubeClient{HTTP: srv.Client(), BaseURL: srv.URL}
+	next := c.ListCommentThreads(context.Background(), "tok", "vid")
+	top, ok, err := next()
+	if err != nil || !ok {
+		t.Fatalf("first: ok=%v err=%v", ok, err)
+	}
+	if top.TotalReplyCount != 5 || top.EmbeddedReplyCount != 2 {
+		t.Fatalf("gating metadata lost: total=%d embedded=%d", top.TotalReplyCount, top.EmbeddedReplyCount)
+	}
+}
+
+// --- quota accounting (3.1/3.2/3.3) ------------------------------------------
+
+func TestQuotaMethodUnits(t *testing.T) {
+	cases := map[string]int64{
+		"/search?key=k":             100,
+		"/playlistItems?part=x":     1,
+		"/channels?id=UC1":          1,
+		"/commentThreads?videoId=v": 1,
+		"/comments?parentId=c":      1,
+	}
+	for path, want := range cases {
+		name, units := youtubeMethodAndUnits(path)
+		if units != want {
+			t.Errorf("units(%s)=%d want %d", path, units, want)
+		}
+		if name == "" {
+			t.Errorf("empty method for %s", path)
+		}
+	}
+}
+
+func TestQuotaAccounting_DailyBudget(t *testing.T) {
+	a := NewQuotaAccounting(150)
+	now := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
+	if !a.TryReserve(100, now) || !a.TryReserve(1, now) || !a.TryReserve(49, now) {
+		t.Fatal("expected 150 units available")
+	}
+	if a.TryReserve(1, now) {
+		t.Fatal("expected budget spent")
+	}
+	// UTC-day roll resets the window.
+	if !a.TryReserve(1, now.Add(13*time.Hour)) {
+		t.Fatal("expected new-day budget")
+	}
+	// Hard stop ignores the window until it passes.
+	b := NewQuotaAccounting(0)
+	b.MarkExhausted(now)
+	if b.TryReserve(1, now) {
+		t.Fatal("expected hard stop to block")
+	}
+	if !b.TryReserve(1, now.Add(24*time.Hour)) {
+		t.Fatal("expected hard stop to expire at next UTC day")
+	}
+}
+
+func TestYouTubeClient_DailyBudgetSuppressesRequests(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_, _ = w.Write([]byte(`{"items":[]}`))
+	}))
+	defer srv.Close()
+
+	c := &YouTubeClient{HTTP: srv.Client(), BaseURL: srv.URL, Quota: NewQuotaAccounting(2)}
+	ctx := context.Background()
+	// commentThreads = 1 unit each; two fit, the third never leaves the
+	// process. search.list would cost 100 and be refused outright.
+	for i := 0; i < 2; i++ {
+		next := c.ListCommentThreads(ctx, "tok", "v")
+		if _, _, err := next(); err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+	}
+	next := c.ListCommentThreads(ctx, "tok", "v")
+	_, _, err := next()
+	var qe *QuotaExhaustedError
+	if !errors.As(err, &qe) {
+		t.Fatalf("expected QuotaExhaustedError, got %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 network calls, got %d", calls)
+	}
+	if qe.UnitsSpent != 2 {
+		t.Fatalf("UnitsSpent=%d want 2", qe.UnitsSpent)
+	}
+}
+
+func TestYouTubeClient_JobRequestCeiling(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_, _ = w.Write([]byte(`{"items":[]}`))
+	}))
+	defer srv.Close()
+
+	c := &YouTubeClient{HTTP: srv.Client(), BaseURL: srv.URL}
+	ctx := WithJobRequestBudget(context.Background(), 1)
+	if _, _, err := c.ListCommentThreads(ctx, "tok", "v")(); err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+	_, _, err := c.ListCommentThreads(ctx, "tok", "v2")()
+	var jb *JobBudgetExceededError
+	if !errors.As(err, &jb) || jb.Kind != "requests" {
+		t.Fatalf("expected JobBudgetExceededError(requests), got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected 1 network call, got %d", calls)
+	}
+}
+
+func TestYouTubeClient_QuotaExceededHardStopsAccounting(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"errors":[{"reason":"quotaExceeded"}]}}`))
+	}))
+	defer srv.Close()
+
+	c := &YouTubeClient{HTTP: srv.Client(), BaseURL: srv.URL, Quota: NewQuotaAccounting(10000)}
+	ctx := context.Background()
+	next := c.ListCommentThreads(ctx, "tok", "v")
+	if _, _, err := next(); err == nil {
+		t.Fatal("expected rate-limit error")
+	}
+	// After a server quotaExceeded, further requests are suppressed without
+	// touching the network.
+	calls := 0
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_, _ = w.Write([]byte(`{"items":[]}`))
+	}))
+	defer srv2.Close()
+	c2 := &YouTubeClient{HTTP: srv2.Client(), BaseURL: srv2.URL, Quota: c.Quota}
+	next2 := c2.ListCommentThreads(ctx, "tok", "v")
+	_, _, err2 := next2()
+	var qe *QuotaExhaustedError
+	if !errors.As(err2, &qe) {
+		t.Fatalf("expected suppression after hard stop, got %v", err2)
+	}
+	if calls != 0 {
+		t.Fatalf("expected no network calls after hard stop, got %d", calls)
+	}
+}
+
 func TestYouTubeClient_ToDBComment_RoundTrip(t *testing.T) {
 	parentID := "parent-abc"
 	ct := CommentThread{

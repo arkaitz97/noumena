@@ -28,6 +28,11 @@ var (
 	ingestionErrorsTotal       metric.Int64Counter
 	ingestionLockContentionTot metric.Int64Counter
 	fetchDurationSeconds       metric.Float64Histogram
+	// optimize-youtube-api-quota: YouTube request/quota telemetry.
+	youtubeRequestsTotal   metric.Int64Counter
+	youtubeQuotaUnitsTotal metric.Int64Counter
+	youtubeSuppressedTotal metric.Int64Counter
+	youtubeDiscoveryTotal  metric.Int64Counter
 )
 
 func init() {
@@ -56,6 +61,30 @@ func init() {
 		metric.WithUnit("s"),
 	); err != nil {
 		panic("noumena_fetch_duration_seconds: " + err.Error())
+	}
+	if youtubeRequestsTotal, err = ingestionMeter.Int64Counter(
+		"noumena_youtube_requests_total",
+		metric.WithDescription("YouTube API requests issued, by method and closed-enum status"),
+	); err != nil {
+		panic("noumena_youtube_requests_total: " + err.Error())
+	}
+	if youtubeQuotaUnitsTotal, err = ingestionMeter.Int64Counter(
+		"noumena_youtube_quota_units_total",
+		metric.WithDescription("YouTube Data API quota units consumed, by method"),
+	); err != nil {
+		panic("noumena_youtube_quota_units_total: " + err.Error())
+	}
+	if youtubeSuppressedTotal, err = ingestionMeter.Int64Counter(
+		"noumena_youtube_requests_suppressed_total",
+		metric.WithDescription("Requests never sent because a quota budget or job ceiling was spent"),
+	); err != nil {
+		panic("noumena_youtube_requests_suppressed_total: " + err.Error())
+	}
+	if youtubeDiscoveryTotal, err = ingestionMeter.Int64Counter(
+		"noumena_youtube_discovery_total",
+		metric.WithDescription("Video-discovery runs by source: uploads playlist vs search.list fallback"),
+	); err != nil {
+		panic("noumena_youtube_discovery_total: " + err.Error())
 	}
 }
 
@@ -114,4 +143,35 @@ func recordCommentsIngested(ctx context.Context, n int) {
 func recordLockContention(ctx context.Context) {
 	ingestionLockContentionTot.Add(ctx, 1,
 		metric.WithAttributes(platformAttr))
+}
+
+// ============================================================================
+// YouTube quota telemetry (optimize-youtube-api-quota).
+// ============================================================================
+
+// recordYoutubeRequest charges one issued request: method is the API
+// endpoint (search.list, playlistItems.list, ...), status the closed enum
+// from ytErrorStatus, units the centralized cost of that method.
+func recordYoutubeRequest(ctx context.Context, method, status string, units int64) {
+	m := attribute.String(telemetry.AttrMethod, method)
+	attrs := []attribute.KeyValue{platformAttr, m, attribute.String(telemetry.AttrStatus, status)}
+	youtubeRequestsTotal.Add(ctx, 1, metric.WithAttributes(attrs...))
+	if units > 0 {
+		youtubeQuotaUnitsTotal.Add(ctx, units, metric.WithAttributes(platformAttr, m))
+	}
+}
+
+// recordYoutubeSuppressed counts a request the budget layer refused to send.
+// reason is a closed enum: daily_budget | job_ceiling.
+func recordYoutubeSuppressed(ctx context.Context, reason string) {
+	youtubeSuppressedTotal.Add(ctx, 1,
+		metric.WithAttributes(platformAttr, attribute.String(telemetry.AttrReason, reason)))
+}
+
+// recordYoutubeDiscovery counts discovery runs by source: via=playlist |
+// search_fallback. A rising fallback rate means uploads-playlist metadata
+// is missing and 100-unit search.list calls are back.
+func recordYoutubeDiscovery(ctx context.Context, via string) {
+	youtubeDiscoveryTotal.Add(ctx, 1,
+		metric.WithAttributes(platformAttr, attribute.String("via", via)))
 }

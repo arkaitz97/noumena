@@ -43,23 +43,23 @@ type User struct {
 }
 
 type UserProfile struct {
-	UserID                    string     `json:"user_id"`
-	DisplayName               *string    `json:"display_name,omitempty"`
-	UserType                  *string    `json:"user_type,omitempty"`
-	PrimaryGoal               *string    `json:"primary_goal,omitempty"`
-	PrimaryPlatform           *string    `json:"primary_platform,omitempty"`
-	ContentTopics             []string   `json:"content_topics,omitempty"`
-	AudienceSizeBucket        *string    `json:"audience_size_bucket,omitempty"`
-	WeeklyCommentVolumeBucket *string    `json:"weekly_comment_volume_bucket,omitempty"`
-	SuccessMetric             *string    `json:"success_metric,omitempty"`
-	Role                      *string    `json:"role,omitempty"`
-	TeamSizeBucket            *string    `json:"team_size_bucket,omitempty"`
-	PublishingFrequencyBucket *string    `json:"publishing_frequency_bucket,omitempty"`
-	InsightPriorities         []string   `json:"insight_priorities,omitempty"`
-	CurrentWorkflow           *string    `json:"current_workflow,omitempty"`
-	BiggestPain               *string    `json:"biggest_pain,omitempty"`
-	CreatedAt                 time.Time  `json:"created_at"`
-	UpdatedAt                 time.Time  `json:"updated_at"`
+	UserID                    string    `json:"user_id"`
+	DisplayName               *string   `json:"display_name,omitempty"`
+	UserType                  *string   `json:"user_type,omitempty"`
+	PrimaryGoal               *string   `json:"primary_goal,omitempty"`
+	PrimaryPlatform           *string   `json:"primary_platform,omitempty"`
+	ContentTopics             []string  `json:"content_topics,omitempty"`
+	AudienceSizeBucket        *string   `json:"audience_size_bucket,omitempty"`
+	WeeklyCommentVolumeBucket *string   `json:"weekly_comment_volume_bucket,omitempty"`
+	SuccessMetric             *string   `json:"success_metric,omitempty"`
+	Role                      *string   `json:"role,omitempty"`
+	TeamSizeBucket            *string   `json:"team_size_bucket,omitempty"`
+	PublishingFrequencyBucket *string   `json:"publishing_frequency_bucket,omitempty"`
+	InsightPriorities         []string  `json:"insight_priorities,omitempty"`
+	CurrentWorkflow           *string   `json:"current_workflow,omitempty"`
+	BiggestPain               *string   `json:"biggest_pain,omitempty"`
+	CreatedAt                 time.Time `json:"created_at"`
+	UpdatedAt                 time.Time `json:"updated_at"`
 }
 
 type PlatformChannel struct {
@@ -76,6 +76,26 @@ type PlatformChannel struct {
 	IngestionErrorCount   int        `json:"ingestion_error_count,omitempty"`
 	IngestionLastErrorAt  *time.Time `json:"ingestion_last_error_at,omitempty"`
 	IngestionBackoffUntil *time.Time `json:"ingestion_backoff_until,omitempty"`
+
+	// Quota-optimization state (optimize-youtube-api-quota change).
+	// UploadsPlaylistID caches the channel's uploads playlist so discovery
+	// uses 1-unit playlistItems.list instead of 100-unit search.list.
+	// PollIntervalMinutes is the adaptive per-channel sync interval;
+	// nil means "use the configured minimum".
+	UploadsPlaylistID   *string `json:"uploads_playlist_id,omitempty"`
+	PollIntervalMinutes *int    `json:"poll_interval_minutes,omitempty"`
+}
+
+// VideoSyncState is a row in video_sync_state: the durable incremental
+// position for one video's comment walk (watermark = newest comment
+// posted_at persisted; page checkpoint = commentThreads token to resume
+// from; status = 'active' or 'skipped' for permanently un-fetchable videos).
+type VideoSyncState struct {
+	PlatformChannelID  string
+	VideoID            string
+	CommentWatermarkAt *time.Time
+	PageCheckpoint     *string
+	Status             string
 }
 
 // IngestionJob is a row in the ingestion_jobs queue.
@@ -138,22 +158,22 @@ type ChannelListItem struct {
 }
 
 type Comment struct {
-	ID                 string     `json:"id"`
-	PlatformChannelID  string     `json:"platform_channel_id"`
-	PlatformCommentID  string     `json:"platform_comment_id"`
-	ParentCommentID    *string    `json:"parent_comment_id,omitempty"`
-	ReplyDepth         int        `json:"reply_depth"`
-	AuthorHandle       *string    `json:"author_handle,omitempty"`
-	Body               string     `json:"body"`
-	PostedAt           time.Time  `json:"posted_at"`
-	Category           *string    `json:"category,omitempty"`
+	ID                 string          `json:"id"`
+	PlatformChannelID  string          `json:"platform_channel_id"`
+	PlatformCommentID  string          `json:"platform_comment_id"`
+	ParentCommentID    *string         `json:"parent_comment_id,omitempty"`
+	ReplyDepth         int             `json:"reply_depth"`
+	AuthorHandle       *string         `json:"author_handle,omitempty"`
+	Body               string          `json:"body"`
+	PostedAt           time.Time       `json:"posted_at"`
+	Category           *string         `json:"category,omitempty"`
 	ActionableInsights json.RawMessage `json:"actionable_insights,omitempty"`
-	Topic              *string    `json:"topic,omitempty"`
-	Confidence         *float64   `json:"confidence,omitempty"`
-	VideoID            *string    `json:"video_id,omitempty"`
-	VideoTitle         *string    `json:"video_title,omitempty"`
-	ProcessedAt        *time.Time `json:"processed_at,omitempty"`
-	CreatedAt          time.Time  `json:"created_at"`
+	Topic              *string         `json:"topic,omitempty"`
+	Confidence         *float64        `json:"confidence,omitempty"`
+	VideoID            *string         `json:"video_id,omitempty"`
+	VideoTitle         *string         `json:"video_title,omitempty"`
+	ProcessedAt        *time.Time      `json:"processed_at,omitempty"`
+	CreatedAt          time.Time       `json:"created_at"`
 }
 
 type UserCommentStar struct {

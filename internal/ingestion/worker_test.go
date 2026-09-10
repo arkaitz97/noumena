@@ -32,6 +32,11 @@ type fakeWorkerDB struct {
 	backoffSet       map[string]time.Time
 	resetCalls       []string
 	maxBackfillDays  int
+
+	// SyncStateDB state (optimize-youtube-api-quota).
+	playlists   map[string]string
+	pollSet     map[string]int
+	videoStates map[string]*db.VideoSyncState
 }
 
 func newFakeWorkerDB() *fakeWorkerDB {
@@ -40,7 +45,58 @@ func newFakeWorkerDB() *fakeWorkerDB {
 		lastSyncedSet:   map[string]time.Time{},
 		backoffSet:      map[string]time.Time{},
 		maxBackfillDays: 90,
+		playlists:       map[string]string{},
+		pollSet:         map[string]int{},
+		videoStates:     map[string]*db.VideoSyncState{},
 	}
+}
+
+func videoKey(pcID, videoID string) string { return pcID + "/" + videoID }
+
+func (f *fakeWorkerDB) SetUploadsPlaylistID(_ context.Context, pcID, playlistID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.playlists[pcID] = playlistID
+	return nil
+}
+func (f *fakeWorkerDB) SetPollInterval(_ context.Context, pcID string, minutes int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pollSet[pcID] = minutes
+	return nil
+}
+func (f *fakeWorkerDB) GetVideoSyncState(_ context.Context, pcID, videoID string) (*db.VideoSyncState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if st, ok := f.videoStates[videoKey(pcID, videoID)]; ok {
+		cp := *st
+		return &cp, nil
+	}
+	return nil, db.ErrNotFound
+}
+func (f *fakeWorkerDB) UpsertVideoSyncState(_ context.Context, st *db.VideoSyncState) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := videoKey(st.PlatformChannelID, st.VideoID)
+	existing, ok := f.videoStates[key]
+	if !ok {
+		cp := *st
+		if cp.Status == "" {
+			cp.Status = "active"
+		}
+		f.videoStates[key] = &cp
+		return nil
+	}
+	// Mirror SQLite semantics: watermark COALESCE(kept when nil), page
+	// checkpoint and status replaced wholesale.
+	if st.CommentWatermarkAt != nil {
+		existing.CommentWatermarkAt = st.CommentWatermarkAt
+	}
+	existing.PageCheckpoint = st.PageCheckpoint
+	if st.Status != "" {
+		existing.Status = st.Status
+	}
+	return nil
 }
 func (f *fakeWorkerDB) ClaimNextIngestionJob(ctx context.Context) (*db.IngestionJob, error) {
 	f.mu.Lock()
@@ -142,6 +198,7 @@ func (f *fakeWorkerDB) InsertComments(_ context.Context, comments []*db.Comment)
 func (w *Worker) processJobNoLock(parent context.Context, job *db.IngestionJob) {
 	jobCtx, cancel := context.WithTimeout(parent, w.JobDeadline)
 	defer cancel()
+	jobCtx = WithJobRequestBudget(jobCtx, w.MaxRequestsPerJob)
 
 	pc, err := w.DB.GetPlatformChannelByID(jobCtx, job.PlatformChannelID)
 	if err != nil {
@@ -167,10 +224,24 @@ func (w *Worker) processJobNoLock(parent context.Context, job *db.IngestionJob) 
 		publishedAfter = &t
 	}
 
-	if err := w.runIngestion(jobCtx, parent, pc, accessTok, publishedAfter, job); err != nil {
+	stats, err := w.runIngestion(jobCtx, parent, pc, accessTok, publishedAfter, job)
+	if err != nil {
 		var rate *RateLimitError
 		var tokInv *TokenInvalidError
+		var quotaEx *QuotaExhaustedError
+		var ceiling *JobBudgetExceededError
 		switch {
+		case errors.As(err, &quotaEx):
+			until := quotaEx.RetryAt
+			if until.IsZero() {
+				until = time.Now().Add(time.Hour)
+			}
+			_ = w.DB.MarkChannelBackoff(parent, job.PlatformChannelID, until)
+			_ = w.DB.MarkJobCompleted(parent, job.ID)
+			return
+		case errors.As(err, &ceiling):
+			_ = w.DB.MarkJobCompleted(parent, job.ID)
+			return
 		case errors.As(err, &rate):
 			_ = w.DB.MarkChannelBackoff(parent, job.PlatformChannelID, time.Now().Add(rate.RetryAfter))
 			_ = w.DB.MarkJobCompleted(parent, job.ID)
@@ -189,17 +260,27 @@ func (w *Worker) processJobNoLock(parent context.Context, job *db.IngestionJob) 
 	_ = w.DB.MarkJobCompleted(parent, job.ID)
 	_ = w.DB.ResetIngestionError(parent, job.PlatformChannelID)
 	_ = w.DB.UpdateLastSyncedAt(parent, job.PlatformChannelID, time.Now())
+	w.adaptPollInterval(parent, pc, stats)
 }
 
 // stubYouTubeServer returns an httptest server that serves one video with
-// two top-level comments and one reply.
+// two top-level comments and one reply. The playlist route mirrors the
+// uploads-playlist discovery path; timestamps are relative to now so poll
+// jobs do not stop at their own watermark.
 func stubYouTubeServer(t *testing.T) *httptest.Server {
+	freshVideo := time.Now().Add(-30 * time.Minute).UTC().Format(time.RFC3339)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case r.URL.Path == "/channels":
+			_, _ = w.Write([]byte(`{"items":[{"contentDetails":{"relatedPlaylists":{"uploads":"UU1"}}}]}`))
+		case r.URL.Path == "/playlistItems":
+			_, _ = w.Write([]byte(`{"items":[
+				{"contentDetails":{"videoId":"v1"},"snippet":{"publishedAt":"` + freshVideo + `","title":"Video One"}}
+			]}`))
 		case r.URL.Path == "/search":
 			_, _ = w.Write([]byte(`{"items":[
-				{"id":{"videoId":"v1"},"snippet":{"publishedAt":"2025-01-01T10:00:00Z"}}
+				{"id":{"videoId":"v1"},"snippet":{"publishedAt":"` + freshVideo + `","title":"Video One"}}
 			]}`))
 		case r.URL.Path == "/commentThreads":
 			resp := commentThreadsResponse{
@@ -389,3 +470,330 @@ func TestWorker_RecoverStaleJobsCallsDB(t *testing.T) {
 	// Must not panic and must complete.
 	w.RecoverStaleJobs(context.Background())
 }
+
+// ============================================================================
+// Quota-optimization behavior (optimize-youtube-api-quota).
+// ============================================================================
+
+func newTestWorker(f *fakeWorkerDB, srv *httptest.Server) *Worker {
+	return &Worker{
+		DB:                        f,
+		Client:                    &YouTubeClient{HTTP: srv.Client(), BaseURL: srv.URL},
+		JobDeadline:               30 * time.Second,
+		Alerter:                   LogAlerter{},
+		PollIntervalMinMinutes:    30,
+		PollIntervalMaxMultiplier: 8,
+	}
+}
+
+func TestWorker_UploadsPlaylistDiscoveryAndCaching(t *testing.T) {
+	srv := stubYouTubeServer(t)
+	defer srv.Close()
+
+	f := newFakeWorkerDB()
+	last := time.Now().Add(-1 * time.Hour)
+	f.channels["pc1"] = &db.PlatformChannel{ID: "pc1", Platform: "youtube", PlatformChannelID: "UC1", LastSyncedAt: &last}
+	f.tokenA, f.tokenR = "tok", "ref"
+
+	w := newTestWorker(f, srv)
+	job := &db.IngestionJob{ID: "j1", PlatformChannelID: "pc1", JobType: "poll"}
+	w.processJobNoLock(context.Background(), job)
+
+	if got := f.playlists["pc1"]; got != "UU1" {
+		t.Fatalf("uploads playlist not cached: %q", got)
+	}
+	total := 0
+	for _, b := range f.insertCalls {
+		total += len(b)
+	}
+	if total != 3 {
+		t.Fatalf("expected 3 comments via playlist discovery, got %d", total)
+	}
+	// Thread structure unchanged (4.6): depth and parent mapping survive.
+	var byID = map[string]*db.Comment{}
+	for _, b := range f.insertCalls {
+		for _, c := range b {
+			byID[c.PlatformCommentID] = c
+		}
+	}
+	if c := byID["c1"]; c == nil || c.ReplyDepth != 0 || c.ParentCommentID != nil {
+		t.Fatalf("top-level c1 mapping wrong: %+v", c)
+	}
+	if c := byID["c1r"]; c == nil || c.ReplyDepth != 1 || c.ParentCommentID == nil || *c.ParentCommentID != "c1" {
+		t.Fatalf("embedded reply c1r mapping wrong: %+v", c)
+	}
+	if c := byID["c1"]; c.VideoTitle == nil || *c.VideoTitle != "Video One" {
+		t.Fatalf("video title not carried: %+v", c)
+	}
+}
+
+func TestWorker_ReplyGatingSkipsCommentsList(t *testing.T) {
+	var commentsCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/comments":
+			commentsCalls++
+			_, _ = w.Write([]byte(`{"items":[]}`))
+		case "/channels":
+			_, _ = w.Write([]byte(`{"items":[{"contentDetails":{"relatedPlaylists":{"uploads":"UU1"}}}]}`))
+		case "/playlistItems":
+			_, _ = w.Write([]byte(`{"items":[{"contentDetails":{"videoId":"v1"},"snippet":{"publishedAt":"` +
+				time.Now().Add(-30*time.Minute).UTC().Format(time.RFC3339) + `"}}]}`))
+		case "/commentThreads":
+			// T1: 3 replies, 3 embedded inline → complete → no comments.list.
+			// T2: 0 replies → no comments.list.
+			_, _ = w.Write([]byte(`{"items":[
+				{"snippet":{"topLevelComment":{"id":"t1","snippet":{"authorDisplayName":"A","textDisplay":"x","publishedAt":"2025-01-01T10:00:00Z"}},"totalReplyCount":3},
+				 "replies":{"comments":[
+					{"id":"r1","snippet":{"textDisplay":"a","publishedAt":"2025-01-01T11:00:00Z","parentId":"t1"}},
+					{"id":"r2","snippet":{"textDisplay":"b","publishedAt":"2025-01-01T11:01:00Z","parentId":"t1"}},
+					{"id":"r3","snippet":{"textDisplay":"c","publishedAt":"2025-01-01T11:02:00Z","parentId":"t1"}}]}},
+				{"snippet":{"topLevelComment":{"id":"t2","snippet":{"authorDisplayName":"B","textDisplay":"y","publishedAt":"2025-01-01T10:05:00Z"}},"totalReplyCount":0}}
+			]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	f := newFakeWorkerDB()
+	last := time.Now().Add(-1 * time.Hour)
+	f.channels["pc1"] = &db.PlatformChannel{ID: "pc1", Platform: "youtube", PlatformChannelID: "UC1", LastSyncedAt: &last}
+	f.tokenA, f.tokenR = "tok", "ref"
+
+	w := newTestWorker(f, srv)
+	w.processJobNoLock(context.Background(), &db.IngestionJob{ID: "j1", PlatformChannelID: "pc1", JobType: "poll"})
+
+	if commentsCalls != 0 {
+		t.Fatalf("comments.list called %d times; gating must skip inline-complete and zero-reply threads", commentsCalls)
+	}
+	total := 0
+	for _, b := range f.insertCalls {
+		total += len(b)
+	}
+	if total != 5 {
+		t.Fatalf("expected 5 comments (2 top + 3 inline), got %d", total)
+	}
+}
+
+func TestWorker_SearchFallbackWhenPlaylistUnresolvable(t *testing.T) {
+	var searchCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/channels":
+			w.WriteHeader(http.StatusNotFound)
+		case "/search":
+			searchCalls++
+			_, _ = w.Write([]byte(`{"items":[{"id":{"videoId":"v1"},"snippet":{"publishedAt":"2025-01-01T10:00:00Z"}}]}`))
+		case "/commentThreads":
+			_, _ = w.Write([]byte(`{"items":[{"snippet":{"topLevelComment":{"id":"c9","snippet":{"authorDisplayName":"A","textDisplay":"hi","publishedAt":"2025-01-01T10:00:00Z"}},"totalReplyCount":0}}]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	f := newFakeWorkerDB()
+	last := time.Now().Add(-1 * time.Hour)
+	f.channels["pc1"] = &db.PlatformChannel{ID: "pc1", Platform: "youtube", PlatformChannelID: "UC1", LastSyncedAt: &last}
+	f.tokenA, f.tokenR = "tok", "ref"
+
+	w := newTestWorker(f, srv)
+	w.processJobNoLock(context.Background(), &db.IngestionJob{ID: "j1", PlatformChannelID: "pc1", JobType: "poll"})
+
+	if searchCalls != 1 {
+		t.Fatalf("expected exactly one bounded search.list fallback, got %d", searchCalls)
+	}
+	if len(f.completedJobs) != 1 {
+		t.Fatalf("fallback ingestion must still complete job, got completed=%v failed=%v", f.completedJobs, f.failedJobs)
+	}
+}
+
+func TestWorker_CheckpointResumeAndWatermark(t *testing.T) {
+	var sawPageToken string
+	wm := time.Date(2025, 1, 1, 10, 30, 0, 0, time.UTC)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/channels":
+			_, _ = w.Write([]byte(`{"items":[{"contentDetails":{"relatedPlaylists":{"uploads":"UU1"}}}]}`))
+		case "/playlistItems":
+			_, _ = w.Write([]byte(`{"items":[{"contentDetails":{"videoId":"v1"},"snippet":{"publishedAt":"` +
+				time.Now().Add(-30*time.Minute).UTC().Format(time.RFC3339) + `"}}]}`))
+		case "/commentThreads":
+			sawPageToken = r.URL.Query().Get("pageToken")
+			// Resumed page: one stale (below watermark) + one new comment.
+			_, _ = w.Write([]byte(`{"items":[
+				{"snippet":{"topLevelComment":{"id":"old","snippet":{"authorDisplayName":"A","textDisplay":"stale","publishedAt":"2025-01-01T10:00:00Z"}},"totalReplyCount":0}},
+				{"snippet":{"topLevelComment":{"id":"new","snippet":{"authorDisplayName":"B","textDisplay":"fresh","publishedAt":"2025-01-01T11:00:00Z"}},"totalReplyCount":0}}
+			]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	f := newFakeWorkerDB()
+	last := time.Now().Add(-1 * time.Hour)
+	f.channels["pc1"] = &db.PlatformChannel{ID: "pc1", Platform: "youtube", PlatformChannelID: "UC1", LastSyncedAt: &last}
+	f.tokenA, f.tokenR = "tok", "ref"
+	// Durable mid-video checkpoint from a previous interrupted run.
+	cp := "P2"
+	f.videoStates[videoKey("pc1", "v1")] = &db.VideoSyncState{
+		PlatformChannelID: "pc1", VideoID: "v1",
+		CommentWatermarkAt: &wm, PageCheckpoint: &cp, Status: "active",
+	}
+
+	w := newTestWorker(f, srv)
+	w.processJobNoLock(context.Background(), &db.IngestionJob{ID: "j1", PlatformChannelID: "pc1", JobType: "poll"})
+
+	if sawPageToken != "P2" {
+		t.Fatalf("resume must start at page checkpoint P2, got %q", sawPageToken)
+	}
+	var ids []string
+	for _, b := range f.insertCalls {
+		for _, c := range b {
+			ids = append(ids, c.PlatformCommentID)
+		}
+	}
+	if len(ids) != 1 || ids[0] != "new" {
+		t.Fatalf("watermark must filter already-persisted comments, got %v", ids)
+	}
+	// Completed walk: checkpoint cleared, watermark advanced.
+	st := f.videoStates[videoKey("pc1", "v1")]
+	if st.PageCheckpoint != nil {
+		t.Fatalf("checkpoint must clear after complete walk, got %q", *st.PageCheckpoint)
+	}
+	if st.CommentWatermarkAt == nil || !st.CommentWatermarkAt.Equal(time.Date(2025, 1, 1, 11, 0, 0, 0, time.UTC)) {
+		t.Fatalf("watermark not advanced: %+v", st.CommentWatermarkAt)
+	}
+}
+
+func TestWorker_SkippedVideoStaysSkipped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/channels":
+			_, _ = w.Write([]byte(`{"items":[{"contentDetails":{"relatedPlaylists":{"uploads":"UU1"}}}]}`))
+		case "/playlistItems":
+			_, _ = w.Write([]byte(`{"items":[{"contentDetails":{"videoId":"v1"},"snippet":{"publishedAt":"` +
+				time.Now().Add(-30*time.Minute).UTC().Format(time.RFC3339) + `"}}]}`))
+		case "/commentThreads":
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":{"errors":[{"reason":"commentsDisabled"}]}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	f := newFakeWorkerDB()
+	last := time.Now().Add(-1 * time.Hour)
+	f.channels["pc1"] = &db.PlatformChannel{ID: "pc1", Platform: "youtube", PlatformChannelID: "UC1", LastSyncedAt: &last}
+	f.tokenA, f.tokenR = "tok", "ref"
+
+	w := newTestWorker(f, srv)
+	job := &db.IngestionJob{ID: "j1", PlatformChannelID: "pc1", JobType: "poll"}
+	w.processJobNoLock(context.Background(), job)
+
+	st := f.videoStates[videoKey("pc1", "v1")]
+	if st == nil || st.Status != "skipped" {
+		t.Fatalf("commentsDisabled video must persist as skipped, got %+v", st)
+	}
+	if len(f.failedJobs) != 0 || len(f.completedJobs) != 1 {
+		t.Fatalf("comments-disabled is permanent, not a failure: completed=%v failed=%v", f.completedJobs, f.failedJobs)
+	}
+}
+
+func TestWorker_AdaptivePolling(t *testing.T) {
+	// Empty channel: interval doubles toward the multiplier cap.
+	f := newFakeWorkerDB()
+	last := time.Now().Add(-1 * time.Hour)
+	cur := 60
+	f.channels["pc1"] = &db.PlatformChannel{ID: "pc1", Platform: "youtube", PlatformChannelID: "UC1", LastSyncedAt: &last, PollIntervalMinutes: &cur}
+	f.tokenA, f.tokenR = "tok", "ref"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/channels":
+			_, _ = w.Write([]byte(`{"items":[{"contentDetails":{"relatedPlaylists":{"uploads":"UU1"}}}]}`))
+		case "/playlistItems":
+			_, _ = w.Write([]byte(`{"items":[]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	w := newTestWorker(f, srv)
+	w.processJobNoLock(context.Background(), &db.IngestionJob{ID: "j1", PlatformChannelID: "pc1", JobType: "poll"})
+	if got := f.pollSet["pc1"]; got != 120 {
+		t.Fatalf("inactive channel interval should double 60→120, got %d", got)
+	}
+
+	// Active channel: halves back toward the configured floor.
+	f2 := newFakeWorkerDB()
+	f2.channels["pc1"] = &db.PlatformChannel{ID: "pc1", Platform: "youtube", PlatformChannelID: "UC1", LastSyncedAt: &last, PollIntervalMinutes: &cur}
+	f2.tokenA, f2.tokenR = "tok", "ref"
+	w2 := newTestWorker(f2, stubYouTubeServer(t))
+	w2.processJobNoLock(context.Background(), &db.IngestionJob{ID: "j2", PlatformChannelID: "pc1", JobType: "poll"})
+	if got := f2.pollSet["pc1"]; got != 30 {
+		t.Fatalf("active channel interval should halve 60→30, got %d", got)
+	}
+}
+
+func TestWorker_QuotaExhaustedDefersWithoutRetryBurn(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[]}`))
+	}))
+	defer srv.Close()
+
+	f := newFakeWorkerDB()
+	last := time.Now().Add(-1 * time.Hour)
+	f.channels["pc1"] = &db.PlatformChannel{ID: "pc1", Platform: "youtube", PlatformChannelID: "UC1", LastSyncedAt: &last}
+	f.tokenA, f.tokenR = "tok", "ref"
+
+	w := newTestWorker(f, srv)
+	// Budget of 1: channels.list consumes it, the playlist page is
+	// suppressed locally (never leaves the process).
+	w.Client.Quota = NewQuotaAccounting(1)
+	w.processJobNoLock(context.Background(), &db.IngestionJob{ID: "j1", PlatformChannelID: "pc1", JobType: "poll"})
+
+	if len(f.failedJobs) != 0 {
+		t.Fatalf("quota exhaustion must not consume retry budget, failed=%v", f.failedJobs)
+	}
+	if len(f.completedJobs) != 1 {
+		t.Fatalf("expected job completed+deferred, got completed=%v", f.completedJobs)
+	}
+	if _, ok := f.backoffSet["pc1"]; !ok {
+		t.Fatalf("expected channel deferred via backoff")
+	}
+}
+
+func TestWorker_JobRequestCeilingDefers(t *testing.T) {
+	srv := stubYouTubeServer(t)
+	defer srv.Close()
+
+	f := newFakeWorkerDB()
+	last := time.Now().Add(-1 * time.Hour)
+	f.channels["pc1"] = &db.PlatformChannel{ID: "pc1", Platform: "youtube", PlatformChannelID: "UC1", LastSyncedAt: &last}
+	f.tokenA, f.tokenR = "tok", "ref"
+
+	w := newTestWorker(f, srv)
+	w.MaxRequestsPerJob = 1 // /channels consumes it; discovery is cut off
+	w.processJobNoLock(context.Background(), &db.IngestionJob{ID: "j1", PlatformChannelID: "pc1", JobType: "poll"})
+
+	if len(f.failedJobs) != 0 {
+		t.Fatalf("ceiling is a clean stop, not a failure: failed=%v", f.failedJobs)
+	}
+	if len(f.completedJobs) != 1 {
+		t.Fatalf("expected completed, got %v", f.completedJobs)
+	}
+}
+
+// Compile-time proof the fake covers the optional interface.
+var _ SyncStateDB = (*fakeWorkerDB)(nil)

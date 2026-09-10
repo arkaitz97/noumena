@@ -30,15 +30,15 @@ const userProfileColumns = `
 
 func scanUserProfile(row *sql.Row) (*UserProfile, error) {
 	var (
-		p                                  UserProfile
-		displayName                        sql.NullString
-		userType, primaryGoal, platform    sql.NullString
-		contentTopicsJSON                  sql.NullString
-		audSize, commVol, successMet       sql.NullString
-		role, teamSize, pubFreq            sql.NullString
-		insightPrioritiesJSON              sql.NullString
-		currWorkflow, biggestPain          sql.NullString
-		createdAtStr, updatedAtStr         string
+		p                               UserProfile
+		displayName                     sql.NullString
+		userType, primaryGoal, platform sql.NullString
+		contentTopicsJSON               sql.NullString
+		audSize, commVol, successMet    sql.NullString
+		role, teamSize, pubFreq         sql.NullString
+		insightPrioritiesJSON           sql.NullString
+		currWorkflow, biggestPain       sql.NullString
+		createdAtStr, updatedAtStr      string
 	)
 
 	err := row.Scan(

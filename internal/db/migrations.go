@@ -480,6 +480,48 @@ FROM users`); err != nil {
 			return nil
 		},
 	},
+	{
+		version: 17,
+		name:    "youtube quota: uploads playlist, adaptive poll, video sync state",
+		run: func(ctx context.Context, tx *sql.Tx) error {
+			// optimize-youtube-api-quota: per-channel uploads-playlist cache
+			// (playlistItems.list = 1 unit vs search.list = 100) and adaptive
+			// poll interval (NULL = configured minimum).
+			for _, col := range []struct{ name, ddl string }{
+				{"yt_uploads_playlist_id", "TEXT"},
+				{"poll_interval_minutes", "INTEGER"},
+			} {
+				has, err := columnExists(ctx, tx, "platform_channels", col.name)
+				if err != nil {
+					return err
+				}
+				if has {
+					continue
+				}
+				if _, err := tx.ExecContext(ctx,
+					fmt.Sprintf("ALTER TABLE platform_channels ADD COLUMN %s %s", col.name, col.ddl)); err != nil {
+					return fmt.Errorf("add platform_channels.%s: %w", col.name, err)
+				}
+			}
+			// Per-video incremental sync state: the newest comment posted_at
+			// durably persisted (watermark) plus the commentThreads page token
+			// needed to resume an interrupted walk. status='skipped' marks
+			// videos whose comments are disabled (permanent, 0 further calls).
+			if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS video_sync_state (
+    platform_channel_id TEXT NOT NULL REFERENCES platform_channels(id) ON DELETE CASCADE,
+    video_id TEXT NOT NULL,
+    comment_watermark_at TEXT,
+    page_checkpoint TEXT,
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active','skipped')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY (platform_channel_id, video_id)
+)`); err != nil {
+				return fmt.Errorf("create video_sync_state: %w", err)
+			}
+			return nil
+		},
+	},
 }
 
 // Migrate applies all pending migrations to the given database inside a

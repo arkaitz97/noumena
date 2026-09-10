@@ -9,15 +9,19 @@ import (
 )
 
 func (q *SQLiteQuery) GetChannelsNeedingSync(ctx context.Context, intervalMinutes int) ([]*PlatformChannel, error) {
-	cutoff := time.Now().UTC().Add(-time.Duration(intervalMinutes) * time.Minute).Format(time.RFC3339)
+	// Adaptive polling (optimize-youtube-api-quota): the configured interval
+	// is a floor; channels with an ingestion_poll override are due only after
+	// their own longer interval has elapsed.
 	rows, err := q.db.QueryContext(ctx,
 		`SELECT pc.id, pc.platform, pc.platform_channel_id, pc.display_name,
 		        pc.last_synced_at, pc.deletion_scheduled_at, pc.created_at,
 		        pc.ingestion_error_count,
-		        pc.ingestion_last_error_at, pc.ingestion_backoff_until
+		        pc.ingestion_last_error_at, pc.ingestion_backoff_until,
+		        pc.yt_uploads_playlist_id, pc.poll_interval_minutes
 		   FROM platform_channels pc
 		  WHERE (pc.last_synced_at IS NULL
-		         OR pc.last_synced_at < ?)
+		         OR pc.last_synced_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now',
+		              '-' || COALESCE(pc.poll_interval_minutes, ?) || ' minutes'))
 		    AND (pc.ingestion_backoff_until IS NULL
 		         OR pc.ingestion_backoff_until < strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 		    AND EXISTS (
@@ -25,7 +29,7 @@ func (q *SQLiteQuery) GetChannelsNeedingSync(ctx context.Context, intervalMinute
 		          WHERE uct.platform_channel_id = pc.id
 		            AND uct.tracking_status = 'active'
 		    )`,
-		cutoff)
+		intervalMinutes)
 	if err != nil {
 		return nil, err
 	}
@@ -35,11 +39,14 @@ func (q *SQLiteQuery) GetChannelsNeedingSync(ctx context.Context, intervalMinute
 	for rows.Next() {
 		var pc PlatformChannel
 		var lastSyncedAt, deletionScheduledAt, createdAt, ingestionLastErrorAt, ingestionBackoffUntil sql.NullString
+		var uploadsPlaylistID sql.NullString
+		var pollIntervalMinutes sql.NullInt64
 		if err := rows.Scan(
 			&pc.ID, &pc.Platform, &pc.PlatformChannelID, &pc.DisplayName,
 			&lastSyncedAt, &deletionScheduledAt, &createdAt,
 			&pc.IngestionErrorCount,
 			&ingestionLastErrorAt, &ingestionBackoffUntil,
+			&uploadsPlaylistID, &pollIntervalMinutes,
 		); err != nil {
 			return nil, err
 		}
@@ -48,6 +55,11 @@ func (q *SQLiteQuery) GetChannelsNeedingSync(ctx context.Context, intervalMinute
 		pc.CreatedAt = parseTime(createdAt.String)
 		pc.IngestionLastErrorAt = parseTimePtr(ingestionLastErrorAt)
 		pc.IngestionBackoffUntil = parseTimePtr(ingestionBackoffUntil)
+		pc.UploadsPlaylistID = strPtrOrNull(uploadsPlaylistID)
+		if pollIntervalMinutes.Valid {
+			v := int(pollIntervalMinutes.Int64)
+			pc.PollIntervalMinutes = &v
+		}
 		out = append(out, &pc)
 	}
 	return out, rows.Err()
@@ -56,17 +68,21 @@ func (q *SQLiteQuery) GetChannelsNeedingSync(ctx context.Context, intervalMinute
 func (q *SQLiteQuery) GetPlatformChannelByID(ctx context.Context, platformChannelID string) (*PlatformChannel, error) {
 	pc := &PlatformChannel{}
 	var lastSyncedAt, deletionScheduledAt, createdAt, ingestionLastErrorAt, ingestionBackoffUntil sql.NullString
+	var uploadsPlaylistID sql.NullString
+	var pollIntervalMinutes sql.NullInt64
 	err := q.db.QueryRowContext(ctx,
 		`SELECT id, platform, platform_channel_id, display_name,
 		        last_synced_at, deletion_scheduled_at, created_at,
 		        ingestion_error_count,
-		        ingestion_last_error_at, ingestion_backoff_until
+		        ingestion_last_error_at, ingestion_backoff_until,
+		        yt_uploads_playlist_id, poll_interval_minutes
 		   FROM platform_channels WHERE id = ?`,
 		platformChannelID).Scan(
 		&pc.ID, &pc.Platform, &pc.PlatformChannelID, &pc.DisplayName,
 		&lastSyncedAt, &deletionScheduledAt, &createdAt,
 		&pc.IngestionErrorCount,
 		&ingestionLastErrorAt, &ingestionBackoffUntil,
+		&uploadsPlaylistID, &pollIntervalMinutes,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -79,7 +95,80 @@ func (q *SQLiteQuery) GetPlatformChannelByID(ctx context.Context, platformChanne
 	pc.CreatedAt = parseTime(createdAt.String)
 	pc.IngestionLastErrorAt = parseTimePtr(ingestionLastErrorAt)
 	pc.IngestionBackoffUntil = parseTimePtr(ingestionBackoffUntil)
+	pc.UploadsPlaylistID = strPtrOrNull(uploadsPlaylistID)
+	if pollIntervalMinutes.Valid {
+		v := int(pollIntervalMinutes.Int64)
+		pc.PollIntervalMinutes = &v
+	}
 	return pc, nil
+}
+
+// SetUploadsPlaylistID caches a channel's YouTube uploads-playlist id so
+// subsequent jobs can discover videos via playlistItems.list (1 unit).
+func (q *SQLiteQuery) SetUploadsPlaylistID(ctx context.Context, platformChannelID, playlistID string) error {
+	_, err := q.db.ExecContext(ctx,
+		`UPDATE platform_channels SET yt_uploads_playlist_id = ? WHERE id = ?`,
+		playlistID, platformChannelID)
+	return err
+}
+
+// SetPollInterval persists the adaptive sync interval (minutes) for a
+// channel; the scheduler's due-for-sync query honors it as a per-channel
+// override of the configured minimum.
+func (q *SQLiteQuery) SetPollInterval(ctx context.Context, platformChannelID string, minutes int) error {
+	_, err := q.db.ExecContext(ctx,
+		`UPDATE platform_channels SET poll_interval_minutes = ? WHERE id = ?`,
+		minutes, platformChannelID)
+	return err
+}
+
+// UpsertVideoSyncState durably records the incremental position for one
+// video's comment walk. Empty watermark/checkpoint strings clear the column;
+// status must be 'active' or 'skipped'.
+func (q *SQLiteQuery) UpsertVideoSyncState(ctx context.Context, st *VideoSyncState) error {
+	status := st.Status
+	if status == "" {
+		status = "active"
+	}
+	var watermark, checkpoint any
+	if st.CommentWatermarkAt != nil {
+		watermark = st.CommentWatermarkAt.UTC().Format(time.RFC3339)
+	}
+	if st.PageCheckpoint != nil && *st.PageCheckpoint != "" {
+		checkpoint = *st.PageCheckpoint
+	}
+	_, err := q.db.ExecContext(ctx,
+		`INSERT INTO video_sync_state
+		     (platform_channel_id, video_id, comment_watermark_at, page_checkpoint, status, updated_at)
+		 VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+		 ON CONFLICT(platform_channel_id, video_id) DO UPDATE SET
+		     comment_watermark_at = COALESCE(excluded.comment_watermark_at, video_sync_state.comment_watermark_at),
+		     page_checkpoint = excluded.page_checkpoint,
+		     status = excluded.status,
+		     updated_at = excluded.updated_at`,
+		st.PlatformChannelID, st.VideoID, watermark, checkpoint, status)
+	return err
+}
+
+// GetVideoSyncState returns the durable incremental position for one video.
+// ErrNotFound when no checkpoint has been recorded yet.
+func (q *SQLiteQuery) GetVideoSyncState(ctx context.Context, platformChannelID, videoID string) (*VideoSyncState, error) {
+	st := &VideoSyncState{PlatformChannelID: platformChannelID, VideoID: videoID}
+	var watermark, checkpoint sql.NullString
+	err := q.db.QueryRowContext(ctx,
+		`SELECT comment_watermark_at, page_checkpoint, status
+		   FROM video_sync_state
+		  WHERE platform_channel_id = ? AND video_id = ?`,
+		platformChannelID, videoID).Scan(&watermark, &checkpoint, &st.Status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	st.CommentWatermarkAt = parseTimePtr(watermark)
+	st.PageCheckpoint = strPtrOrNull(checkpoint)
+	return st, nil
 }
 
 func (q *SQLiteQuery) UpdateIngestionError(ctx context.Context, platformChannelID, errMsg string, retryAfter time.Duration) error {

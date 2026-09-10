@@ -47,6 +47,17 @@ type WorkerDB interface {
 	InsertComments(ctx context.Context, comments []*db.Comment) (int, error)
 }
 
+// SyncStateDB is the optional DB surface for quota-optimization state
+// (optimize-youtube-api-quota): the uploads-playlist cache, per-video
+// incremental checkpoints, and the adaptive poll interval. Workers fall
+// back to stateless behavior when the underlying DB does not implement it.
+type SyncStateDB interface {
+	SetUploadsPlaylistID(ctx context.Context, platformChannelID, playlistID string) error
+	SetPollInterval(ctx context.Context, platformChannelID string, minutes int) error
+	GetVideoSyncState(ctx context.Context, platformChannelID, videoID string) (*db.VideoSyncState, error)
+	UpsertVideoSyncState(ctx context.Context, st *db.VideoSyncState) error
+}
+
 // DeadLetterAlerter is invoked exactly once when a job is dead-lettered.
 type DeadLetterAlerter interface {
 	Alert(ctx context.Context, platformChannelID, jobID, errMsg string)
@@ -88,19 +99,49 @@ type Worker struct {
 	JobDeadline    time.Duration
 	MaxConcurrency int
 	PollEmptyDelay time.Duration // sleep between empty claims
+
+	// Quota ceilings (optimize-youtube-api-quota). Zero disables each.
+	// MaxRequestsPerJob bounds YouTube requests per job via the client's
+	// context budget; MaxVideos/MaxThreadPages/MaxReplyFetches bound the
+	// worker-side loops that issue them.
+	MaxRequestsPerJob     int
+	MaxVideosPerJob       int
+	MaxThreadPagesPerJob  int
+	MaxReplyFetchesPerJob int
+	// PollIntervalMinMinutes is the floor of the adaptive per-channel poll
+	// interval (configured minimum); inactive channels back off to at most
+	// PollIntervalMaxMultiplier x the floor.
+	PollIntervalMinMinutes    int
+	PollIntervalMaxMultiplier int
 }
 
 // NewWorker returns a Worker with sensible defaults.
 func NewWorker(db WorkerDB, pool *sql.DB) *Worker {
-	return &Worker{
-		DB:             db,
-		Pool:           pool,
-		Client:         NewYouTubeClient(),
-		Alerter:        LogAlerter{},
-		JobDeadline:    defaultJobDeadline,
-		MaxConcurrency: 8,
-		PollEmptyDelay: 1 * time.Second,
+	client := NewYouTubeClient()
+	if daily := config.Default.YouTubeDailyQuotaUnits; daily > 0 {
+		client.Quota = NewQuotaAccounting(int64(daily))
 	}
+	return &Worker{
+		DB:                        db,
+		Pool:                      pool,
+		Client:                    client,
+		Alerter:                   LogAlerter{},
+		JobDeadline:               defaultJobDeadline,
+		MaxConcurrency:            8,
+		PollEmptyDelay:            1 * time.Second,
+		MaxRequestsPerJob:         config.Default.IngestionMaxRequestsPerJob,
+		MaxVideosPerJob:           config.Default.IngestionMaxVideosPerJob,
+		MaxThreadPagesPerJob:      config.Default.IngestionMaxThreadPagesPerJob,
+		MaxReplyFetchesPerJob:     config.Default.IngestionMaxReplyFetchesPerJob,
+		PollIntervalMinMinutes:    config.Default.IngestionPollIntervalMinutes,
+		PollIntervalMaxMultiplier: config.Default.IngestionPollIntervalMaxMultiplier,
+	}
+}
+
+// syncDB returns the optional SyncStateDB implemented by w.DB, if any.
+func (w *Worker) syncDB() (SyncStateDB, bool) {
+	s, ok := w.DB.(SyncStateDB)
+	return s, ok
 }
 
 // Run claims jobs in a loop until ctx is cancelled. Concurrent execution
@@ -175,6 +216,8 @@ func (w *Worker) Run(ctx context.Context) {
 func (w *Worker) processJob(parent context.Context, job *db.IngestionJob) {
 	jobCtx, cancel := context.WithTimeout(parent, w.JobDeadline)
 	defer cancel()
+	// Per-job request ceiling is enforced in the client via this context.
+	jobCtx = WithJobRequestBudget(jobCtx, w.MaxRequestsPerJob)
 
 	// otel-instrumentation: record fetch_duration on every return
 	// path. The outcome is mutated by the closure below as we learn
@@ -252,11 +295,36 @@ func (w *Worker) processJob(parent context.Context, job *db.IngestionJob) {
 	}
 
 	// 4. Iterate videos → comment threads, batching inserts and checkpointing.
-	if err := w.runIngestion(jobCtx, parent, pc, accessTok, publishedAfter, job); err != nil {
+	stats, err := w.runIngestion(jobCtx, parent, pc, accessTok, publishedAfter, job)
+	if err != nil {
 		// Categorize.
 		var rate *RateLimitError
 		var tokInv *TokenInvalidError
+		var quotaEx *QuotaExhaustedError
+		var ceiling *JobBudgetExceededError
 		switch {
+		case errors.As(err, &quotaEx):
+			// Daily project budget spent: defer the channel to the next
+			// budget window; the job itself is not a failure and must not
+			// burn retry budget.
+			until := quotaEx.RetryAt
+			if until.IsZero() {
+				until = time.Now().Add(time.Hour)
+			}
+			_ = w.DB.MarkChannelBackoff(parent, job.PlatformChannelID, until)
+			_ = w.DB.MarkJobCompleted(parent, job.ID)
+			recordIngestionError(parent, telemetry.ReasonRateLimited)
+			outcome = telemetry.OutcomeError
+			log.Printf("worker: quota exhausted job=%s channel=%s spent=%d retry_at=%s — deferred without retry burn",
+				job.ID, job.PlatformChannelID, quotaEx.UnitsSpent, until.UTC().Format(time.RFC3339))
+			return
+		case errors.As(err, &ceiling):
+			// Per-job ceiling: clean stop. Checkpoints are durable; the
+			// next scheduled poll resumes where we stopped.
+			_ = w.DB.MarkJobCompleted(parent, job.ID)
+			log.Printf("worker: job ceiling kind=%s limit=%d job=%s channel=%s — remainder deferred to next tick",
+				ceiling.Kind, ceiling.Limit, job.ID, job.PlatformChannelID)
+			return
 		case errors.As(err, &rate):
 			until := time.Now().Add(rate.RetryAfter)
 			_ = w.DB.MarkChannelBackoff(parent, job.PlatformChannelID, until)
@@ -295,19 +363,134 @@ func (w *Worker) processJob(parent context.Context, job *db.IngestionJob) {
 	}
 	_ = w.DB.ResetIngestionError(parent, job.PlatformChannelID)
 	_ = w.DB.UpdateLastSyncedAt(parent, job.PlatformChannelID, time.Now())
+	w.adaptPollInterval(parent, pc, stats)
 }
 
+// ============================================================================
+// Adaptive polling (optimize-youtube-api-quota). Channels with fresh
+// content halve their interval toward the configured floor; silent channels
+// double it up to PollIntervalMaxMultiplier x the floor. Existing backoff
+// still wins whenever it is longer.
+// ============================================================================
+
+func (w *Worker) adaptPollInterval(ctx context.Context, pc *db.PlatformChannel, st ingestStats) {
+	sdb, ok := w.syncDB()
+	if !ok || w.PollIntervalMinMinutes <= 0 {
+		return
+	}
+	floor := w.PollIntervalMinMinutes
+	mult := w.PollIntervalMaxMultiplier
+	if mult < 2 {
+		mult = 8
+	}
+	cur := floor
+	if pc.PollIntervalMinutes != nil && *pc.PollIntervalMinutes > cur {
+		cur = *pc.PollIntervalMinutes
+	}
+	next := cur
+	if st.newContent() {
+		if next > floor {
+			if next /= 2; next < floor {
+				next = floor
+			}
+		}
+	} else {
+		ceiling := floor * mult
+		next = cur * 2
+		if next > ceiling {
+			next = ceiling
+		}
+	}
+	if next == cur {
+		return
+	}
+	if err := sdb.SetPollInterval(ctx, pc.ID, next); err != nil {
+		log.Printf("worker: set poll interval channel=%s: %v", pc.ID, err)
+		return
+	}
+	log.Printf("worker: adaptive poll channel=%s %dmin → %dmin (videos=%d comments=%d)",
+		pc.ID, cur, next, st.videos, st.comments)
+}
+
+// discoverVideos picks the quota-cheapest video source for a job:
+// uploads-playlist playlistItems.list (1 unit/page) when the playlist id is
+// known or resolvable, otherwise a bounded search.list fallback (100 units)
+// with fallback telemetry.
+func (w *Worker) discoverVideos(ctx context.Context, pc *db.PlatformChannel, accessTok string, publishedAfter time.Time, job *db.IngestionJob) (func() (VideoRef, bool, error), error) {
+	stopBefore := time.Time{}
+	if job.JobType != "backfill" {
+		stopBefore = publishedAfter // newest-first walk ends at the watermark
+	}
+	if pc.UploadsPlaylistID != nil && *pc.UploadsPlaylistID != "" {
+		recordYoutubeDiscovery(ctx, "playlist")
+		return w.Client.ListUploads(ctx, accessTok, *pc.UploadsPlaylistID, stopBefore), nil
+	}
+	playlistID, err := w.Client.ResolveUploadsPlaylist(ctx, accessTok, pc.PlatformChannelID)
+	if err != nil {
+		var rate *RateLimitError
+		var tokInv *TokenInvalidError
+		var ceiling *JobBudgetExceededError
+		switch {
+		case errors.As(err, &rate), errors.As(err, &tokInv), errors.As(err, &ceiling):
+			return nil, err // auth/limits must not be masked by fallback
+		}
+		// Bounded fallback: one search.list walk per job, telemetry makes
+		// the 100-unit spend visible on noumena_youtube_discovery_total.
+		log.Printf("worker: uploads-playlist resolve failed channel=%s err=%v — falling back to search.list", pc.ID, err)
+		recordYoutubeDiscovery(ctx, "search_fallback")
+		return w.Client.ListVideos(ctx, accessTok, pc.PlatformChannelID, publishedAfter), nil
+	}
+	pc.UploadsPlaylistID = &playlistID
+	if sdb, ok := w.syncDB(); ok {
+		if err := sdb.SetUploadsPlaylistID(ctx, pc.ID, playlistID); err != nil {
+			log.Printf("worker: cache uploads playlist channel=%s: %v", pc.ID, err)
+		}
+	} else {
+		log.Printf("worker: uploads playlist resolved channel=%s playlist=%s (no sync-state store to cache in)", pc.ID, playlistID)
+	}
+	recordYoutubeDiscovery(ctx, "playlist")
+	return w.Client.ListUploads(ctx, accessTok, playlistID, stopBefore), nil
+}
+
+// ingestStats carries what one ingestion run did — feeds adaptive polling
+// and the per-job ceilings.
+type ingestStats struct {
+	videos     int // videos discovered for this run
+	comments   int // comments queued for insert (post-watermark)
+	pages      int // commentThreads pages fetched
+	replyWalks int // gated comments.list walks started
+}
+
+func (s ingestStats) newContent() bool { return s.videos > 0 || s.comments > 0 }
+
 // runIngestion paginates videos and comment threads, batches inserts, and
-// checkpoints `last_synced_at` after each batch.
-func (w *Worker) runIngestion(jobCtx, persistCtx context.Context, pc *db.PlatformChannel, accessTok string, publishedAfter *time.Time, job *db.IngestionJob) error {
+// checkpoints `last_synced_at` after each batch. It additionally persists
+// per-video watermarks and page checkpoints (video_sync_state) so an
+// interrupted walk resumes instead of restarting, and prunes requests to
+// threads that actually have missing replies.
+func (w *Worker) runIngestion(jobCtx, persistCtx context.Context, pc *db.PlatformChannel, accessTok string, publishedAfter *time.Time, job *db.IngestionJob) (ingestStats, error) {
+	var stats ingestStats
 	var pa time.Time
 	if publishedAfter != nil {
 		pa = *publishedAfter
 	}
-	nextVideo := w.Client.ListVideos(jobCtx, accessTok, pc.PlatformChannelID, pa)
+	nextVideo, err := w.discoverVideos(jobCtx, pc, accessTok, pa, job)
+	if err != nil {
+		return stats, err
+	}
 
+	sdb, hasSDB := w.syncDB()
 	batch := make([]*db.Comment, 0, commentBatchSize)
-	var maxPostedAt time.Time
+	var maxPostedAt time.Time // channel-wide, feeds last_synced_at
+
+	// walk holds the durable position for the video being ingested now.
+	type walkState struct {
+		videoID    string
+		watermark  time.Time // per-video, from video_sync_state
+		videoMax   time.Time // newest comment queued this video
+		checkpoint string    // token to re-fetch the page being consumed
+	}
+	var walk *walkState
 
 	flush := func() error {
 		if len(batch) == 0 {
@@ -323,34 +506,107 @@ func (w *Worker) runIngestion(jobCtx, persistCtx context.Context, pc *db.Platfor
 		if !maxPostedAt.IsZero() {
 			_ = w.DB.UpdateLastSyncedAt(persistCtx, pc.ID, maxPostedAt)
 		}
+		if hasSDB && walk != nil {
+			cp := walk.checkpoint
+			st := &db.VideoSyncState{
+				PlatformChannelID: pc.ID,
+				VideoID:           walk.videoID,
+				PageCheckpoint:    &cp,
+			}
+			if !walk.videoMax.IsZero() {
+				wm := walk.videoMax
+				st.CommentWatermarkAt = &wm
+			}
+			if err := sdb.UpsertVideoSyncState(persistCtx, st); err != nil {
+				log.Printf("worker: checkpoint upsert video=%s channel=%s: %v", walk.videoID, pc.ID, err)
+			}
+		}
 		batch = batch[:0]
 		return nil
 	}
+	// finishVideo persists the final watermark and clears the page
+	// checkpoint — the walk is complete, nothing to resume.
+	finishVideo := func() {
+		if !hasSDB || walk == nil {
+			return
+		}
+		st := &db.VideoSyncState{PlatformChannelID: pc.ID, VideoID: walk.videoID}
+		if !walk.videoMax.IsZero() {
+			wm := walk.videoMax
+			st.CommentWatermarkAt = &wm
+		}
+		if err := sdb.UpsertVideoSyncState(persistCtx, st); err != nil {
+			log.Printf("worker: checkpoint finish video=%s channel=%s: %v", walk.videoID, pc.ID, err)
+		}
+	}
 
 	for {
-		// Honor soft deadline: stop cleanly with whatever we have.
+		// Honor soft deadline: stop cleanly with whatever we have. The
+		// last durable checkpoint (flushed above) resumes this video.
 		if jobCtx.Err() != nil {
 			if err := flush(); err != nil {
-				return err
+				return stats, err
 			}
-			return jobCtx.Err()
+			return stats, jobCtx.Err()
 		}
 
 		v, ok, err := nextVideo()
 		if err != nil {
-			return err
+			return stats, err
 		}
 		if !ok {
 			break
 		}
+		if w.MaxVideosPerJob > 0 && stats.videos >= w.MaxVideosPerJob {
+			return stats, &JobBudgetExceededError{Kind: "videos", Limit: w.MaxVideosPerJob}
+		}
+		// Backfill keeps the old server-side window: videos older than the
+		// backfill horizon were never fetched via search.list either.
+		if job.JobType == "backfill" && !v.PublishedAt.IsZero() && v.PublishedAt.Before(pa) {
+			continue
+		}
+		stats.videos++
 
-		nextThread := w.Client.ListCommentThreads(jobCtx, accessTok, v.ID)
+		walk = &walkState{videoID: v.ID}
+		if hasSDB {
+			st, serr := sdb.GetVideoSyncState(jobCtx, pc.ID, v.ID)
+			switch {
+			case serr == nil:
+				if st.Status == "skipped" {
+					log.Printf("worker: skip video=%s channel=%s: previously marked comments-unavailable", v.ID, pc.ID)
+					continue
+				}
+				if st.CommentWatermarkAt != nil {
+					walk.watermark = *st.CommentWatermarkAt
+				}
+				if st.PageCheckpoint != nil {
+					walk.checkpoint = *st.PageCheckpoint
+				}
+			case errors.Is(serr, db.ErrNotFound):
+				// fresh video — full walk
+			default:
+				return stats, fmt.Errorf("load video sync state: %w", serr)
+			}
+			if walk.checkpoint != "" {
+				log.Printf("worker: resuming video=%s channel=%s from page checkpoint", v.ID, pc.ID)
+			}
+		}
+		resumeFrom := walk.checkpoint
+		pageCeilHit := false
+		nextThread := w.Client.ListCommentThreadsPaged(jobCtx, accessTok, v.ID, resumeFrom, func(fetchedWith, nextToken string) {
+			walk.checkpoint = fetchedWith
+			stats.pages++
+			if w.MaxThreadPagesPerJob > 0 && stats.pages >= w.MaxThreadPagesPerJob && nextToken != "" {
+				pageCeilHit = true
+			}
+		})
+
 		for {
 			if jobCtx.Err() != nil {
 				if err := flush(); err != nil {
-					return err
+					return stats, err
 				}
-				return jobCtx.Err()
+				return stats, jobCtx.Err()
 			}
 			t, ok, err := nextThread()
 			if err != nil {
@@ -359,32 +615,60 @@ func (w *Worker) runIngestion(jobCtx, persistCtx context.Context, pc *db.Platfor
 					// Permanent: video owner disabled comments. Skip the
 					// video, keep the rest of the ingestion run intact.
 					log.Printf("worker: skip video=%s channel=%s: comments disabled", v.ID, job.PlatformChannelID)
+					if hasSDB {
+						skipped := &db.VideoSyncState{PlatformChannelID: pc.ID, VideoID: v.ID, Status: "skipped"}
+						if err := sdb.UpsertVideoSyncState(persistCtx, skipped); err != nil {
+							log.Printf("worker: mark video skipped video=%s: %v", v.ID, err)
+						}
+					}
 					break
 				}
-				return err
+				if ferr := flush(); ferr != nil {
+					return stats, ferr
+				}
+				return stats, err
 			}
 			if !ok {
 				break
 			}
+			// Watermark filter: everything at-or-before the durable
+			// per-video watermark is already persisted.
+			if !walk.watermark.IsZero() && !t.PostedAt.IsZero() && !t.PostedAt.After(walk.watermark) {
+				continue
+			}
 			// Comments API returns videoId but never videoTitle — carry the
-			// title from the search.list ref that discovered this video.
+			// title from the discovery ref that found this video.
 			if t.VideoID == "" {
 				t.VideoID = v.ID
 			}
 			t.VideoTitle = v.Title
 			c := t.ToDBComment(pc.ID)
 			batch = append(batch, c)
+			stats.comments++
 			if t.PostedAt.After(maxPostedAt) {
 				maxPostedAt = t.PostedAt
 			}
+			if t.PostedAt.After(walk.videoMax) {
+				walk.videoMax = t.PostedAt
+			}
 			if len(batch) >= commentBatchSize {
 				if err := flush(); err != nil {
-					return err
+					return stats, err
 				}
 			}
 
-			// Paginate through deep replies for this thread.
-			if t.ParentCommentID == nil && t.ReplyDepth == 0 {
+			// Deep replies: gate on MISSING replies only. commentThreads
+			// already embeds replies inline; comments.list is issued only
+			// when totalReplyCount exceeds the embedded count, so zero- and
+			// fully-inline threads cost nothing extra.
+			if t.ParentCommentID == nil && t.ReplyDepth == 0 && t.TotalReplyCount > t.EmbeddedReplyCount {
+				if w.MaxReplyFetchesPerJob > 0 && stats.replyWalks >= w.MaxReplyFetchesPerJob {
+					if err := flush(); err != nil {
+						return stats, err
+					}
+					return stats, &JobBudgetExceededError{Kind: "replies", Limit: w.MaxReplyFetchesPerJob}
+				}
+				stats.replyWalks++
 				nextReply := w.Client.ListReplies(jobCtx, accessTok, t.CommentID)
 				for {
 					if jobCtx.Err() != nil {
@@ -397,25 +681,43 @@ func (w *Worker) runIngestion(jobCtx, persistCtx context.Context, pc *db.Platfor
 					if !rok {
 						break
 					}
+					if !walk.watermark.IsZero() && !r.PostedAt.IsZero() && !r.PostedAt.After(walk.watermark) {
+						continue
+					}
 					// Deep replies: comments.list gives videoId, not title —
 					// inherit both from the parent thread.
 					r.VideoID = t.VideoID
 					r.VideoTitle = t.VideoTitle
 					rc := r.ToDBComment(pc.ID)
 					batch = append(batch, rc)
+					stats.comments++
 					if r.PostedAt.After(maxPostedAt) {
 						maxPostedAt = r.PostedAt
 					}
+					if r.PostedAt.After(walk.videoMax) {
+						walk.videoMax = r.PostedAt
+					}
 					if len(batch) >= commentBatchSize {
 						if err := flush(); err != nil {
-							return err
+							return stats, err
 						}
 					}
 				}
 			}
+			if pageCeilHit {
+				if err := flush(); err != nil {
+					return stats, err
+				}
+				return stats, &JobBudgetExceededError{Kind: "pages", Limit: w.MaxThreadPagesPerJob}
+			}
 		}
+		if err := flush(); err != nil {
+			return stats, err
+		}
+		finishVideo()
+		walk = nil
 	}
-	return flush()
+	return stats, flush()
 }
 
 // failJob routes a generic error to MarkJobFailed or MarkJobDeadLettered
