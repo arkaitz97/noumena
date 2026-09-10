@@ -19,7 +19,7 @@ import (
 // AuthHandler bundles the dependencies for the /auth/* routes.
 type AuthHandler struct {
 	Queries      db.DBQuery
-	EmailClient  email.Client
+	EmailSender  email.EmailSender
 	CookieSecure bool
 
 	// OAuthExchanger lets tests inject a fake Google token-exchange + ID-token
@@ -96,14 +96,19 @@ func normalizeEmail(s string) string {
 	return strings.ToLower(strings.TrimSpace(s))
 }
 
+// sendEmail is a nil-safe wrapper around EmailSender.Send.
+func (h *AuthHandler) sendEmail(ctx context.Context, msg email.Message) error {
+	if h.EmailSender == nil {
+		return nil
+	}
+	return h.EmailSender.Send(ctx, msg)
+}
+
 // sendVerificationOrAutoVerify issues and emails a verification token when
 // verification is required; otherwise it marks the new account verified.
-func (h *AuthHandler) sendVerificationOrAutoVerify(r *http.Request, userID, email string) {
+func (h *AuthHandler) sendVerificationOrAutoVerify(r *http.Request, userID, emailAddr string) {
 	if !config.Default.EmailVerificationRequired {
 		_ = h.Queries.SetEmailVerified(r.Context(), userID)
-		return
-	}
-	if h.EmailClient == nil {
 		return
 	}
 	vRaw, vHash, err := auth.GenerateRefreshToken()
@@ -114,7 +119,12 @@ func (h *AuthHandler) sendVerificationOrAutoVerify(r *http.Request, userID, emai
 	if err := h.Queries.InsertEmailVerificationToken(r.Context(), userID, vHash, expiresAt); err != nil {
 		return
 	}
-	_ = h.EmailClient.SendVerificationEmail(email, emailLink("/verify-email", vRaw))
+	_ = h.sendEmail(r.Context(), email.Message{
+		Template:       email.TemplateEmailVerification,
+		ToAddress:      emailAddr,
+		IdempotencyKey: email.IdempotencyKey(email.TemplateEmailVerification, emailAddr, vRaw),
+		Variables:      map[string]any{"VerifyURL": emailLink("/verify-email", vRaw)},
+	})
 }
 
 // --- Registration -----------------------------------------------------------
@@ -240,9 +250,12 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		if attempts >= 5 {
 			until := time.Now().Add(15 * time.Minute)
 			_ = h.Queries.LockUser(r.Context(), user.ID, until)
-			if h.EmailClient != nil {
-				_ = h.EmailClient.SendLoginLockoutEmail(user.Email)
-			}
+			_ = h.sendEmail(r.Context(), email.Message{
+				Template:       email.TemplateLoginLockout,
+				ToAddress:      user.Email,
+				IdempotencyKey: email.IdempotencyKey(email.TemplateLoginLockout, user.Email, time.Now().UTC().Format("2006-01-02T15:04")),
+				Variables:      map[string]any{"LockMinutes": 15},
+			})
 		}
 		writeError(w, http.StatusUnauthorized, genericLoginError)
 		return
@@ -412,8 +425,13 @@ func (h *AuthHandler) ResendVerification(w http.ResponseWriter, r *http.Request)
 			writeError(w, http.StatusInternalServerError, "failed to issue token")
 			return
 		}
-		if h.EmailClient != nil {
-			_ = h.EmailClient.SendVerificationEmail(ec.PendingEmail, emailLink("/verify-email", vRaw))
+		if h.EmailSender != nil {
+			_ = h.sendEmail(r.Context(), email.Message{
+				Template:       email.TemplateEmailVerification,
+				ToAddress:      ec.PendingEmail,
+				IdempotencyKey: email.IdempotencyKey(email.TemplateEmailVerification, ec.PendingEmail, vRaw),
+				Variables:      map[string]any{"VerifyURL": emailLink("/verify-email", vRaw)},
+			})
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"message": "verification email sent"})
 		return
@@ -431,8 +449,13 @@ func (h *AuthHandler) ResendVerification(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, "failed to issue token")
 		return
 	}
-	if h.EmailClient != nil {
-		_ = h.EmailClient.SendVerificationEmail(user.Email, emailLink("/verify-email", vRaw))
+	if h.EmailSender != nil {
+		_ = h.sendEmail(r.Context(), email.Message{
+			Template:       email.TemplateEmailVerification,
+			ToAddress:      user.Email,
+			IdempotencyKey: email.IdempotencyKey(email.TemplateEmailVerification, user.Email, vRaw),
+			Variables:      map[string]any{"VerifyURL": emailLink("/verify-email", vRaw)},
+		})
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"message": "verification email sent"})
 }
@@ -472,8 +495,13 @@ func (h *AuthHandler) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 
 	// Google-only account: send the SSO notice instead of issuing a reset token.
 	if user.PasswordHash == nil && user.GoogleSub != nil {
-		if h.EmailClient != nil {
-			_ = h.EmailClient.SendGoogleOnlyAccountResetNotice(user.Email)
+		if h.EmailSender != nil {
+			_ = h.sendEmail(r.Context(), email.Message{
+				Template:       email.TemplatePasswordReset,
+				ToAddress:      user.Email,
+				IdempotencyKey: email.IdempotencyKey("google_only_reset", user.Email, time.Now().UTC().Format("2006-01-02T15:04")),
+				Variables:      map[string]any{"ResetURL": config.Default.AppBaseURL + "/login"},
+			})
 		}
 		respond()
 		return
@@ -488,8 +516,13 @@ func (h *AuthHandler) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 	}
 	expiresAt := time.Now().Add(config.Default.PasswordResetTTL)
 	if err := h.Queries.InsertPasswordResetToken(r.Context(), user.ID, hash, expiresAt); err == nil {
-		if h.EmailClient != nil {
-			_ = h.EmailClient.SendPasswordResetEmail(user.Email, emailLink("/reset-password", raw))
+		if h.EmailSender != nil {
+			_ = h.sendEmail(r.Context(), email.Message{
+				Template:       email.TemplatePasswordReset,
+				ToAddress:      user.Email,
+				IdempotencyKey: email.IdempotencyKey(email.TemplatePasswordReset, user.Email, raw),
+				Variables:      map[string]any{"ResetURL": emailLink("/reset-password", raw)},
+			})
 		}
 	}
 	respond()

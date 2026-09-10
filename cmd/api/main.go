@@ -30,12 +30,6 @@ import (
 	"noumena/internal/telemetry"
 )
 
-func writeJSON(w http.ResponseWriter, status int, body interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(body)
-}
-
 type sqliteBackfillEnqueuer struct{ q *db.SQLiteQuery }
 
 func (b *sqliteBackfillEnqueuer) EnqueueBackfill(ctx context.Context, platformChannelID string, days int) error {
@@ -106,13 +100,13 @@ func main() {
 		log.Println("Using mock database queries.")
 	}
 
-	emailClient, emailPipeline := startEmail(rootCtx, queries)
+	emailPipeline := startEmail(rootCtx, queries)
 
 	billingClient := startBillingClient()
 
 	opencodeKey := os.Getenv("OPENCODE_API_KEY")
 
-	digestWorker := startDigestWorker(rootCtx, opencodeKey, queries, emailClient, emailPipeline)
+	digestWorker := startDigestWorker(rootCtx, opencodeKey, queries, emailPipeline)
 	if digestWorker != nil {
 		defer digestWorker.Stop()
 	}
@@ -121,7 +115,7 @@ func main() {
 
 	if queries != nil {
 		auth.StartUnverifiedAccountCleanup(rootCtx, queries, 0, 0)
-		api.StartTokenExpiryNotifier(rootCtx, queries, emailClient, api.TokenExpirySchedule{})
+		api.StartTokenExpiryNotifier(rootCtx, queries, emailPipeline, api.TokenExpirySchedule{})
 		api.StartChannelPurgeJob(rootCtx, queries, 0)
 	}
 
@@ -181,7 +175,7 @@ func main() {
 
 	workspaceHandler := &api.WorkspaceHandler{Queries: queries, Cfg: config.Default}
 
-	authHandler := &api.AuthHandler{Queries: queries, EmailClient: emailClient, CookieSecure: config.Default.CookieSecure}
+	authHandler := &api.AuthHandler{Queries: queries, EmailSender: emailPipeline, CookieSecure: config.Default.CookieSecure}
 	if queries != nil {
 		authHandler.DefaultWorkspaceCreator = workspaceHandler.CreateDefaultWorkspace
 	}
@@ -336,13 +330,17 @@ func main() {
 	})
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]interface{}{
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"status": "ok",
 			"uptime": time.Since(startTime).String(),
 		})
 	})
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]interface{}{
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"status": "ok",
 			"uptime": time.Since(startTime).String(),
 		})
@@ -352,14 +350,18 @@ func main() {
 			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 			defer cancel()
 			if err := db.DB.PingContext(ctx); err != nil {
-				writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
 					"status": "error",
 					"error":  "database unavailable",
 				})
 				return
 			}
 		}
-		writeJSON(w, http.StatusOK, map[string]interface{}{
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"status": "ok",
 		})
 	})
@@ -586,21 +588,16 @@ func main() {
 // and logs its own status. Same behavior as the former inline blocks.
 // ============================================================================
 
-// startEmail wires the email stack: pipeline+SMTP when enabled, the legacy
-// Resend client while migrating, mock otherwise.
-func startEmail(rootCtx context.Context, queries db.DBQuery) (email.Client, *email.Pipeline) {
-	if config.Default.EmailEnabled {
-		return startEmailPipeline(rootCtx, queries)
+// startEmail wires the email stack: pipeline+SMTP when enabled, nil otherwise.
+func startEmail(rootCtx context.Context, queries db.DBQuery) *email.Pipeline {
+	if !config.Default.EmailEnabled {
+		log.Println("Email: disabled (EMAIL_ENABLED=false)")
+		return nil
 	}
-	if key := os.Getenv("RESEND_API_KEY"); key != "" {
-		log.Println("Email: legacy Resend client (EMAIL_ENABLED=false, RESEND_API_KEY present)")
-		return email.NewResendClient(key, "onboarding@resend.dev"), nil
-	}
-	log.Println("Email: mock client (EMAIL_ENABLED=false, RESEND_API_KEY unset)")
-	return email.NewMockClient(), nil
+	return startEmailPipeline(rootCtx, queries)
 }
 
-func startEmailPipeline(rootCtx context.Context, queries db.DBQuery) (email.Client, *email.Pipeline) {
+func startEmailPipeline(rootCtx context.Context, queries db.DBQuery) *email.Pipeline {
 	if os.Getenv("RESEND_API_KEY") != "" {
 		log.Println("EMAIL_ENABLED=true overrides RESEND_API_KEY (pipeline+SMTP path active)")
 	}
@@ -618,7 +615,7 @@ func startEmailPipeline(rootCtx context.Context, queries db.DBQuery) (email.Clie
 	log.Printf("Email: pipeline initialized (provider=%s host=%s)", config.Default.EmailProvider, config.Default.SMTPHost)
 	retry := &email.RetryWorker{Pipeline: pipeline, Queries: queries, Sender: sender}
 	retry.Start(rootCtx)
-	return email.NewPipelineAdapter(pipeline), pipeline
+	return pipeline
 }
 
 // startBillingClient returns the Stripe client when billing is enabled, the
@@ -648,7 +645,7 @@ func startBillingClient() billing.Client {
 
 // startDigestWorker wires the weekly digest worker when enabled and runnable;
 // every refusal logs its reason and returns nil.
-func startDigestWorker(rootCtx context.Context, opencodeKey string, queries db.DBQuery, emailClient email.Client, emailPipeline *email.Pipeline) *llm.Worker {
+func startDigestWorker(rootCtx context.Context, opencodeKey string, queries db.DBQuery, emailPipeline *email.Pipeline) *llm.Worker {
 	if !envOn("DIGEST_WORKER_ENABLED") {
 		log.Println("Weekly-digest worker: disabled (DIGEST_WORKER_ENABLED!=true)")
 		return nil
@@ -662,10 +659,9 @@ func startDigestWorker(rootCtx context.Context, opencodeKey string, queries db.D
 		return nil
 	}
 	worker := &llm.Worker{
-		Queries:     queries,
-		LLMClient:   llm.NewOpenCodeClient(opencodeKey, config.Default.OpenCodeBaseURL, config.Default.OpenCodeModel),
-		EmailClient: emailClient,
-		Pipeline:    emailPipeline,
+		Queries:   queries,
+		LLMClient: llm.NewOpenCodeClient(opencodeKey, config.Default.OpenCodeBaseURL, config.Default.OpenCodeModel),
+		Pipeline:  emailPipeline,
 	}
 	worker.Start(rootCtx)
 	log.Println("Weekly-digest worker started")

@@ -40,6 +40,12 @@ import (
 	"noumena/internal/telemetry"
 )
 
+// EmailSender is the narrow interface for sending a single email message.
+// Pipeline satisfies it; tests inject a fake.
+type EmailSender interface {
+	Send(ctx context.Context, msg Message) error
+}
+
 // Message is the single input shape accepted by Send.
 //
 // Template selects the registered template (must match a key in the

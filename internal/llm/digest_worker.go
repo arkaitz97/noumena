@@ -76,9 +76,8 @@ const deferredRedispatchLimit = 50
 // (user_id, week_start_date) makes accidental concurrent dispatch safe but
 // wasteful.
 type Worker struct {
-	Queries     db.DBQuery
-	LLMClient   *opencodeClient
-	EmailClient email.Client // optional; reserved for Spec 08
+	Queries   db.DBQuery
+	LLMClient *opencodeClient
 	// Pipeline is the data-lifecycle (12.6) email path. When set AND the
 	// user has digest_email_opt_in=true, the worker emits
 	// TemplateWeeklyDigest after successfully writing weekly_digests

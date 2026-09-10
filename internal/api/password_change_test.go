@@ -74,7 +74,7 @@ func extractRefreshCookie(rr *httptest.ResponseRecorder) *http.Cookie {
 // token_version or touch any session.
 func TestChangePassword_WrongCurrentRejected(t *testing.T) {
 	q := &MockQuery{}
-	r := setupAuthRouter(q, &mockEmailClient{})
+	r := setupAuthRouter(q, &mockEmailSender{})
 
 	rr := registerJSON(t, r, "pw@example.com", "Password1")
 	if rr.Code != http.StatusCreated {
@@ -105,7 +105,7 @@ func TestChangePassword_WrongCurrentRejected(t *testing.T) {
 // 2.3: policy failure returns 400 and does not invalidate anything.
 func TestChangePassword_WeakNewPasswordRejected(t *testing.T) {
 	q := &MockQuery{}
-	r := setupAuthRouter(q, &mockEmailClient{})
+	r := setupAuthRouter(q, &mockEmailSender{})
 	access := registerAndGetAccessToken(t, r, "weak@example.com")
 
 	rr := changePassword(t, r, access, "Password1", "short")
@@ -125,7 +125,7 @@ func TestChangePassword_WeakNewPasswordRejected(t *testing.T) {
 // the freshly issued refresh cookie still works.
 func TestChangePassword_SuccessInvalidatesOtherSessions(t *testing.T) {
 	q := &MockQuery{}
-	r := setupAuthRouter(q, &mockEmailClient{})
+	r := setupAuthRouter(q, &mockEmailSender{})
 
 	// Session A (this browser) + session B (another device).
 	rrA := registerJSON(t, r, "pw@example.com", "Password1")
@@ -197,7 +197,7 @@ func TestChangePassword_SuccessInvalidatesOtherSessions(t *testing.T) {
 }
 
 func TestChangePassword_Unauthenticated(t *testing.T) {
-	r := setupAuthRouter(&MockQuery{}, &mockEmailClient{})
+	r := setupAuthRouter(&MockQuery{}, &mockEmailSender{})
 	rr := changePassword(t, r, "", "Password1", "NewPass1")
 	if rr.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401, got %d", rr.Code)
@@ -207,7 +207,7 @@ func TestChangePassword_Unauthenticated(t *testing.T) {
 // Google-only accounts have no password to verify — reject cleanly.
 func TestChangePassword_GoogleOnlyNoPassword(t *testing.T) {
 	q := &MockQuery{}
-	r := setupAuthRouter(q, &mockEmailClient{})
+	r := setupAuthRouter(q, &mockEmailSender{})
 	_, _ = q.CreateUserGoogle(context.Background(), "g@example.com", "g-sub")
 	access, _, err := auth.IssueAccessToken("test-user-id", 0)
 	if err != nil {
