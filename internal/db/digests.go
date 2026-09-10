@@ -387,6 +387,26 @@ func strPtr(s string) *string {
 	return &s
 }
 
+// nextSyncAt schedules the next poll: 30 min after the last sync — or the
+// backoff end when it is later; without a prior sync the backoff itself is
+// the next slot (nil when there is none).
+func nextSyncAt(lastSyncedAt, backoffUntil sql.NullString) *time.Time {
+	if !lastSyncedAt.Valid {
+		if !backoffUntil.Valid {
+			return nil
+		}
+		bu := parseTime(backoffUntil.String)
+		return &bu
+	}
+	nxt := parseTime(lastSyncedAt.String).Add(30 * time.Minute)
+	if backoffUntil.Valid {
+		if bu := parseTime(backoffUntil.String); bu.After(nxt) {
+			nxt = bu
+		}
+	}
+	return &nxt
+}
+
 func parseTimePtr(s sql.NullString) *time.Time {
 	if !s.Valid || s.String == "" {
 		return nil

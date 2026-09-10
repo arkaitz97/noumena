@@ -43,9 +43,11 @@ func (w *Worker) Run(ctx context.Context) {
 		w.TTLHours = 24
 	}
 
-	if n, err := w.Queries.ResetStuckProcessingExports(ctx, 30*time.Minute); err != nil {
+	n, err := w.Queries.ResetStuckProcessingExports(ctx, 30*time.Minute)
+	if err != nil {
 		w.logger().Printf("export-worker: startup reset failed: %v", err)
-	} else if n > 0 {
+	}
+	if err == nil && n > 0 {
 		w.logger().Printf("export-worker: startup reset %d stuck rows to queued", n)
 	}
 	w.runCleanupOnce(ctx)

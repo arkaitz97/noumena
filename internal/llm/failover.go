@@ -97,24 +97,32 @@ func NewConfiguredClient(primaryName, fallbackName, primaryKey, fallbackKey stri
 	return NewFailoverClient(primary, fallback, 0, 0), nil
 }
 
+// providerFactories maps a normalized provider name to its client builder.
+// New providers register here instead of extending a switch statement.
+var providerFactories = map[string]func(apiKey string) LLMClient{
+	"":          newConfigProviderClient,
+	"opencode":  newConfigProviderClient,
+	"openai":    func(k string) LLMClient { return NewOpenAIClient(k, "", "") },
+	"anthropic": func(k string) LLMClient { return NewAnthropicClient(k, "", "") },
+}
+
+// newConfigProviderClient honors OPENCODE_BASE_URL/OPENCODE_MODEL from config
+// (same values the legacy single-provider path passes) so failover wiring
+// does not silently fall back to constructor defaults.
+func newConfigProviderClient(apiKey string) LLMClient {
+	return NewOpenCodeClient(apiKey, config.Default.OpenCodeBaseURL, config.Default.OpenCodeModel)
+}
+
 // newClientByProvider maps a provider name to a freshly built LLMClient.
 // Keys are optional at construction: transport omits auth headers when the
 // key is empty and the API responds 401 (non-retryable, surfaces as an
 // error — never a crash).
 func newClientByProvider(name, apiKey string) (LLMClient, error) {
-	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "", "opencode":
-		// Honors OPENCODE_BASE_URL/OPENCODE_MODEL from config (same values the
-		// legacy single-provider path passes) so failover wiring does not
-		// silently fall back to constructor defaults.
-		return NewOpenCodeClient(apiKey, config.Default.OpenCodeBaseURL, config.Default.OpenCodeModel), nil
-	case "openai":
-		return NewOpenAIClient(apiKey, "", ""), nil
-	case "anthropic":
-		return NewAnthropicClient(apiKey, "", ""), nil
-	default:
+	factory, ok := providerFactories[strings.ToLower(strings.TrimSpace(name))]
+	if !ok {
 		return nil, fmt.Errorf("unknown LLM provider %q (want opencode|openai|anthropic)", name)
 	}
+	return factory(apiKey), nil
 }
 
 // active returns the client current calls should hit, without holding the

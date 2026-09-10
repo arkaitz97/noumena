@@ -351,12 +351,7 @@ func (h *ProfileHandler) PatchProfile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.DisplayName != nil {
-		trimmed := strings.TrimSpace(*req.DisplayName)
-		if trimmed == "" {
-			existing.DisplayName = nil
-		} else {
-			existing.DisplayName = &trimmed
-		}
+		existing.DisplayName = cleanOptionalString(req.DisplayName)
 	}
 	if req.UserType != nil {
 		existing.UserType = cleanedUserType

@@ -62,50 +62,67 @@ var revokeBackoffs = []time.Duration{0, 10 * time.Second, 20 * time.Second}
 // The helper deliberately uses an *http.Client constructed per call
 // (rather than a package-global) so tests can inject a transport
 // without mutating shared state.
+// googleRevocablePlatforms share Google's OAuth revoke endpoint.
+var googleRevocablePlatforms = map[string]bool{"youtube": true, "google": true, "youtube_data_v3": true}
+
 func RevokeOAuthToken(ctx context.Context, platform, accessToken string, logger *log.Logger) error {
 	if logger == nil {
 		logger = log.Default()
 	}
-	switch platform {
-	case "youtube", "google", "youtube_data_v3":
+	if googleRevocablePlatforms[platform] {
 		return revokeGoogleToken(ctx, accessToken, logger)
-	default:
-		logger.Printf("oauth_revoke_skipped platform=%s reason=unsupported", platform)
-		return nil
 	}
+	logger.Printf("oauth_revoke_skipped platform=%s reason=unsupported", platform)
+	return nil
 }
 
 func revokeGoogleToken(ctx context.Context, accessToken string, logger *log.Logger) error {
-	form := url.Values{"token": {accessToken}}
-
 	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, revokeEndpoint+"?"+form.Encode(), nil)
+	resp, err := postRevoke(reqCtx, accessToken)
 	if err != nil {
-		return fmt.Errorf("oauth revoke: build request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := revokeHTTPClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("oauth revoke: %w", err)
+		return err
 	}
 	defer resp.Body.Close()
+	return classifyRevoke(resp.StatusCode, logger)
+}
 
-	// Google returns 200 on success. 400 is documented for already-
-	// invalid/expired tokens, which is a no-op success from our
-	// perspective. Any other status is an error worth retrying.
-	switch {
-	case resp.StatusCode == http.StatusOK:
+// postRevoke performs the revoke POST, wrapping transport errors as before.
+func postRevoke(ctx context.Context, accessToken string) (*http.Response, error) {
+	req, err := newRevokeRequest(ctx, accessToken)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := revokeHTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("oauth revoke: %w", err)
+	}
+	return resp, nil
+}
+
+func newRevokeRequest(ctx context.Context, accessToken string) (*http.Request, error) {
+	form := url.Values{"token": {accessToken}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, revokeEndpoint+"?"+form.Encode(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("oauth revoke: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return req, nil
+}
+
+// classifyRevoke: Google returns 200 on success. 400 is documented for
+// already-invalid/expired tokens, which is a no-op success from our
+// perspective. Any other status is an error worth retrying.
+func classifyRevoke(status int, logger *log.Logger) error {
+	if status == http.StatusOK {
 		logger.Printf("oauth_revoke_ok platform=youtube")
 		return nil
-	case resp.StatusCode == http.StatusBadRequest:
+	}
+	if status == http.StatusBadRequest {
 		logger.Printf("oauth_revoke_already_invalid platform=youtube status=400")
 		return nil
-	default:
-		return fmt.Errorf("oauth revoke: unexpected status %d", resp.StatusCode)
 	}
+	return fmt.Errorf("oauth revoke: unexpected status %d", status)
 }
 
 // RevokeWithRetry wraps RevokeOAuthToken with a SHORT bounded retry
@@ -150,21 +167,27 @@ func revokeChannelTokens(ctx context.Context, ch *db.UserChannelTrackingRow, log
 	if logger == nil {
 		logger = log.Default()
 	}
-	if ch.RefreshTokenEnc != "" {
-		plain, err := auth.Decrypt(ch.RefreshTokenEnc)
-		if err != nil {
-			logger.Printf("oauth_revoke_refresh_decrypt_warn channel=%s err=%v", ch.PlatformChannelID, err)
-		} else if err := RevokeWithRetry(ctx, ch.Platform, plain, logger); err != nil {
-			return fmt.Errorf("revoke refresh token: %w", err)
-		}
+	// The refresh token is the durable credential; revoke it FIRST.
+	if err := revokeTokenField(ctx, ch, ch.RefreshTokenEnc, "refresh", logger); err != nil {
+		return err
 	}
-	if ch.AccessTokenEnc != "" {
-		plain, err := auth.Decrypt(ch.AccessTokenEnc)
-		if err != nil {
-			logger.Printf("oauth_revoke_access_decrypt_warn channel=%s err=%v", ch.PlatformChannelID, err)
-		} else if err := RevokeWithRetry(ctx, ch.Platform, plain, logger); err != nil {
-			return fmt.Errorf("revoke access token: %w", err)
-		}
+	return revokeTokenField(ctx, ch, ch.AccessTokenEnc, "access", logger)
+}
+
+// revokeTokenField decrypts one stored credential and revokes it
+// provider-side. A missing/undecryptable token is logged and skipped —
+// never fatal to the deletion job.
+func revokeTokenField(ctx context.Context, ch *db.UserChannelTrackingRow, enc, kind string, logger *log.Logger) error {
+	if enc == "" {
+		return nil
+	}
+	plain, err := auth.Decrypt(enc)
+	if err != nil {
+		logger.Printf("oauth_revoke_%s_decrypt_warn channel=%s err=%v", kind, ch.PlatformChannelID, err)
+		return nil
+	}
+	if err := RevokeWithRetry(ctx, ch.Platform, plain, logger); err != nil {
+		return fmt.Errorf("revoke %s token: %w", kind, err)
 	}
 	return nil
 }

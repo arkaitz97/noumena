@@ -191,63 +191,96 @@ func trialDaysRemaining(endsAt time.Time) int {
 }
 
 func (h *BillingHandler) Status(w http.ResponseWriter, r *http.Request) {
-	userID, ok := r.Context().Value(UserIDKey).(string)
-	if !ok || userID == "" {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	user, ok := h.requireBillingUser(w, r)
+	if !ok {
 		return
 	}
-
-	user, err := h.Queries.GetUserByID(r.Context(), userID)
-	if err != nil || user == nil {
-		http.Error(w, "user not found", http.StatusNotFound)
-		return
-	}
-
 	plan := user.SubscriptionPlan
 	if plan == "" {
 		plan = billing.PlanFree
 	}
 	limits := billing.LimitsFor(plan)
+	channelCount, ok := h.activeChannelCount(w, r, user.ID)
+	if !ok {
+		return
+	}
+	overage, ok := h.overageCost(w, r, user, plan)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, buildStatusResponse(user, plan, limits, channelCount, overage))
+}
 
+// requireBillingUser resolves the caller and loads their user row.
+func (h *BillingHandler) requireBillingUser(w http.ResponseWriter, r *http.Request) (*db.User, bool) {
+	userID, ok := r.Context().Value(UserIDKey).(string)
+	if !ok || userID == "" {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return nil, false
+	}
+	user, err := h.Queries.GetUserByID(r.Context(), userID)
+	if err != nil || user == nil {
+		http.Error(w, "user not found", http.StatusNotFound)
+		return nil, false
+	}
+	return user, true
+}
+
+func (h *BillingHandler) activeChannelCount(w http.ResponseWriter, r *http.Request, userID string) (int, bool) {
 	channelCount, err := h.Queries.GetActiveChannelCount(r.Context(), userID)
 	if err != nil {
 		log.Printf("billing: GetActiveChannelCount user=%s err=%v", userID, err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
+		return 0, false
 	}
+	return channelCount, true
+}
 
-	// Overage: only meaningful for plans that track overage; the SQL is
-	// safe to call for any plan but we skip the round-trip otherwise.
-	var overage float64
-	if billing.TracksOverage(plan) {
-		// Period boundaries: anchor at current_period_end if known,
-		// otherwise the current calendar window. This is intentionally a
-		// best-effort window for read-side rollup; the authoritative
-		// boundaries are the ones written when each row was inserted.
-		periodEnd := time.Now().Add(31 * 24 * time.Hour)
-		if user.CurrentPeriodEnd != nil {
-			periodEnd = *user.CurrentPeriodEnd
-		}
-		periodStart := periodEnd.Add(-31 * 24 * time.Hour)
-		overage, err = h.Queries.GetOverageCostForCurrentPeriod(r.Context(), userID, periodStart, periodEnd)
-		if err != nil {
-			log.Printf("billing: GetOverageCostForCurrentPeriod user=%s err=%v", userID, err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
+// overageCost is only meaningful for plans that track overage; the SQL is
+// safe to call for any plan but we skip the round-trip otherwise.
+func (h *BillingHandler) overageCost(w http.ResponseWriter, r *http.Request, user *db.User, plan string) (float64, bool) {
+	if !billing.TracksOverage(plan) {
+		return 0, true
 	}
+	periodStart, periodEnd := statusOverageWindow(user)
+	overage, err := h.Queries.GetOverageCostForCurrentPeriod(r.Context(), user.ID, periodStart, periodEnd)
+	if err != nil {
+		log.Printf("billing: GetOverageCostForCurrentPeriod user=%s err=%v", user.ID, err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return 0, false
+	}
+	return overage, true
+}
 
+// statusOverageWindow anchors at current_period_end if known, otherwise the
+// current calendar window. This is intentionally a best-effort window for
+// read-side rollup; the authoritative boundaries are the ones written when
+// each row was inserted.
+func statusOverageWindow(user *db.User) (time.Time, time.Time) {
+	periodEnd := time.Now().Add(31 * 24 * time.Hour)
+	if user.CurrentPeriodEnd != nil {
+		periodEnd = *user.CurrentPeriodEnd
+	}
+	return periodEnd.Add(-31 * 24 * time.Hour), periodEnd
+}
+
+// statusTrial resolves the trial banner. The trial is active while the
+// deadline is in the future AND there is no paid subscription: upgrades
+// exit the trial immediately.
+func statusTrial(user *db.User, plan string) trialInfo {
 	trial := trialInfo{Active: false}
-	if user.TrialEndsAt != nil {
-		trial.EndsAt = user.TrialEndsAt.UTC().Format(time.RFC3339)
-		// Trial is active while the deadline is in the future AND there is
-		// no paid subscription: upgrades exit the trial immediately.
-		if time.Now().Before(*user.TrialEndsAt) && !billing.IsPaidPlan(plan) {
-			trial.Active = true
-			trial.DaysRemaining = trialDaysRemaining(*user.TrialEndsAt)
-		}
+	if user.TrialEndsAt == nil {
+		return trial
 	}
+	trial.EndsAt = user.TrialEndsAt.UTC().Format(time.RFC3339)
+	if time.Now().Before(*user.TrialEndsAt) && !billing.IsPaidPlan(plan) {
+		trial.Active = true
+		trial.DaysRemaining = trialDaysRemaining(*user.TrialEndsAt)
+	}
+	return trial
+}
 
+func buildStatusResponse(user *db.User, plan string, limits billing.PlanLimits, channelCount int, overage float64) statusResponse {
 	resp := statusResponse{
 		Plan:              plan,
 		Status:            user.SubscriptionStatus,
@@ -259,12 +292,12 @@ func (h *BillingHandler) Status(w http.ResponseWriter, r *http.Request) {
 		CommentsUsed:      user.CommentsUsedThisPeriod,
 		CommentsLimit:     limits.CommentQuotaMonthly,
 		OverageCost:       overage,
-		Trial:             trial,
+		Trial:             statusTrial(user, plan),
 	}
 	if resp.Status == "" {
 		resp.Status = "active"
 	}
-	writeJSON(w, http.StatusOK, resp)
+	return resp
 }
 
 // ----------------------------------------------------------------------------
@@ -432,40 +465,39 @@ func (h *BillingHandler) dispatchEvent(ctx context.Context, event stripe.Event) 
 // applyEvent writes the side effects for a single event and the matching
 // processed_stripe_events row. tx may be nil in mock mode.
 func (h *BillingHandler) applyEvent(ctx context.Context, tx *sql.Tx, event stripe.Event) error {
-	switch event.Type {
-	case "checkout.session.completed":
-		if err := h.handleCheckoutCompleted(ctx, tx, event); err != nil {
-			return err
-		}
-	case "invoice.payment_succeeded":
-		if err := h.handleInvoicePaymentSucceeded(ctx, tx, event); err != nil {
-			return err
-		}
-	case "invoice.payment_failed":
-		if err := h.handleInvoicePaymentFailed(ctx, tx, event); err != nil {
-			return err
-		}
-	case "customer.subscription.created":
-		// Same persistence semantics as updated; Stripe fires this for
-		// upgrades initiated outside Checkout (e.g. API-driven trials).
-		if err := h.handleSubscriptionUpdated(ctx, tx, event); err != nil {
-			return err
-		}
-	case "customer.subscription.updated":
-		if err := h.handleSubscriptionUpdated(ctx, tx, event); err != nil {
-			return err
-		}
-	case "customer.subscription.deleted":
-		if err := h.handleSubscriptionDeleted(ctx, tx, event); err != nil {
-			return err
-		}
-	default:
+	if err := h.applyEventType(ctx, tx, event); err != nil {
+		return err
+	}
+	return h.markProcessed(ctx, tx, event)
+}
+
+// eventHandlers maps Stripe event types to their side-effect handlers; new
+// event types register here instead of growing a switch statement.
+func (h *BillingHandler) eventHandlers() map[stripe.EventType]func(context.Context, *sql.Tx, stripe.Event) error {
+	return map[stripe.EventType]func(context.Context, *sql.Tx, stripe.Event) error{
+		"checkout.session.completed":    h.handleCheckoutCompleted,
+		"invoice.payment_succeeded":     h.handleInvoicePaymentSucceeded,
+		"invoice.payment_failed":        h.handleInvoicePaymentFailed,
+		"customer.subscription.deleted": h.handleSubscriptionDeleted,
+		// Stripe fires created for upgrades initiated outside Checkout (e.g.
+		// API-driven trials); persistence semantics match updated.
+		"customer.subscription.created": h.handleSubscriptionUpdated,
+		"customer.subscription.updated": h.handleSubscriptionUpdated,
+	}
+}
+
+func (h *BillingHandler) applyEventType(ctx context.Context, tx *sql.Tx, event stripe.Event) error {
+	handler, ok := h.eventHandlers()[event.Type]
+	if !ok {
 		// Spec 4.6: log unhandled event types at INFO and still mark them
 		// processed so Stripe stops retrying.
-		log.Printf("billing webhook: unhandled event type=%s id=%s (marking processed)",
-			event.Type, event.ID)
+		log.Printf("billing webhook: unhandled event type=%s id=%s (marking processed)", event.Type, event.ID)
+		return nil
 	}
+	return handler(ctx, tx, event)
+}
 
+func (h *BillingHandler) markProcessed(ctx context.Context, tx *sql.Tx, event stripe.Event) error {
 	if event.ID == "" {
 		// Some test events have empty ids; nothing to write.
 		return nil
@@ -489,51 +521,72 @@ type stripeCheckoutSession struct {
 }
 
 func (h *BillingHandler) handleCheckoutCompleted(ctx context.Context, tx *sql.Tx, event stripe.Event) error {
-	var sess stripeCheckoutSession
-	if err := json.Unmarshal(event.Data.Raw, &sess); err != nil {
+	sess, err := decodeCheckoutSession(event)
+	if err != nil {
 		return err
 	}
-
-	userID := sess.Metadata["user_id"]
-	if userID == "" {
-		userID = sess.ClientReferenceID
-	}
+	userID := checkoutUserID(sess)
 	if userID == "" {
 		log.Printf("billing webhook: checkout.session.completed missing user_id (event=%s)", event.ID)
 		return nil
 	}
-
-	plan := sess.Metadata["plan"]
-	interval := sess.Metadata["interval"]
-
-	// If we have a subscription id, fetch the authoritative state from
-	// Stripe so plan/interval/period_end come from the source of truth.
-	var periodEnd *time.Time
-	if sess.Subscription != "" {
-		sub, err := h.BillingClient.GetSubscription(ctx, sess.Subscription)
-		if err != nil {
-			return err
-		}
-		if sub != nil {
-			if p, i, ok := h.priceMapPlanInterval(sub); ok {
-				plan = p
-				interval = i
-			}
-			if sub.CurrentPeriodEnd != 0 {
-				t := time.Unix(sub.CurrentPeriodEnd, 0).UTC()
-				periodEnd = &t
-			}
-		}
+	upd, err := h.checkoutSubscriptionUpdate(ctx, userID, sess)
+	if err != nil {
+		return err
 	}
+	return h.Queries.ApplySubscriptionUpdate(ctx, tx, upd)
+}
 
+func decodeCheckoutSession(event stripe.Event) (stripeCheckoutSession, error) {
+	var sess stripeCheckoutSession
+	err := json.Unmarshal(event.Data.Raw, &sess)
+	return sess, err
+}
+
+// checkoutUserID prefers session metadata, falling back to the
+// client_reference_id propagated at Checkout creation time.
+func checkoutUserID(sess stripeCheckoutSession) string {
+	if id := sess.Metadata["user_id"]; id != "" {
+		return id
+	}
+	return sess.ClientReferenceID
+}
+
+// checkoutSubscriptionUpdate resolves the authoritative state from Stripe
+// (so plan/interval/period_end come from the source of truth) and builds the
+// local subscription row update.
+func (h *BillingHandler) checkoutSubscriptionUpdate(ctx context.Context, userID string, sess stripeCheckoutSession) (db.SubscriptionUpdate, error) {
+	plan, interval := sess.Metadata["plan"], sess.Metadata["interval"]
+	sub, err := h.authoritativeSubscription(ctx, sess)
+	if err != nil {
+		return db.SubscriptionUpdate{}, err
+	}
+	if p, i, ok := priceOfItem(sub, h.BillingClient.PriceMap()); ok {
+		plan, interval = p, i
+	}
+	upd := newActiveSubscriptionUpdate(userID, plan, interval)
+	attachCheckoutRefs(&upd, sess, periodEndOf(sub))
+	return upd, nil
+}
+
+// authoritativeSubscription fetches the Stripe-side subscription; one-time
+// payment sessions (no subscription id) resolve to nil.
+func (h *BillingHandler) authoritativeSubscription(ctx context.Context, sess stripeCheckoutSession) (*stripe.Subscription, error) {
+	if sess.Subscription == "" {
+		return nil, nil
+	}
+	return h.BillingClient.GetSubscription(ctx, sess.Subscription)
+}
+
+// newActiveSubscriptionUpdate is the standard "subscription now active" row:
+// plan quota in, usage reset, past-due cleared.
+func newActiveSubscriptionUpdate(userID, plan, interval string) db.SubscriptionUpdate {
 	if plan == "" {
 		plan = billing.PlanCreator // sensible default; metadata should always be present.
 	}
-
 	limits := billing.LimitsFor(plan)
-	status := "active"
-	used := 0
-	upd := db.SubscriptionUpdate{
+	status, used := "active", 0
+	return db.SubscriptionUpdate{
 		UserID:                 userID,
 		SubscriptionPlan:       &plan,
 		BillingInterval:        &interval,
@@ -542,22 +595,20 @@ func (h *BillingHandler) handleCheckoutCompleted(ctx context.Context, tx *sql.Tx
 		SubscriptionStatus:     &status,
 		PastDueSinceClear:      true,
 	}
+}
+
+// attachCheckoutRefs persists the Stripe references carried by the session.
+// An empty Subscription field (one-time payment sessions) leaves the existing
+// column unchanged.
+func attachCheckoutRefs(upd *db.SubscriptionUpdate, sess stripeCheckoutSession, periodEnd *time.Time) {
 	if sess.Customer != "" {
-		c := sess.Customer
-		upd.StripeCustomerID = &c
+		upd.StripeCustomerID = &sess.Customer
 	}
 	if sess.Subscription != "" {
-		// Persist the subscription id so DeleteAccount can cancel it
-		// later. Empty Subscription field (one-time payment sessions)
-		// leaves the existing column unchanged.
-		s := sess.Subscription
-		upd.StripeSubscriptionID = &s
+		upd.StripeSubscriptionID = &sess.Subscription
 	}
-	if periodEnd != nil {
-		upd.CurrentPeriodEnd = periodEnd
-		upd.QuotaResetAt = periodEnd
-	}
-	return h.Queries.ApplySubscriptionUpdate(ctx, tx, upd)
+	upd.CurrentPeriodEnd = periodEnd
+	upd.QuotaResetAt = periodEnd
 }
 
 type stripeInvoice struct {
@@ -577,105 +628,111 @@ type stripeInvoice struct {
 }
 
 func (h *BillingHandler) handleInvoicePaymentSucceeded(ctx context.Context, tx *sql.Tx, event stripe.Event) error {
+	inv, err := decodeInvoice(event)
+	if err != nil || inv.Customer == "" {
+		return err
+	}
+	user, err := h.userByStripeCustomer(ctx, inv.Customer, "invoice.payment_succeeded")
+	if err != nil || user == nil {
+		return err
+	}
+	upd := paidInvoiceUpdate(user.ID, invoicePeriodEnd(inv))
+	return h.Queries.ApplySubscriptionUpdate(ctx, tx, upd)
+}
+
+func decodeInvoice(event stripe.Event) (stripeInvoice, error) {
 	var inv stripeInvoice
-	if err := json.Unmarshal(event.Data.Raw, &inv); err != nil {
-		return err
-	}
-	if inv.Customer == "" {
-		return nil
-	}
-	user, err := h.Queries.GetUserByStripeCustomerID(ctx, inv.Customer)
+	err := json.Unmarshal(event.Data.Raw, &inv)
+	return inv, err
+}
+
+// userByStripeCustomer resolves the local user for an invoice event, logging
+// unknown customers under the given event name.
+func (h *BillingHandler) userByStripeCustomer(ctx context.Context, customer, eventName string) (*db.User, error) {
+	user, err := h.Queries.GetUserByStripeCustomerID(ctx, customer)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if user == nil {
-		log.Printf("billing webhook: invoice.payment_succeeded for unknown customer=%s", inv.Customer)
-		return nil
+		log.Printf("billing webhook: %s for unknown customer=%s", eventName, customer)
 	}
+	return user, nil
+}
 
-	// Period end: prefer the invoice line's period end (renewal anchor),
-	// fall back to invoice.period_end. If neither is set, leave the column
-	// untouched.
-	var periodEnd *time.Time
+// invoicePeriodEnd prefers the invoice line's period end (renewal anchor),
+// falling back to invoice.period_end; nil leaves the column untouched.
+func invoicePeriodEnd(inv stripeInvoice) *time.Time {
 	if len(inv.Lines.Data) > 0 && inv.Lines.Data[0].Period.End != 0 {
-		t := time.Unix(inv.Lines.Data[0].Period.End, 0).UTC()
-		periodEnd = &t
-	} else if inv.PeriodEnd != 0 {
-		t := time.Unix(inv.PeriodEnd, 0).UTC()
-		periodEnd = &t
+		return unixPtr(inv.Lines.Data[0].Period.End)
 	}
+	return unixPtr(inv.PeriodEnd)
+}
 
-	status := "active"
-	used := 0
+// paidInvoiceUpdate reactivates the subscription and resets usage for the
+// new period.
+func paidInvoiceUpdate(userID string, periodEnd *time.Time) db.SubscriptionUpdate {
+	status, used := "active", 0
 	upd := db.SubscriptionUpdate{
-		UserID:                 user.ID,
+		UserID:                 userID,
 		SubscriptionStatus:     &status,
 		CommentsUsedThisPeriod: &used,
 		PastDueSinceClear:      true,
 	}
-	if periodEnd != nil {
-		upd.CurrentPeriodEnd = periodEnd
-		upd.QuotaResetAt = periodEnd
-	}
-	return h.Queries.ApplySubscriptionUpdate(ctx, tx, upd)
+	upd.CurrentPeriodEnd = periodEnd
+	upd.QuotaResetAt = periodEnd
+	return upd
 }
 
 func (h *BillingHandler) handleInvoicePaymentFailed(ctx context.Context, tx *sql.Tx, event stripe.Event) error {
-	var inv stripeInvoice
-	if err := json.Unmarshal(event.Data.Raw, &inv); err != nil {
+	inv, err := decodeInvoice(event)
+	if err != nil || inv.Customer == "" {
 		return err
-	}
-	if inv.Customer == "" {
-		return nil
 	}
 	user, err := h.Queries.GetUserByStripeCustomerID(ctx, inv.Customer)
-	if err != nil {
+	if err != nil || user == nil {
 		return err
 	}
-	if user == nil {
-		return nil
+	if err := h.Queries.ApplySubscriptionUpdate(ctx, tx, pastDueUpdate(user)); err != nil {
+		return err
 	}
+	h.sendPaymentFailedEmail(ctx, user, inv)
+	return nil
+}
+
+// pastDueUpdate marks the subscription past_due. past_due_since is only set
+// on the *first* failure so the 3-day grace clock is anchored at the first
+// miss; subsequent failures leave the existing timestamp in place.
+func pastDueUpdate(user *db.User) db.SubscriptionUpdate {
 	status := "past_due"
-	now := time.Now().UTC()
-	upd := db.SubscriptionUpdate{
-		UserID:             user.ID,
-		SubscriptionStatus: &status,
-	}
-	// Only set past_due_since on the *first* failure so the 3-day grace
-	// clock is anchored at the first miss. Subsequent failures leave the
-	// existing timestamp in place.
+	upd := db.SubscriptionUpdate{UserID: user.ID, SubscriptionStatus: &status}
 	if user.PastDueSince == nil {
+		now := time.Now().UTC()
 		upd.PastDueSince = &now
 	}
-	if err := h.Queries.ApplySubscriptionUpdate(ctx, tx, upd); err != nil {
-		return err
-	}
+	return upd
+}
 
-	// 12.3: emit payment_failed transactional email. Idempotency key
-	// includes the invoice ID so retried webhooks (Stripe redelivers on
-	// 5xx) collapse to one send. Pipeline+UI surface only — failure to
-	// enqueue must not roll back the DB transition.
-	if h.Pipeline != nil && inv.ID != "" {
-		key := "payment_failed:" + user.ID + ":" + inv.ID
-		amount := float64(inv.AmountDue) / 100.0
-		msg := email.Message{
-			ToUserID:       user.ID,
-			ToAddress:      user.Email,
-			Template:       email.TemplatePaymentFailed,
-			IdempotencyKey: key,
-			Variables: map[string]any{
-				"PlanName":  "Creator",
-				"Amount":    amount,
-				"Currency":  strings.ToUpper(inv.Currency),
-				"PortalURL": "",
-			},
-		}
-		if err := h.Pipeline.Send(ctx, msg); err != nil {
-			log.Printf("payment_failed email enqueue failed user=%s invoice=%s: %v",
-				user.ID, inv.ID, err)
-		}
+// sendPaymentFailedEmail 12.3: emits the payment_failed transactional email.
+// Idempotency key includes the invoice ID so retried webhooks (Stripe
+// redelivers on 5xx) collapse to one send. Pipeline+UI surface only — a
+// failure to enqueue must not roll back the DB transition.
+func (h *BillingHandler) sendPaymentFailedEmail(ctx context.Context, user *db.User, inv stripeInvoice) {
+	if h.Pipeline == nil || inv.ID == "" {
+		return
 	}
-	return nil
+	msg := email.Message{
+		ToUserID:       user.ID,
+		ToAddress:      user.Email,
+		Template:       email.TemplatePaymentFailed,
+		IdempotencyKey: "payment_failed:" + user.ID + ":" + inv.ID,
+		Variables: map[string]any{
+			"PlanName": "Creator", "Amount": float64(inv.AmountDue) / 100.0,
+			"Currency": strings.ToUpper(inv.Currency), "PortalURL": "",
+		},
+	}
+	if err := h.Pipeline.Send(ctx, msg); err != nil {
+		log.Printf("payment_failed email enqueue failed user=%s invoice=%s: %v", user.ID, inv.ID, err)
+	}
 }
 
 type stripeSubscriptionEvent struct {
@@ -686,57 +743,76 @@ type stripeSubscriptionEvent struct {
 }
 
 func (h *BillingHandler) handleSubscriptionUpdated(ctx context.Context, tx *sql.Tx, event stripe.Event) error {
-	var s stripeSubscriptionEvent
-	if err := json.Unmarshal(event.Data.Raw, &s); err != nil {
+	s, err := decodeSubscriptionEvent(event)
+	if err != nil || s.ID == "" {
 		return err
 	}
-	if s.ID == "" {
-		return nil
+	sub, err := h.BillingClient.GetSubscription(ctx, s.ID) // authoritative state per spec 5.4
+	if err != nil || sub == nil {
+		return err
 	}
-
-	// Authoritative state per spec 5.4.
-	sub, err := h.BillingClient.GetSubscription(ctx, s.ID)
+	user, err := h.resolveUserBySubEvent(ctx, s)
 	if err != nil {
 		return err
-	}
-	if sub == nil {
-		return nil
-	}
-
-	// Resolve user: metadata.user_id wins, then by customer id.
-	var user *db.User
-	if id := s.Metadata["user_id"]; id != "" {
-		user, err = h.Queries.GetUserByID(ctx, id)
-		if err != nil && !errors.Is(err, db.ErrNotFound) {
-			return err
-		}
-	}
-	if user == nil && s.Customer != "" {
-		user, err = h.Queries.GetUserByStripeCustomerID(ctx, s.Customer)
-		if err != nil {
-			return err
-		}
 	}
 	if user == nil {
 		log.Printf("billing webhook: customer.subscription.updated unknown user (sub=%s)", s.ID)
 		return nil
 	}
+	return h.applySubscriptionState(ctx, tx, user, s.ID, sub)
+}
 
-	// Map current price ID back to plan + interval.
-	var plan, interval string
-	if sub.Items != nil && len(sub.Items.Data) > 0 && sub.Items.Data[0].Price != nil {
-		if p, i, ok := h.BillingClient.PriceMap().PlanFromPriceID(sub.Items.Data[0].Price.ID); ok {
-			plan = p
-			interval = i
+func decodeSubscriptionEvent(event stripe.Event) (stripeSubscriptionEvent, error) {
+	var s stripeSubscriptionEvent
+	err := json.Unmarshal(event.Data.Raw, &s)
+	return s, err
+}
+
+// resolveUserBySubEvent finds the local user for a subscription event:
+// metadata.user_id wins, then the Stripe customer id.
+func (h *BillingHandler) resolveUserBySubEvent(ctx context.Context, s stripeSubscriptionEvent) (*db.User, error) {
+	if id := s.Metadata["user_id"]; id != "" {
+		user, err := h.Queries.GetUserByID(ctx, id)
+		if err != nil && !errors.Is(err, db.ErrNotFound) {
+			return nil, err
+		}
+		if user != nil {
+			return user, nil
 		}
 	}
-
-	status := mapStripeStatus(string(sub.Status))
-	upd := db.SubscriptionUpdate{
-		UserID:               user.ID,
-		SubscriptionStatus:   &status,
-		StripeSubscriptionID: &s.ID,
+	if s.Customer == "" {
+		return nil, nil
 	}
+	return h.Queries.GetUserByStripeCustomerID(ctx, s.Customer)
+}
+
+// applySubscriptionState persists the mapped Stripe state, then enforces the
+// new plan when the subscription is active.
+func (h *BillingHandler) applySubscriptionState(ctx context.Context, tx *sql.Tx, user *db.User, subID string, sub *stripe.Subscription) error {
+	plan, interval := "", ""
+	if p, i, ok := priceOfItem(sub, h.BillingClient.PriceMap()); ok {
+		plan, interval = p, i
+	}
+	status := mapStripeStatus(string(sub.Status))
+	upd := subscriptionStateUpdate(user.ID, subID, status, plan, interval, sub.CurrentPeriodEnd)
+	if err := h.Queries.ApplySubscriptionUpdate(ctx, tx, upd); err != nil {
+		return err
+	}
+	h.enforceActivePlan(ctx, tx, user, plan, status)
+	return nil
+}
+
+// subscriptionStateUpdate maps status/plan/interval/period onto the local
+// row; empty plan or interval leave those columns unchanged.
+func subscriptionStateUpdate(userID, subID, status, plan, interval string, periodEnd int64) db.SubscriptionUpdate {
+	upd := db.SubscriptionUpdate{UserID: userID, SubscriptionStatus: &status, StripeSubscriptionID: &subID}
+	applyPlanInterval(&upd, plan, interval)
+	upd.CurrentPeriodEnd = unixPtr(periodEnd)
+	upd.PastDueSinceClear = status == "active"
+	return upd
+}
+
+func applyPlanInterval(upd *db.SubscriptionUpdate, plan, interval string) {
 	if plan != "" {
 		upd.SubscriptionPlan = &plan
 		l := billing.LimitsFor(plan)
@@ -745,85 +821,78 @@ func (h *BillingHandler) handleSubscriptionUpdated(ctx context.Context, tx *sql.
 	if interval != "" {
 		upd.BillingInterval = &interval
 	}
-	if sub.CurrentPeriodEnd != 0 {
-		t := time.Unix(sub.CurrentPeriodEnd, 0).UTC()
-		upd.CurrentPeriodEnd = &t
-	}
-	if status == "active" {
-		upd.PastDueSinceClear = true
-	}
-	if err := h.Queries.ApplySubscriptionUpdate(ctx, tx, upd); err != nil {
-		return err
-	}
+}
 
-	if plan != "" && status == "active" {
-		limit := billing.LimitsFor(plan)
-		if !limit.ChannelsUnlimited {
-			if err := h.Queries.PauseChannelsAlphabetically(ctx, tx, user.ID, limit.ChannelLimit); err != nil {
-				log.Printf("billing webhook: pause excess channels user=%s plan=%s: %v", user.ID, plan, err)
-			}
-		}
-
-		// 7.4: Send downgrade notification email when plan changes to a lower tier.
-		oldPlan := user.SubscriptionPlan
-		if oldPlan == "" {
-			oldPlan = billing.PlanFree
-		}
-		if plan != oldPlan && h.Pipeline != nil {
-			pausedChannels := false
-			if !limit.ChannelsUnlimited {
-				pausedChannels = true
-			}
-			_ = h.Pipeline.Send(ctx, email.Message{
-				Template:       email.TemplatePlanDowngrade,
-				ToUserID:       user.ID,
-				ToAddress:      user.Email,
-				IdempotencyKey: "plan_downgrade:" + user.ID + ":" + plan,
-				Variables: map[string]any{
-					"OldPlan":        oldPlan,
-					"NewPlan":        plan,
-					"ChannelLimit":   limit.ChannelLimit,
-					"PausedChannels": pausedChannels,
-				},
-			})
-		}
+// enforceActivePlan re-applies channel limits and notifies downgrades after
+// an activation; plan-less or inactive events are ignored.
+func (h *BillingHandler) enforceActivePlan(ctx context.Context, tx *sql.Tx, user *db.User, plan, status string) {
+	if plan == "" || status != "active" {
+		return
 	}
+	limit := billing.LimitsFor(plan)
+	h.pauseExcessChannels(ctx, tx, user.ID, plan, limit)
+	h.notifyPlanDowngrade(ctx, user, plan, limit)
+}
 
-	return nil
+func (h *BillingHandler) pauseExcessChannels(ctx context.Context, tx *sql.Tx, userID, plan string, limit billing.PlanLimits) {
+	if limit.ChannelsUnlimited {
+		return
+	}
+	if err := h.Queries.PauseChannelsAlphabetically(ctx, tx, userID, limit.ChannelLimit); err != nil {
+		log.Printf("billing webhook: pause excess channels user=%s plan=%s: %v", userID, plan, err)
+	}
+}
+
+// notifyPlanDowngrade 7.4: send the downgrade notification when the plan
+// moved to a different tier.
+func (h *BillingHandler) notifyPlanDowngrade(ctx context.Context, user *db.User, plan string, limit billing.PlanLimits) {
+	oldPlan := user.SubscriptionPlan
+	if oldPlan == "" {
+		oldPlan = billing.PlanFree
+	}
+	if plan == oldPlan || h.Pipeline == nil {
+		return
+	}
+	msg := email.Message{
+		Template:       email.TemplatePlanDowngrade,
+		ToUserID:       user.ID,
+		ToAddress:      user.Email,
+		IdempotencyKey: "plan_downgrade:" + user.ID + ":" + plan,
+		Variables: map[string]any{
+			"OldPlan": oldPlan, "NewPlan": plan,
+			"ChannelLimit": limit.ChannelLimit, "PausedChannels": !limit.ChannelsUnlimited,
+		},
+	}
+	_ = h.Pipeline.Send(ctx, msg)
 }
 
 func (h *BillingHandler) handleSubscriptionDeleted(ctx context.Context, tx *sql.Tx, event stripe.Event) error {
-	var s stripeSubscriptionEvent
-	if err := json.Unmarshal(event.Data.Raw, &s); err != nil {
+	s, err := decodeSubscriptionEvent(event)
+	if err != nil {
 		return err
 	}
-
-	// Resolve user: metadata first, customer id second.
-	var user *db.User
-	var err error
-	if id := s.Metadata["user_id"]; id != "" {
-		user, err = h.Queries.GetUserByID(ctx, id)
-		if err != nil && !errors.Is(err, db.ErrNotFound) {
-			return err
-		}
-	}
-	if user == nil && s.Customer != "" {
-		user, err = h.Queries.GetUserByStripeCustomerID(ctx, s.Customer)
-		if err != nil {
-			return err
-		}
+	user, err := h.resolveUserBySubEvent(ctx, s)
+	if err != nil {
+		return err
 	}
 	if user == nil {
 		log.Printf("billing webhook: customer.subscription.deleted unknown user (sub=%s)", s.ID)
 		return nil
 	}
+	if err := h.Queries.ApplySubscriptionUpdate(ctx, tx, freePlanDowngrade(user.ID)); err != nil {
+		return err
+	}
+	// Free plan keeps 1 channel; pause everything else alphabetically.
+	return h.Queries.PauseChannelsAlphabetically(ctx, tx, user.ID, billing.LimitsFor(billing.PlanFree).ChannelLimit)
+}
 
-	// Downgrade to free per spec 5.5.
-	freePlan := billing.PlanFree
+// freePlanDowngrade is the spec 5.5 downgrade: free plan, canceled status,
+// billing interval / past-due / subscription reference cleared.
+func freePlanDowngrade(userID string) db.SubscriptionUpdate {
+	freePlan, status := billing.PlanFree, "canceled"
 	freeLimits := billing.LimitsFor(freePlan)
-	status := "canceled"
-	upd := db.SubscriptionUpdate{
-		UserID:                    user.ID,
+	return db.SubscriptionUpdate{
+		UserID:                    userID,
 		SubscriptionPlan:          &freePlan,
 		CommentQuotaMonthly:       &freeLimits.CommentQuotaMonthly,
 		SubscriptionStatus:        &status,
@@ -831,46 +900,62 @@ func (h *BillingHandler) handleSubscriptionDeleted(ctx context.Context, tx *sql.
 		PastDueSinceClear:         true,
 		StripeSubscriptionIDClear: true,
 	}
-	if err := h.Queries.ApplySubscriptionUpdate(ctx, tx, upd); err != nil {
-		return err
-	}
-
-	// Free plan keeps 1 channel; pause everything else alphabetically.
-	return h.Queries.PauseChannelsAlphabetically(ctx, tx, user.ID, freeLimits.ChannelLimit)
 }
 
 // ----------------------------------------------------------------------------
 // helpers
 // ----------------------------------------------------------------------------
 
+// unixPtr converts a Stripe epoch-seconds field to a *time.Time; 0 (unset)
+// maps to nil so the column stays untouched.
+func unixPtr(sec int64) *time.Time {
+	if sec == 0 {
+		return nil
+	}
+	t := time.Unix(sec, 0).UTC()
+	return &t
+}
+
+// periodEndOf is the authoritative current-period end of a Stripe
+// subscription (nil when absent).
+func periodEndOf(sub *stripe.Subscription) *time.Time {
+	if sub == nil {
+		return nil
+	}
+	return unixPtr(sub.CurrentPeriodEnd)
+}
+
+// priceOfItem maps the subscription's first item price ID back to the
+// configured (plan, interval) catalog.
+func priceOfItem(sub *stripe.Subscription, prices billing.PriceMap) (string, string, bool) {
+	if sub == nil || sub.Items == nil || len(sub.Items.Data) == 0 || sub.Items.Data[0].Price == nil {
+		return "", "", false
+	}
+	return prices.PlanFromPriceID(sub.Items.Data[0].Price.ID)
+}
+
 // priceMapPlanInterval inspects a Stripe Subscription's first item and
 // returns the matching (plan, interval) from the configured PriceMap.
 func (h *BillingHandler) priceMapPlanInterval(sub *stripe.Subscription) (string, string, bool) {
-	if sub == nil || sub.Items == nil || len(sub.Items.Data) == 0 {
-		return "", "", false
-	}
-	item := sub.Items.Data[0]
-	if item.Price == nil {
-		return "", "", false
-	}
-	return h.BillingClient.PriceMap().PlanFromPriceID(item.Price.ID)
+	return priceOfItem(sub, h.BillingClient.PriceMap())
+}
+
+// stripeStatusMap narrows the Stripe subscription status set onto the 4-value
+// local state machine.
+var stripeStatusMap = map[string]string{
+	"active": "active", "trialing": "active",
+	"past_due": "past_due", "unpaid": "past_due",
+	"canceled": "canceled", "incomplete_expired": "canceled",
+	"paused": "paused",
 }
 
 // mapStripeStatus narrows the Stripe subscription status set onto the
 // 4-value local state machine.
 func mapStripeStatus(s string) string {
-	switch s {
-	case "active", "trialing":
-		return "active"
-	case "past_due", "unpaid":
-		return "past_due"
-	case "canceled", "incomplete_expired":
-		return "canceled"
-	case "paused":
-		return "paused"
-	default:
-		return "active"
+	if mapped, ok := stripeStatusMap[s]; ok {
+		return mapped
 	}
+	return "active"
 }
 
 // (writeJSON is defined in auth_handlers.go and reused here.)

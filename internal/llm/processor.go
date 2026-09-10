@@ -160,37 +160,67 @@ func (p *Processor) tickOnce(ctx context.Context) {
 
 // processChannelBatch runs the full lifecycle for a single per-channel batch.
 func (p *Processor) processChannelBatch(ctx context.Context, channelID string, batch []*db.Comment) {
-	if len(batch) == 0 {
+	primary, ok := p.requireActivePrimary(ctx, channelID, batch)
+	if !ok {
 		return
 	}
+	jobID, ok := p.startJob(ctx, channelID, batch)
+	if !ok {
+		return
+	}
+	results, err := p.classify(ctx, p.buildPrompts(ctx, channelID, primary, batch))
+	if err != nil {
+		p.failBatch(ctx, channelID, jobID, "", err)
+		return
+	}
+	// Apply confidence-threshold downgrade.
+	results = ApplyConfidenceThreshold(results, p.ConfidenceThreshold)
+	// Persist results, increment quota, mark job complete.
+	if err := p.persistBatch(ctx, batch, results, primary, jobID); err != nil {
+		p.failBatch(ctx, channelID, jobID, "persist", err)
+		return
+	}
+	log.Printf("event=batch_completed channel_id=%s job_id=%s batch_size=%d primary_user_id=%s",
+		channelID, jobID, len(batch), primary.ID)
+}
 
-	// Resolve primary token holder. No primary => skip (no DB writes).
+// requireActivePrimary resolves the primary token holder (no primary => skip,
+// no DB writes) and applies the pre-batch billing guard (billing change,
+// task 7.3): skip when the holder is paused OR already at quota (advisory;
+// the post-batch overage logger handles the boundary-crossing case).
+func (p *Processor) requireActivePrimary(ctx context.Context, channelID string, batch []*db.Comment) (*db.User, bool) {
+	if len(batch) == 0 {
+		return nil, false
+	}
 	primary, err := p.Q.GetPrimaryTracker(ctx, channelID)
 	if err != nil {
-		if errors.Is(err, db.ErrNoPrimaryTracker) {
-			log.Printf("event=batch_skipped_no_primary channel_id=%s batch_size=%d", channelID, len(batch))
-			return
-		}
-		log.Printf("LLM Processor: GetPrimaryTracker failed for channel=%s: %v", channelID, err)
-		return
+		p.logPrimaryLookup(channelID, len(batch), err)
+		return nil, false
 	}
-
-	// Pre-batch billing guard (billing change, task 7.3).
-	// Skip the entire batch if the primary token holder is paused, OR if
-	// they have already hit their quota (advisory; the post-batch overage
-	// logger handles the boundary-crossing case).
 	if primary.SubscriptionStatus == "paused" {
 		log.Printf("event=batch_skipped_paused channel_id=%s primary_user_id=%s batch_size=%d",
 			channelID, primary.ID, len(batch))
-		return
+		return nil, false
 	}
-	if !(primary.CommentsUsedThisPeriod < primary.CommentQuotaMonthly) {
+	if primary.CommentsUsedThisPeriod >= primary.CommentQuotaMonthly {
 		log.Printf("event=batch_skipped_quota channel_id=%s primary_user_id=%s used=%d quota=%d batch_size=%d",
 			channelID, primary.ID, primary.CommentsUsedThisPeriod, primary.CommentQuotaMonthly, len(batch))
+		return nil, false
+	}
+	return primary, true
+}
+
+func (p *Processor) logPrimaryLookup(channelID string, batchLen int, err error) {
+	if errors.Is(err, db.ErrNoPrimaryTracker) {
+		log.Printf("event=batch_skipped_no_primary channel_id=%s batch_size=%d", channelID, batchLen)
 		return
 	}
+	log.Printf("LLM Processor: GetPrimaryTracker failed for channel=%s: %v", channelID, err)
+}
 
-	// Enqueue the job row for observability with dedupe.
+// startJob enqueues the job row for observability with dedupe and flips it
+// to processing; false means the batch was deduped or enqueue failed.
+func (p *Processor) startJob(ctx context.Context, channelID string, batch []*db.Comment) (string, bool) {
 	commentIDs := make([]string, 0, len(batch))
 	for _, c := range batch {
 		commentIDs = append(commentIDs, c.ID)
@@ -198,40 +228,49 @@ func (p *Processor) processChannelBatch(ctx context.Context, channelID string, b
 	jobID, created, err := enqueueLLMJobDeduped(ctx, p.Q, commentIDs, p.Client.ProviderName())
 	if err != nil {
 		log.Printf("LLM Processor: EnqueueLLMJob failed channel=%s: %v", channelID, err)
-		return
+		return "", false
 	}
 	if !created {
 		log.Printf("event=batch_deduped channel_id=%s job_id=%s batch_size=%d", channelID, jobID, len(batch))
-		return
+		return "", false
 	}
 	if err := p.Q.MarkLLMJobProcessing(ctx, jobID); err != nil {
-		log.Printf("LLM Processor: MarkLLMJobProcessing failed job=%s: %v", jobID, err)
 		// Continue: we still want to attempt classification.
+		log.Printf("LLM Processor: MarkLLMJobProcessing failed job=%s: %v", jobID, err)
 	}
-
 	log.Printf("event=batch_started channel_id=%s job_id=%s batch_size=%d provider=%s model=%s",
 		channelID, jobID, len(batch), p.Client.ProviderName(), p.Client.ModelName())
+	return jobID, true
+}
 
-	// inflight covers the LLM call so graceful shutdown waits for it.
-	p.inflight.Add(1)
-	defer p.inflight.Done()
-
-	// Build prompt input. The LLM call happens outside any DB transaction.
-	customPrompt := ""
-	if primary != nil {
-		customPrompt, _ = p.Q.GetChannelCustomPrompt(ctx, channelID, primary.ID)
-	}
+// buildPrompts renders the batch prompt input: the primary's custom prompt
+// plus a flattened parent context for replies. The LLM call happens outside
+// any DB transaction.
+func (p *Processor) buildPrompts(ctx context.Context, channelID string, primary *db.User, batch []*db.Comment) []PromptComment {
+	customPrompt, _ := p.Q.GetChannelCustomPrompt(ctx, channelID, primary.ID)
 	prompts := make([]PromptComment, len(batch))
 	for i, c := range batch {
-		pc := PromptComment{Body: c.Body, CustomPrompt: customPrompt}
-		if c.ParentCommentID != nil && *c.ParentCommentID != "" {
-			parent, _ := p.Q.GetCommentBodyByID(ctx, *c.ParentCommentID)
-			pc.ParentContext = parent
-		}
-		prompts[i] = pc
+		prompts[i] = PromptComment{Body: c.Body, ParentContext: p.parentContext(ctx, c), CustomPrompt: customPrompt}
 	}
+	return prompts
+}
 
+// parentContext fetches the parent comment body for reply rows.
+func (p *Processor) parentContext(ctx context.Context, c *db.Comment) string {
+	if c.ParentCommentID == nil || *c.ParentCommentID == "" {
+		return ""
+	}
+	parent, _ := p.Q.GetCommentBodyByID(ctx, *c.ParentCommentID)
+	return parent
+}
+
+// classify runs the LLM call under the batch timeout. The inflight counter
+// covers the call so graceful shutdown waits for it.
+func (p *Processor) classify(ctx context.Context, prompts []PromptComment) ([]LLMResult, error) {
+	p.inflight.Add(1)
+	defer p.inflight.Done()
 	llmCtx, cancel := context.WithTimeout(ctx, p.BatchTimeout)
+	defer cancel()
 	// otel-instrumentation: wrap each LLM call in a tracer span and
 	// emit the (request, duration) metrics on every return path.
 	// Provider/model are read once before the call because the
@@ -239,33 +278,24 @@ func (p *Processor) processChannelBatch(ctx context.Context, channelID string, b
 	// pre-call values matches the "what we asked for" semantic.
 	provider := p.Client.ProviderName()
 	model := p.Client.ModelName()
-	llmCtx, span := llmTracer.Start(llmCtx, "llm.classify_batch",
-		traceWithAttrs(provider, model, len(prompts)))
+	traced, span := llmTracer.Start(llmCtx, "llm.classify_batch", traceWithAttrs(provider, model, len(prompts)))
+	defer span.End()
 	llmStart := time.Now()
-	results, err := p.Client.ClassifyBatch(llmCtx, prompts)
-	recordLLMRequest(ctx, provider, model, llmStart, err)
-	span.End()
-	cancel()
-	if err != nil {
-		msg := truncate(fmt.Sprintf("%v", err), 4000)
-		_ = p.Q.MarkLLMJobFailed(ctx, jobID, msg)
+	results, err := p.Client.ClassifyBatch(traced, prompts)
+	recordLLMRequest(llmCtx, provider, model, llmStart, err)
+	return results, err
+}
+
+// failBatch records the truncated error on the job row and logs the
+// batch_failed event (phase names the persist-stage failure variant).
+func (p *Processor) failBatch(ctx context.Context, channelID, jobID, phase string, err error) {
+	msg := truncate(fmt.Sprintf("%v", err), 4000)
+	_ = p.Q.MarkLLMJobFailed(ctx, jobID, msg)
+	if phase == "" {
 		log.Printf("event=batch_failed channel_id=%s job_id=%s error=%v", channelID, jobID, err)
 		return
 	}
-
-	// Apply confidence-threshold downgrade.
-	results = ApplyConfidenceThreshold(results, p.ConfidenceThreshold)
-
-	// Persist results, increment quota, mark job complete.
-	if err := p.persistBatch(ctx, batch, results, primary, jobID); err != nil {
-		msg := truncate(fmt.Sprintf("%v", err), 4000)
-		_ = p.Q.MarkLLMJobFailed(ctx, jobID, msg)
-		log.Printf("event=batch_failed phase=persist channel_id=%s job_id=%s error=%v", channelID, jobID, err)
-		return
-	}
-
-	log.Printf("event=batch_completed channel_id=%s job_id=%s batch_size=%d primary_user_id=%s",
-		channelID, jobID, len(batch), primary.ID)
+	log.Printf("event=batch_failed phase=%s channel_id=%s job_id=%s error=%v", phase, channelID, jobID, err)
 }
 
 func enqueueLLMJobDeduped(ctx context.Context, q db.DBQuery, commentIDs []string, provider string) (id string, created bool, err error) {
@@ -320,35 +350,47 @@ func (p *Processor) persistBatch(ctx context.Context, batch []*db.Comment, resul
 	// the user's quota boundary AND their plan tracks overage (creator,
 	// studio), insert a comment_usage_logs row with the delta beyond the
 	// quota.
-	if billing.TracksOverage(primary.SubscriptionPlan) && primary.CommentQuotaMonthly > 0 {
-		preUsed := primary.CommentsUsedThisPeriod
-		postUsed := preUsed + len(batch)
-		if postUsed > primary.CommentQuotaMonthly {
-			delta := postUsed - max2(primary.CommentQuotaMonthly, preUsed)
-			if delta > 0 {
-				// Period boundaries: prefer current_period_end if known,
-				// otherwise approximate a month window ending now.
-				periodEnd := time.Now().UTC().Add(31 * 24 * time.Hour)
-				if primary.CurrentPeriodEnd != nil {
-					periodEnd = *primary.CurrentPeriodEnd
-				}
-				periodStart := periodEnd.Add(-31 * 24 * time.Hour)
-				if err := p.Q.InsertCommentUsageLog(ctx, nil, primary.ID, delta, periodStart, periodEnd); err != nil {
-					// Non-fatal: usage was already incremented; we log and
-					// continue so the job can complete.
-					log.Printf("event=overage_log_failed user=%s delta=%d err=%v", primary.ID, delta, err)
-				} else {
-					log.Printf("event=overage_logged user=%s plan=%s pre_used=%d post_used=%d quota=%d delta=%d",
-						primary.ID, primary.SubscriptionPlan, preUsed, postUsed, primary.CommentQuotaMonthly, delta)
-				}
-			}
-		}
-	}
+	p.logOverage(ctx, primary, len(batch))
 
 	if err := p.Q.MarkLLMJobCompleted(ctx, jobID); err != nil {
 		return fmt.Errorf("mark job completed: %w", err)
 	}
 	return nil
+}
+
+// logOverage records usage beyond quota when the plan tracks overage.
+// Non-fatal: usage was already incremented; we log and continue so the job
+// can complete.
+func (p *Processor) logOverage(ctx context.Context, primary *db.User, batchLen int) {
+	if !billing.TracksOverage(primary.SubscriptionPlan) || primary.CommentQuotaMonthly <= 0 {
+		return
+	}
+	preUsed := primary.CommentsUsedThisPeriod
+	postUsed := preUsed + batchLen
+	delta := postUsed - max2(primary.CommentQuotaMonthly, preUsed)
+	if delta > 0 {
+		p.recordOverageDelta(ctx, primary, delta, preUsed, postUsed)
+	}
+}
+
+func (p *Processor) recordOverageDelta(ctx context.Context, primary *db.User, delta, preUsed, postUsed int) {
+	periodStart, periodEnd := overagePeriod(primary.CurrentPeriodEnd)
+	if err := p.Q.InsertCommentUsageLog(ctx, nil, primary.ID, delta, periodStart, periodEnd); err != nil {
+		log.Printf("event=overage_log_failed user=%s delta=%d err=%v", primary.ID, delta, err)
+		return
+	}
+	log.Printf("event=overage_logged user=%s plan=%s pre_used=%d post_used=%d quota=%d delta=%d",
+		primary.ID, primary.SubscriptionPlan, preUsed, postUsed, primary.CommentQuotaMonthly, delta)
+}
+
+// overagePeriod bounds the usage log: prefer current_period_end if known,
+// otherwise approximate a month window ending now.
+func overagePeriod(currentPeriodEnd *time.Time) (time.Time, time.Time) {
+	periodEnd := time.Now().UTC().Add(31 * 24 * time.Hour)
+	if currentPeriodEnd != nil {
+		periodEnd = *currentPeriodEnd
+	}
+	return periodEnd.Add(-31 * 24 * time.Hour), periodEnd
 }
 
 func max2(a, b int) int {

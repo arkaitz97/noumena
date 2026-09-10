@@ -43,64 +43,107 @@ type DigestPromptInputs struct {
 // synthesis.
 func BuildDigestPrompt(in DigestPromptInputs) string {
 	var b strings.Builder
+	writeDigestHeader(&b, in)
+	writeDigestData(&b, in)
+	writeDigestProfile(&b, in)
+	writeDigestTask(&b)
+	return b.String()
+}
+
+// writeDigestHeader emits the role line and the scalar ground truth.
+func writeDigestHeader(b *strings.Builder, in DigestPromptInputs) {
 	b.WriteString("You are an expert content strategist analyzing a creator's audience comments from the past week.\n\n")
 	b.WriteString("GROUND TRUTH (computed by the application — do NOT recalculate; ECHO these values verbatim in your response):\n")
-	fmt.Fprintf(&b, "  total_comments_analyzed: %d\n", in.Aggregates.TotalCommentsAnalyzed)
-	fmt.Fprintf(&b, "  filtered_comments: %d\n", in.Aggregates.FilteredComments)
-	fmt.Fprintf(&b, "  engagement_health_score: %d\n", in.Aggregates.EngagementHealthScore)
-	fmt.Fprintf(&b, "  health_score_breakdown: response_rate=%d engagement_depth=%d\n",
+	fmt.Fprintf(b, "  total_comments_analyzed: %d\n", in.Aggregates.TotalCommentsAnalyzed)
+	fmt.Fprintf(b, "  filtered_comments: %d\n", in.Aggregates.FilteredComments)
+	fmt.Fprintf(b, "  engagement_health_score: %d\n", in.Aggregates.EngagementHealthScore)
+	fmt.Fprintf(b, "  health_score_breakdown: response_rate=%d engagement_depth=%d\n",
 		in.Aggregates.HealthScoreBreakdown.ResponseRate,
 		in.Aggregates.HealthScoreBreakdown.EngagementDepth)
-	if len(in.Aggregates.TopActionableInsights) > 0 {
-		b.WriteString("  top_actionable_insights:\n")
-		for _, ins := range in.Aggregates.TopActionableInsights {
-			fmt.Fprintf(&b, "    - [%s] %s (count: %d)\n", ins.Type, ins.Description, ins.Count)
-		}
-	}
+}
 
-	if len(in.TopTopics) > 0 {
-		b.WriteString("  top_topics:\n")
-		for _, t := range in.TopTopics {
-			fmt.Fprintf(&b, "    - %s (%d)\n", t.Topic, t.Count)
-		}
-	}
-	if len(in.CategoryCounts) > 0 {
-		b.WriteString("  category_distribution:\n")
-		for k, v := range in.CategoryCounts {
-			fmt.Fprintf(&b, "    %s: %d\n", k, v)
-		}
-	}
+// writeDigestData lists aggregate breakdowns plus the grounding samples.
+func writeDigestData(b *strings.Builder, in DigestPromptInputs) {
+	writeInsightLines(b, in.Aggregates.TopActionableInsights)
+	writeTopicLines(b, in.TopTopics)
+	writeCategoryLines(b, in.CategoryCounts)
+	writeSampleLines(b, in.SampleComments)
+}
 
-	if len(in.SampleComments) > 0 {
-		b.WriteString("\nSAMPLE COMMENTS (high-signal subset for grounding only):\n")
-		for i, s := range in.SampleComments {
-			s = strings.ReplaceAll(s, "\n", " ")
-			fmt.Fprintf(&b, "  [%d] %s\n", i, s)
+func writeInsightLines(b *strings.Builder, insights []ActionableInsightAgg) {
+	if len(insights) == 0 {
+		return
+	}
+	b.WriteString("  top_actionable_insights:\n")
+	for _, ins := range insights {
+		fmt.Fprintf(b, "    - [%s] %s (count: %d)\n", ins.Type, ins.Description, ins.Count)
+	}
+}
+
+func writeTopicLines(b *strings.Builder, topics []TopicAgg) {
+	if len(topics) == 0 {
+		return
+	}
+	b.WriteString("  top_topics:\n")
+	for _, t := range topics {
+		fmt.Fprintf(b, "    - %s (%d)\n", t.Topic, t.Count)
+	}
+}
+
+func writeCategoryLines(b *strings.Builder, counts map[string]int) {
+	if len(counts) == 0 {
+		return
+	}
+	b.WriteString("  category_distribution:\n")
+	for k, v := range counts {
+		fmt.Fprintf(b, "    %s: %d\n", k, v)
+	}
+}
+
+func writeSampleLines(b *strings.Builder, samples []string) {
+	if len(samples) == 0 {
+		return
+	}
+	b.WriteString("\nSAMPLE COMMENTS (high-signal subset for grounding only):\n")
+	for i, s := range samples {
+		fmt.Fprintf(b, "  [%d] %s\n", i, strings.ReplaceAll(s, "\n", " "))
+	}
+}
+
+// writeDigestProfile lists the declared creator context when enabled.
+func writeDigestProfile(b *strings.Builder, in DigestPromptInputs) {
+	if !isProfileContextEnabled() || in.Profile == nil {
+		return
+	}
+	parts := profileParts(in.Profile)
+	if len(parts) == 0 {
+		return
+	}
+	b.WriteString("\nCREATOR PROFILE CONTEXT (prioritize insights aligned with these declared goals):\n")
+	for _, part := range parts {
+		fmt.Fprintf(b, "  - %s\n", part)
+	}
+}
+
+// profileParts lists the non-empty declared fields.
+func profileParts(p *db.UserProfile) []string {
+	var parts []string
+	add := func(label string, v *string) {
+		if v != nil && *v != "" {
+			parts = append(parts, fmt.Sprintf("%s: %s", label, *v))
 		}
 	}
-
-	if isProfileContextEnabled() && in.Profile != nil {
-		var profileParts []string
-		if in.Profile.DisplayName != nil && *in.Profile.DisplayName != "" {
-			profileParts = append(profileParts, fmt.Sprintf("Creator Name: %s", *in.Profile.DisplayName))
-		}
-		if in.Profile.UserType != nil && *in.Profile.UserType != "" {
-			profileParts = append(profileParts, fmt.Sprintf("Role/Type: %s", *in.Profile.UserType))
-		}
-		if in.Profile.PrimaryGoal != nil && *in.Profile.PrimaryGoal != "" {
-			profileParts = append(profileParts, fmt.Sprintf("Primary Goal: %s", *in.Profile.PrimaryGoal))
-		}
-		if len(in.Profile.ContentTopics) > 0 {
-			profileParts = append(profileParts, fmt.Sprintf("Topics of Interest: %s", strings.Join(in.Profile.ContentTopics, ", ")))
-		}
-		if len(profileParts) > 0 {
-			b.WriteString("\nCREATOR PROFILE CONTEXT (prioritize insights aligned with these declared goals):\n")
-			for _, part := range profileParts {
-				fmt.Fprintf(&b, "  - %s\n", part)
-			}
-		}
+	add("Creator Name", p.DisplayName)
+	add("Role/Type", p.UserType)
+	add("Primary Goal", p.PrimaryGoal)
+	if len(p.ContentTopics) > 0 {
+		parts = append(parts, fmt.Sprintf("Topics of Interest: %s", strings.Join(p.ContentTopics, ", ")))
 	}
+	return parts
+}
 
+// writeDigestTask is the output contract the parser depends on.
+func writeDigestTask(b *strings.Builder) {
 	b.WriteString(`
 TASK: Produce a JSON object with EXACTLY this shape:
 {
@@ -120,7 +163,6 @@ RULES:
 - engagement_health_score, health_score_breakdown, totals: ECHO the GROUND TRUTH values exactly.
 - Return ONLY the JSON object. No markdown fences, no prose before or after.
 `)
-	return b.String()
 }
 
 // CallDigestLLM invokes the OpenCode client with a 90-second timeout,

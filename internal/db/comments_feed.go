@@ -96,127 +96,158 @@ func applyToxicLayer(categories []string, includeToxic bool) ([]string, bool) {
 // and the positional argument slice. $1 is always userID. The caller MUST NOT
 // reorder or omit the access-control join or processed_at predicate; they are
 // emitted unconditionally for every mode.
+// accessControlClause is the mandatory per-user visibility predicate. It is
+// kept as a constant so no caller or future refactor can silently drop it.
+const accessControlClause = "(EXISTS(SELECT 1 FROM user_channel_tracking uct WHERE uct.platform_channel_id=pc.id AND uct.user_id=$1 AND uct.tracking_status IN ('active','paused')) OR EXISTS(SELECT 1 FROM channel_grants cg JOIN workspace_members wm ON wm.workspace_id=cg.workspace_id WHERE cg.channel_id=pc.id AND wm.user_id=$1))"
+
+// feedProjection is the full comment row with channel name and star flag,
+// shared by the feed, saved, and stream modes.
+const feedProjection = `c.id, c.platform_channel_id, c.platform_comment_id, c.parent_comment_id, c.reply_depth,
+		c.author_handle, c.body, c.posted_at, c.category, c.actionable_insights,
+		c.topic, c.confidence, c.video_id, c.video_title, c.processed_at, c.created_at,
+		pc.display_name AS channel_name,
+		pc.platform_channel_id AS platform_id,
+		EXISTS (SELECT 1 FROM user_comment_stars ucs
+		        WHERE ucs.user_id = $1 AND ucs.comment_id = c.id) AS is_starred`
+
+// modeProjections maps each feed mode to its SELECT projection clause.
+var modeProjections = map[FeedMode]string{
+	ModeCount:  "COUNT(*)",
+	ModeFeed:   feedProjection,
+	ModeSaved:  feedProjection,
+	ModeStream: feedProjection,
+}
+
+// feedQueryBuilder accumulates the positional args in emission order while
+// the SQL string is assembled piece by piece.
+type feedQueryBuilder struct{ args []any }
+
+// addArg records an arg and returns its placeholder ($N).
+func (b *feedQueryBuilder) addArg(v any) string {
+	b.args = append(b.args, v)
+	return "?"
+}
+
+// BuildFeedQuery is the single dynamic SQL builder. It returns the SQL string
+// and the positional argument slice. $1 is always userID. The caller MUST NOT
+// reorder or omit the access-control join or processed_at predicate; they are
+// emitted unconditionally for every mode.
 func BuildFeedQuery(userID string, filters FeedFilters, mode FeedMode) (string, []any) {
-	args := []any{userID}
-	// Helper that records an arg and returns its placeholder ($N).
-	addArg := func(v any) string {
-		args = append(args, v)
-		return "?"
+	b := &feedQueryBuilder{args: []any{userID}}
+	sql := "SELECT " + modeProjections[mode] + " FROM " + b.from(mode)
+	sql += " WHERE " + strings.Join(b.where(filters), " AND ")
+	if tail := b.tail(mode, filters); tail != "" {
+		sql += " " + tail
 	}
+	return sql, b.args
+}
 
-	// --- Projection -------------------------------------------------------
-	var projection string
-	switch mode {
-	case ModeCount:
-		projection = "COUNT(*)"
-	case ModeFeed, ModeSaved, ModeStream:
-		projection = `c.id, c.platform_channel_id, c.platform_comment_id, c.parent_comment_id, c.reply_depth,
-			c.author_handle, c.body, c.posted_at, c.category, c.actionable_insights,
-			c.topic, c.confidence, c.video_id, c.video_title, c.processed_at, c.created_at,
-			pc.display_name AS channel_name,
-			pc.platform_channel_id AS platform_id,
-			EXISTS (SELECT 1 FROM user_comment_stars ucs
-			        WHERE ucs.user_id = $1 AND ucs.comment_id = c.id) AS is_starred`
-	}
-
-	// --- FROM + JOIN ------------------------------------------------------
-	// Access-control join is mandatory and cannot be disabled. We use
-	// tracking_status IN ('active','paused') so paused channels remain
-	// readable (consistent with the source spec's "still see your data").
+// from joins the base tables. Access-control join is mandatory and cannot be
+// disabled. We use tracking_status IN ('active','paused') so paused channels
+// remain readable (consistent with the source spec's "still see your data").
+// ModeSaved inner-joins through user_comment_stars to scope the result set
+// to only rows the caller has starred.
+func (b *feedQueryBuilder) from(mode FeedMode) string {
 	from := `comments c
 		JOIN platform_channels pc ON pc.id = c.platform_channel_id`
-	if mode == ModeSaved {
-		// Inner-join through user_comment_stars to scope the result set to
-		// only rows the caller has starred.
-		from += `
+	if mode != ModeSaved {
+		return from
+	}
+	return from + `
 		JOIN user_comment_stars ucs2 ON ucs2.comment_id = c.id
 		   AND ucs2.user_id = $1`
-	}
+}
 
-	// --- WHERE ------------------------------------------------------------
-	where := []string{"(EXISTS(SELECT 1 FROM user_channel_tracking uct WHERE uct.platform_channel_id=pc.id AND uct.user_id=$1 AND uct.tracking_status IN ('active','paused')) OR EXISTS(SELECT 1 FROM channel_grants cg JOIN workspace_members wm ON wm.workspace_id=cg.workspace_id WHERE cg.channel_id=pc.id AND wm.user_id=$1))", "c.processed_at IS NOT NULL"}
+func (b *feedQueryBuilder) where(filters FeedFilters) []string {
+	where := []string{accessControlClause, "c.processed_at IS NOT NULL"}
+	where = b.addCategoryFilter(where, filters)
+	where = b.addInList(where, "c.platform_channel_id IN (", filters.Channels, ")")
+	where = b.addInsightFilter(where, filters.InsightType)
+	where = b.addDateBounds(where, filters)
+	return b.addSearchFilter(where, filters.Search)
+}
 
-	// Effective category list after the two-layer toxic rule.
+// addCategoryFilter applies the effective category list after the two-layer
+// toxic rule (Decision 7).
+func (b *feedQueryBuilder) addCategoryFilter(where []string, filters FeedFilters) []string {
 	effectiveCats, explicitCats := applyToxicLayer(filters.Categories, filters.IncludeToxic)
-
 	if !explicitCats {
 		// Default: restrict to the high-signal category set.
-		ph := make([]string, 0, len(HighSignalCategories))
-		for _, cat := range HighSignalCategories {
-			ph = append(ph, addArg(cat))
-		}
-		where = append(where, "c.category IN ("+strings.Join(ph, ",")+")")
-	} else if len(effectiveCats) == 0 {
+		return b.addInList(where, "c.category IN (", HighSignalCategories, ")")
+	}
+	if len(effectiveCats) == 0 {
 		// Caller passed only toxic/spam without include_toxic=true → strip
 		// reduces to empty list. Return a contradiction so we yield zero
 		// rows without dropping the explicit-filter intent.
-		where = append(where, "FALSE")
-	} else {
-		ph := make([]string, 0, len(effectiveCats))
-		for _, cat := range effectiveCats {
-			ph = append(ph, addArg(cat))
-		}
-		where = append(where, "c.category IN ("+strings.Join(ph, ",")+")")
+		return append(where, "FALSE")
 	}
+	return b.addInList(where, "c.category IN (", effectiveCats, ")")
+}
 
-	if len(filters.Channels) > 0 {
-		ph := make([]string, 0, len(filters.Channels))
-		for _, ch := range filters.Channels {
-			ph = append(ph, addArg(ch))
-		}
-		where = append(where, "c.platform_channel_id IN ("+strings.Join(ph, ",")+")")
+// addInList emits `prefix $?, $?, … suffix` with one positional arg per value.
+func (b *feedQueryBuilder) addInList(where []string, prefix string, vals []string, suffix string) []string {
+	if len(vals) == 0 {
+		return where
 	}
+	ph := make([]string, 0, len(vals))
+	for _, v := range vals {
+		ph = append(ph, b.addArg(v))
+	}
+	return append(where, prefix+strings.Join(ph, ",")+suffix)
+}
 
-	if filters.InsightType != "" {
-		where = append(where, "json_extract(c.actionable_insights, '$[0].type') = "+addArg(filters.InsightType))
+func (b *feedQueryBuilder) addInsightFilter(where []string, insightType string) []string {
+	if insightType == "" {
+		return where
 	}
+	return append(where, "json_extract(c.actionable_insights, '$[0].type') = "+b.addArg(insightType))
+}
+
+func (b *feedQueryBuilder) addDateBounds(where []string, filters FeedFilters) []string {
 	if filters.DateFrom != nil {
-		where = append(where, "c.posted_at >= "+addArg(*filters.DateFrom))
+		where = append(where, "c.posted_at >= "+b.addArg(*filters.DateFrom))
 	}
 	if filters.DateTo != nil {
-		where = append(where, "c.posted_at <= "+addArg(*filters.DateTo))
+		where = append(where, "c.posted_at <= "+b.addArg(*filters.DateTo))
 	}
-	if filters.Search != nil && *filters.Search != "" {
-		ph := addArg(*filters.Search)
-		where = append(where,
-			"(c.body LIKE '%' || "+ph+" || '%' OR COALESCE(c.topic,'') LIKE '%' || "+ph+" || '%')")
-	}
+	return where
+}
 
-	// --- ORDER BY / LIMIT / OFFSET ---------------------------------------
-	var tail string
-	switch mode {
-	case ModeCount:
-		// no tail
-	case ModeSaved:
+// addSearchFilter reuses a single positional arg for both LIKE patterns.
+func (b *feedQueryBuilder) addSearchFilter(where []string, search *string) []string {
+	if search == nil || *search == "" {
+		return where
+	}
+	ph := b.addArg(*search)
+	return append(where, "(c.body LIKE '%' || "+ph+" || '%' OR COALESCE(c.topic,'') LIKE '%' || "+ph+" || '%')")
+}
+
+// tail selects the ORDER BY / LIMIT / OFFSET shape for the mode.
+func (b *feedQueryBuilder) tail(mode FeedMode, filters FeedFilters) string {
+	if mode == ModeCount {
+		return ""
+	}
+	if mode == ModeSaved {
 		// sort overridden per spec
-		tail = "ORDER BY ucs2.starred_at DESC"
-		tail += " LIMIT " + addArg(safeLimit(filters.Limit))
-		tail += " OFFSET " + addArg(safeOffset(filters.Offset))
-	case ModeFeed:
-		sort, ok := AllowedSorts[filters.Sort]
-		if !ok {
-			sort = AllowedSorts["newest"]
-		}
-		tail = sort
-		tail += " LIMIT " + addArg(safeLimit(filters.Limit))
-		tail += " OFFSET " + addArg(safeOffset(filters.Offset))
-	case ModeStream:
-		// Export streaming: no LIMIT, deterministic order.
-		sort, ok := AllowedSorts[filters.Sort]
-		if !ok {
-			sort = AllowedSorts["newest"]
-		}
-		tail = sort
+		return "ORDER BY ucs2.starred_at DESC" + b.addPaging(filters)
 	}
+	tail := sortClause(filters.Sort)
+	if mode == ModeFeed {
+		tail += b.addPaging(filters)
+	}
+	return tail // ModeStream: export streaming — no LIMIT, deterministic order.
+}
 
-	sql := "SELECT " + projection + " FROM " + from
-	if len(where) > 0 {
-		sql += " WHERE " + strings.Join(where, " AND ")
+// sortClause resolves the requested sort, falling back to newest.
+func sortClause(sort string) string {
+	if s, ok := AllowedSorts[sort]; ok {
+		return s
 	}
-	if tail != "" {
-		sql += " " + tail
-	}
-	return sql, args
+	return AllowedSorts["newest"]
+}
+
+func (b *feedQueryBuilder) addPaging(filters FeedFilters) string {
+	return " LIMIT " + b.addArg(safeLimit(filters.Limit)) + " OFFSET " + b.addArg(safeOffset(filters.Offset))
 }
 
 func safeLimit(n int) int {

@@ -61,12 +61,8 @@ func ValidatePasswordPolicy(pw string) error {
 	}
 	var hasUpper, hasDigit bool
 	for _, r := range pw {
-		switch {
-		case unicode.IsUpper(r):
-			hasUpper = true
-		case unicode.IsDigit(r):
-			hasDigit = true
-		}
+		hasUpper = hasUpper || unicode.IsUpper(r)
+		hasDigit = hasDigit || unicode.IsDigit(r)
 	}
 	if !hasUpper {
 		return &PasswordPolicyError{Reason: "password must contain at least one uppercase letter"}

@@ -373,9 +373,11 @@ func Load(strict bool) (*Config, error) {
 		c.PasswordResetTTL = d
 	}
 
-	if v := os.Getenv("APP_BASE_URL"); v != "" {
-		c.AppBaseURL = v
-	} else if strict {
+	appBaseURL, appBaseURLSet := lookupEnv("APP_BASE_URL")
+	if appBaseURLSet {
+		c.AppBaseURL = appBaseURL
+	}
+	if !appBaseURLSet && strict {
 		return nil, fmt.Errorf("APP_BASE_URL is required")
 	}
 
@@ -769,17 +771,9 @@ func Load(strict bool) (*Config, error) {
 	// Parsed last so any future required-when-enabled validation can refer
 	// to other already-parsed fields. Defaults preserve zero-config local
 	// dev: OTEL_ENABLED=false, no OTLP traffic.
-	if v := os.Getenv("OTEL_ENABLED"); v != "" {
-		c.OTELEnabled = v == "1" || v == "true" || v == "yes"
-	} else {
-		c.OTELEnabled = false
-	}
+	c.OTELEnabled = truthy(os.Getenv("OTEL_ENABLED"))
 	c.OTELExporterOTLPEndpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-	if v := os.Getenv("OTEL_SERVICE_NAME"); v != "" {
-		c.OTELServiceName = v
-	} else {
-		c.OTELServiceName = "noumena-api"
-	}
+	c.OTELServiceName = envOr("OTEL_SERVICE_NAME", "noumena-api")
 	c.OTELResourceAttributes = os.Getenv("OTEL_RESOURCE_ATTRIBUTES")
 	if c.OTELEnabled && c.OTELExporterOTLPEndpoint == "" {
 		return nil, fmt.Errorf("OTEL_ENABLED=true but OTEL_EXPORTER_OTLP_ENDPOINT is unset")
@@ -832,18 +826,37 @@ func Load(strict bool) (*Config, error) {
 	return &c, nil
 }
 
+// lookupEnv returns the environment value when set and non-empty.
+func lookupEnv(key string) (string, bool) {
+	v := os.Getenv(key)
+	return v, v != ""
+}
+
+// truthy reports whether an env value means "on" (1|true|yes).
+func truthy(v string) bool { return v == "1" || v == "true" || v == "yes" }
+
+// envOr returns the environment value, or fallback when unset/empty.
+func envOr(key, fallback string) string {
+	if v, ok := lookupEnv(key); ok {
+		return v
+	}
+	return fallback
+}
+
+// validAESKeySizes are the byte lengths accepted for ENCRYPTION_KEY
+// (AES-128/192/256).
+var validAESKeySizes = map[int]bool{16: true, 24: true, 32: true}
+
 // validateEncryptionKey rejects empty or invalid-size AES keys. The env
 // value is used as raw key bytes (16/24/32 bytes for AES-128/192/256).
 func validateEncryptionKey(key string) error {
 	if key == "" {
 		return fmt.Errorf("ENCRYPTION_KEY is required (generate one with: openssl rand -base64 24; 16/24/32-byte raw value)")
 	}
-	switch len(key) {
-	case 16, 24, 32:
+	if validAESKeySizes[len(key)] {
 		return nil
-	default:
-		return fmt.Errorf("ENCRYPTION_KEY must be 16, 24, or 32 bytes (got %d bytes)", len(key))
 	}
+	return fmt.Errorf("ENCRYPTION_KEY must be 16, 24, or 32 bytes (got %d bytes)", len(key))
 }
 
 // EnsureExportDir validates that the configured EXPORT_DIR exists and is

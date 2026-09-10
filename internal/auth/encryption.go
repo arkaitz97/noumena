@@ -150,29 +150,37 @@ func Decrypt(encodedText string) (string, error) {
 	if sep <= 0 || sep == len(rest)-1 {
 		return "", errors.New("decryption failed: malformed key version header")
 	}
-	keyID, payload := rest[:sep], rest[sep+1:]
+	return decryptVersioned(rest[:sep], rest[sep+1:], current, previous, currentGCM)
+}
 
-	switch keyID {
-	case keyIDFor(current):
-		plain, err := decryptWith(currentGCM, payload)
-		if err != nil {
-			return "", errors.New("decryption failed: corrupted ciphertext")
-		}
-		return plain, nil
-	case keyIDFor(previous):
-		if len(previous) == 0 {
-			return "", errors.New("decryption failed: ciphertext keyed with ENCRYPTION_KEY_PREVIOUS which is not configured")
-		}
-		prevGCM, gerr := gcmFor(previous)
-		if gerr != nil {
-			return "", gerr
-		}
-		plain, err := decryptWith(prevGCM, payload)
-		if err != nil {
-			return "", errors.New("decryption failed: corrupted ciphertext")
-		}
-		return plain, nil
-	default:
-		return "", fmt.Errorf("decryption failed: no key matches ciphertext key id %q (key rotated and old key discarded?)", keyID)
+// decryptVersioned selects the key by ID and decrypts the payload.
+func decryptVersioned(keyID, payload string, current, previous []byte, currentGCM cipher.AEAD) (string, error) {
+	if keyID == keyIDFor(current) {
+		return decryptChecked(currentGCM, payload)
 	}
+	if keyID == keyIDFor(previous) {
+		return decryptWithPrevious(previous, payload)
+	}
+	return "", fmt.Errorf("decryption failed: no key matches ciphertext key id %q (key rotated and old key discarded?)", keyID)
+}
+
+// decryptChecked decrypts with a resolved AEAD; any failure means corrupted
+// ciphertext.
+func decryptChecked(aesGCM cipher.AEAD, payload string) (string, error) {
+	plain, err := decryptWith(aesGCM, payload)
+	if err != nil {
+		return "", errors.New("decryption failed: corrupted ciphertext")
+	}
+	return plain, nil
+}
+
+func decryptWithPrevious(previous []byte, payload string) (string, error) {
+	if len(previous) == 0 {
+		return "", errors.New("decryption failed: ciphertext keyed with ENCRYPTION_KEY_PREVIOUS which is not configured")
+	}
+	prevGCM, err := gcmFor(previous)
+	if err != nil {
+		return "", err
+	}
+	return decryptChecked(prevGCM, payload)
 }

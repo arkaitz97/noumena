@@ -114,21 +114,13 @@ func (h *WorkspaceHandler) GetWorkspaceByID(w http.ResponseWriter, r *http.Reque
 	workspaceID := chi.URLParam(r, "id")
 
 	if _, err := h.Queries.GetWorkspaceMember(r.Context(), workspaceID, userID); err != nil {
-		if errors.Is(err, db.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "workspace not found")
-		} else {
-			writeError(w, http.StatusInternalServerError, "failed to get workspace")
-		}
+		writeWorkspaceError(w, err, http.StatusNotFound, "workspace not found", "failed to get workspace")
 		return
 	}
 
 	workspace, err := h.Queries.GetWorkspace(r.Context(), workspaceID)
 	if err != nil {
-		if errors.Is(err, db.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "workspace not found")
-		} else {
-			writeError(w, http.StatusInternalServerError, "failed to get workspace")
-		}
+		writeWorkspaceError(w, err, http.StatusNotFound, "workspace not found", "failed to get workspace")
 		return
 	}
 
@@ -517,11 +509,7 @@ func (h *WorkspaceHandler) GrantChannel(w http.ResponseWriter, r *http.Request) 
 
 	member, err := h.Queries.GetWorkspaceMember(r.Context(), workspaceID, userID)
 	if err != nil {
-		if errors.Is(err, db.ErrNotFound) {
-			writeError(w, http.StatusForbidden, "not a member of this workspace")
-		} else {
-			writeError(w, http.StatusInternalServerError, "failed to get workspace member")
-		}
+		writeWorkspaceError(w, err, http.StatusForbidden, "not a member of this workspace", "failed to get workspace member")
 		return
 	}
 	if member.Role == "viewer" {
@@ -530,11 +518,7 @@ func (h *WorkspaceHandler) GrantChannel(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if err := h.Queries.GrantChannel(r.Context(), workspaceID, channelID, userID); err != nil {
-		if errors.Is(err, db.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "channel not found")
-		} else {
-			writeError(w, http.StatusInternalServerError, "failed to grant channel")
-		}
+		writeWorkspaceError(w, err, http.StatusNotFound, "channel not found", "failed to grant channel")
 		return
 	}
 
@@ -553,11 +537,7 @@ func (h *WorkspaceHandler) RevokeChannel(w http.ResponseWriter, r *http.Request)
 
 	member, err := h.Queries.GetWorkspaceMember(r.Context(), workspaceID, userID)
 	if err != nil {
-		if errors.Is(err, db.ErrNotFound) {
-			writeError(w, http.StatusForbidden, "not a member of this workspace")
-		} else {
-			writeError(w, http.StatusInternalServerError, "failed to get workspace member")
-		}
+		writeWorkspaceError(w, err, http.StatusForbidden, "not a member of this workspace", "failed to get workspace member")
 		return
 	}
 	if member.Role == "viewer" {
@@ -571,6 +551,17 @@ func (h *WorkspaceHandler) RevokeChannel(w http.ResponseWriter, r *http.Request)
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// writeWorkspaceError maps a workspace-layer failure: the not-found sentinel
+// gets the caller-chosen status+message (404 for resources, 403 for membership),
+// anything else is a 500 with failMsg.
+func writeWorkspaceError(w http.ResponseWriter, err error, notFoundStatus int, notFoundMsg, failMsg string) {
+	if errors.Is(err, db.ErrNotFound) {
+		writeError(w, notFoundStatus, notFoundMsg)
+		return
+	}
+	writeError(w, http.StatusInternalServerError, failMsg)
 }
 
 func (h *WorkspaceHandler) requireAdmin(ctx context.Context, userID, workspaceID string) error {

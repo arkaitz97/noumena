@@ -106,143 +106,18 @@ func main() {
 		log.Println("Using mock database queries.")
 	}
 
-	var emailClient email.Client
-	var emailPipeline *email.Pipeline
-	switch {
-	case config.Default.EmailEnabled:
-		if os.Getenv("RESEND_API_KEY") != "" {
-			log.Println("EMAIL_ENABLED=true overrides RESEND_API_KEY (pipeline+SMTP path active)")
-		}
-		if queries == nil {
-			log.Fatalf("EMAIL_ENABLED=true requires a live database (email_send_log) — refusing to start")
-		}
-		sender := &email.NetSMTPSender{
-			Host:       config.Default.SMTPHost,
-			Port:       config.Default.SMTPPort,
-			Username:   config.Default.SMTPUsername,
-			Password:   config.Default.SMTPPassword,
-			CmdTimeout: config.Default.SMTPCmdTimeout,
-		}
-		emailPipeline = &email.Pipeline{
-			Queries: queries,
-			Sender:  sender,
-			Cfg:     config.Default,
-			Logger:  log.Default(),
-		}
-		emailClient = email.NewPipelineAdapter(emailPipeline)
-		log.Printf("Email: pipeline initialized (provider=%s host=%s)", config.Default.EmailProvider, config.Default.SMTPHost)
-		retry := &email.RetryWorker{
-			Pipeline: emailPipeline,
-			Queries:  queries,
-			Sender:   sender,
-		}
-		retry.Start(rootCtx)
-	case os.Getenv("RESEND_API_KEY") != "":
-		emailClient = email.NewResendClient(os.Getenv("RESEND_API_KEY"), "onboarding@resend.dev")
-		log.Println("Email: legacy Resend client (EMAIL_ENABLED=false, RESEND_API_KEY present)")
-	default:
-		log.Println("Email: mock client (EMAIL_ENABLED=false, RESEND_API_KEY unset)")
-		emailClient = email.NewMockClient()
-	}
+	emailClient, emailPipeline := startEmail(rootCtx, queries)
 
-	var billingClient billing.Client
-	if config.Default.BillingEnabled {
-		prices := billing.PriceMap{
-			CreatorMonthly: config.Default.StripePriceCreatorMonthly,
-			CreatorAnnual:  config.Default.StripePriceCreatorAnnual,
-			StudioMonthly:  config.Default.StripePriceStudioMonthly,
-			StudioAnnual:   config.Default.StripePriceStudioAnnual,
-			AgencyMonthly:  config.Default.StripePriceAgencyMonthly,
-			AgencyAnnual:   config.Default.StripePriceAgencyAnnual,
-		}
-		billingClient = billing.NewStripeClient(billing.Config{
-			SecretKey:     config.Default.StripeSecretKey,
-			WebhookSecret: config.Default.StripeWebhookSecret,
-			Prices:        prices,
-			SuccessURL:    config.Default.BillingCheckoutSuccessURL,
-			CancelURL:     config.Default.BillingCheckoutCancelURL,
-		})
-		log.Println("Billing: Stripe client initialized (BILLING_ENABLED=true)")
-	} else {
-		log.Println("Billing: disabled (BILLING_ENABLED!=true), using mock billing client")
-		billingClient = billing.NewMockClient()
-	}
+	billingClient := startBillingClient()
 
 	opencodeKey := os.Getenv("OPENCODE_API_KEY")
 
-	var digestWorker *llm.Worker
-	if os.Getenv("DIGEST_WORKER_ENABLED") == "true" || os.Getenv("DIGEST_WORKER_ENABLED") == "1" {
-		if opencodeKey == "" {
-			log.Println("WARN: DIGEST_WORKER_ENABLED=true but OPENCODE_API_KEY is unset; digest worker will not start")
-		} else if queries == nil {
-			log.Println("WARN: DIGEST_WORKER_ENABLED=true but no live DB; digest worker will not start")
-		} else {
-			opencodeClient := llm.NewOpenCodeClient(opencodeKey, config.Default.OpenCodeBaseURL, config.Default.OpenCodeModel)
-			digestWorker = &llm.Worker{
-				Queries:     queries,
-				LLMClient:   opencodeClient,
-				EmailClient: emailClient,
-				Pipeline:    emailPipeline,
-			}
-			digestWorker.Start(rootCtx)
-			log.Println("Weekly-digest worker started")
-			defer digestWorker.Stop()
-		}
-	} else {
-		log.Println("Weekly-digest worker: disabled (DIGEST_WORKER_ENABLED!=true)")
+	digestWorker := startDigestWorker(rootCtx, opencodeKey, queries, emailClient, emailPipeline)
+	if digestWorker != nil {
+		defer digestWorker.Stop()
 	}
 
-	if config.Default.LLMProcessorEnabled {
-		primary := config.Default.LLMPrimaryProvider
-		if primary == "" {
-			primary = "opencode"
-		}
-		fallback := config.Default.LLMFallbackProvider
-		keyFor := func(name string) string {
-			switch strings.ToLower(strings.TrimSpace(name)) {
-			case "openai":
-				return os.Getenv("OPENAI_API_KEY")
-			case "anthropic":
-				return os.Getenv("ANTHROPIC_API_KEY")
-			default:
-				return opencodeKey
-			}
-		}
-		var procClient llm.LLMClient
-		if primary == "opencode" && fallback == "" {
-			// Legacy single-provider path: honors OPENCODE_BASE_URL/OPENCODE_MODEL.
-			if opencodeKey == "" {
-				log.Fatalf("LLM_PROCESSOR_ENABLED=true but OPENCODE_API_KEY is unset")
-			}
-			procClient = llm.NewOpenCodeClient(opencodeKey, config.Default.OpenCodeBaseURL, config.Default.OpenCodeModel)
-		} else {
-			primaryKey := keyFor(primary)
-			if primaryKey == "" {
-				log.Fatalf("LLM_PROCESSOR_ENABLED=true but no API key for primary LLM provider %q", primary)
-			}
-			fallbackKey := keyFor(fallback)
-			var err error
-			procClient, err = llm.NewConfiguredClient(primary, fallback, primaryKey, fallbackKey)
-			if err != nil {
-				log.Fatalf("LLM processor: client init failed: %v", err)
-			}
-			if fallback != "" {
-				log.Printf("LLM processor: failover enabled primary=%s fallback=%s", primary, fallback)
-			}
-		}
-		proc := llm.NewProcessor(procClient, queries)
-		proc.TickInterval = config.Default.LLMProcessorTickInterval
-		proc.BatchTimeout = config.Default.LLMProcessorBatchTimeout
-		proc.BatchSize = config.Default.LLMBatchSize
-		proc.ConfidenceThreshold = config.Default.LLMConfidenceThreshold
-		proc.ShutdownGrace = config.Default.LLMProcessorShutdownGrace
-		log.Printf("LLM processor: enabled=true provider=%s batch_size=%d threshold=%.2f",
-			primary,
-			config.Default.LLMBatchSize, config.Default.LLMConfidenceThreshold)
-		runWorker(proc.Run)
-	} else {
-		log.Println("LLM processor: disabled (LLM_PROCESSOR_ENABLED=false)")
-	}
+	startLLMProcessor(queries, runWorker)
 
 	if queries != nil {
 		auth.StartUnverifiedAccountCleanup(rootCtx, queries, 0, 0)
@@ -704,4 +579,162 @@ func main() {
 		log.Printf("shutdown: telemetry: %v", err)
 	}
 	db.CloseDB()
+}
+
+// ============================================================================
+// Startup wiring — each subsystem picks its implementation via guard clauses
+// and logs its own status. Same behavior as the former inline blocks.
+// ============================================================================
+
+// startEmail wires the email stack: pipeline+SMTP when enabled, the legacy
+// Resend client while migrating, mock otherwise.
+func startEmail(rootCtx context.Context, queries db.DBQuery) (email.Client, *email.Pipeline) {
+	if config.Default.EmailEnabled {
+		return startEmailPipeline(rootCtx, queries)
+	}
+	if key := os.Getenv("RESEND_API_KEY"); key != "" {
+		log.Println("Email: legacy Resend client (EMAIL_ENABLED=false, RESEND_API_KEY present)")
+		return email.NewResendClient(key, "onboarding@resend.dev"), nil
+	}
+	log.Println("Email: mock client (EMAIL_ENABLED=false, RESEND_API_KEY unset)")
+	return email.NewMockClient(), nil
+}
+
+func startEmailPipeline(rootCtx context.Context, queries db.DBQuery) (email.Client, *email.Pipeline) {
+	if os.Getenv("RESEND_API_KEY") != "" {
+		log.Println("EMAIL_ENABLED=true overrides RESEND_API_KEY (pipeline+SMTP path active)")
+	}
+	if queries == nil {
+		log.Fatalf("EMAIL_ENABLED=true requires a live database (email_send_log) — refusing to start")
+	}
+	sender := &email.NetSMTPSender{
+		Host:       config.Default.SMTPHost,
+		Port:       config.Default.SMTPPort,
+		Username:   config.Default.SMTPUsername,
+		Password:   config.Default.SMTPPassword,
+		CmdTimeout: config.Default.SMTPCmdTimeout,
+	}
+	pipeline := &email.Pipeline{Queries: queries, Sender: sender, Cfg: config.Default, Logger: log.Default()}
+	log.Printf("Email: pipeline initialized (provider=%s host=%s)", config.Default.EmailProvider, config.Default.SMTPHost)
+	retry := &email.RetryWorker{Pipeline: pipeline, Queries: queries, Sender: sender}
+	retry.Start(rootCtx)
+	return email.NewPipelineAdapter(pipeline), pipeline
+}
+
+// startBillingClient returns the Stripe client when billing is enabled, the
+// mock otherwise.
+func startBillingClient() billing.Client {
+	if !config.Default.BillingEnabled {
+		log.Println("Billing: disabled (BILLING_ENABLED!=true), using mock billing client")
+		return billing.NewMockClient()
+	}
+	billingClient := billing.NewStripeClient(billing.Config{
+		SecretKey:     config.Default.StripeSecretKey,
+		WebhookSecret: config.Default.StripeWebhookSecret,
+		Prices: billing.PriceMap{
+			CreatorMonthly: config.Default.StripePriceCreatorMonthly,
+			CreatorAnnual:  config.Default.StripePriceCreatorAnnual,
+			StudioMonthly:  config.Default.StripePriceStudioMonthly,
+			StudioAnnual:   config.Default.StripePriceStudioAnnual,
+			AgencyMonthly:  config.Default.StripePriceAgencyMonthly,
+			AgencyAnnual:   config.Default.StripePriceAgencyAnnual,
+		},
+		SuccessURL: config.Default.BillingCheckoutSuccessURL,
+		CancelURL:  config.Default.BillingCheckoutCancelURL,
+	})
+	log.Println("Billing: Stripe client initialized (BILLING_ENABLED=true)")
+	return billingClient
+}
+
+// startDigestWorker wires the weekly digest worker when enabled and runnable;
+// every refusal logs its reason and returns nil.
+func startDigestWorker(rootCtx context.Context, opencodeKey string, queries db.DBQuery, emailClient email.Client, emailPipeline *email.Pipeline) *llm.Worker {
+	if !envOn("DIGEST_WORKER_ENABLED") {
+		log.Println("Weekly-digest worker: disabled (DIGEST_WORKER_ENABLED!=true)")
+		return nil
+	}
+	if opencodeKey == "" {
+		log.Println("WARN: DIGEST_WORKER_ENABLED=true but OPENCODE_API_KEY is unset; digest worker will not start")
+		return nil
+	}
+	if queries == nil {
+		log.Println("WARN: DIGEST_WORKER_ENABLED=true but no live DB; digest worker will not start")
+		return nil
+	}
+	worker := &llm.Worker{
+		Queries:     queries,
+		LLMClient:   llm.NewOpenCodeClient(opencodeKey, config.Default.OpenCodeBaseURL, config.Default.OpenCodeModel),
+		EmailClient: emailClient,
+		Pipeline:    emailPipeline,
+	}
+	worker.Start(rootCtx)
+	log.Println("Weekly-digest worker started")
+	return worker
+}
+
+// envOn reports the historical 1/true form of a boolean env flag.
+func envOn(key string) bool {
+	return os.Getenv(key) == "true" || os.Getenv(key) == "1"
+}
+
+// providerEnvKeys maps LLM providers to their API-key environment variable.
+var providerEnvKeys = map[string]string{
+	"openai":    "OPENAI_API_KEY",
+	"anthropic": "ANTHROPIC_API_KEY",
+}
+
+// startLLMProcessor wires the classification processor when enabled.
+func startLLMProcessor(queries db.DBQuery, runWorker func(func(context.Context))) {
+	if !config.Default.LLMProcessorEnabled {
+		log.Println("LLM processor: disabled (LLM_PROCESSOR_ENABLED=false)")
+		return
+	}
+	primary := config.Default.LLMPrimaryProvider
+	if primary == "" {
+		primary = "opencode"
+	}
+	procClient := newProcessorClient(primary, config.Default.LLMFallbackProvider)
+	proc := llm.NewProcessor(procClient, queries)
+	proc.TickInterval = config.Default.LLMProcessorTickInterval
+	proc.BatchTimeout = config.Default.LLMProcessorBatchTimeout
+	proc.BatchSize = config.Default.LLMBatchSize
+	proc.ConfidenceThreshold = config.Default.LLMConfidenceThreshold
+	proc.ShutdownGrace = config.Default.LLMProcessorShutdownGrace
+	log.Printf("LLM processor: enabled=true provider=%s batch_size=%d threshold=%.2f",
+		primary, config.Default.LLMBatchSize, config.Default.LLMConfidenceThreshold)
+	runWorker(proc.Run)
+}
+
+// newProcessorClient builds the configured provider client; the legacy
+// opencode-only path honors OPENCODE_BASE_URL/OPENCODE_MODEL.
+func newProcessorClient(primary, fallback string) llm.LLMClient {
+	opencodeKey := os.Getenv("OPENCODE_API_KEY")
+	if primary == "opencode" && fallback == "" {
+		if opencodeKey == "" {
+			log.Fatalf("LLM_PROCESSOR_ENABLED=true but OPENCODE_API_KEY is unset")
+		}
+		return llm.NewOpenCodeClient(opencodeKey, config.Default.OpenCodeBaseURL, config.Default.OpenCodeModel)
+	}
+	primaryKey := providerKey(primary, opencodeKey)
+	if primaryKey == "" {
+		log.Fatalf("LLM_PROCESSOR_ENABLED=true but no API key for primary LLM provider %q", primary)
+	}
+	client, err := llm.NewConfiguredClient(primary, fallback, primaryKey, providerKey(fallback, opencodeKey))
+	if err != nil {
+		log.Fatalf("LLM processor: client init failed: %v", err)
+	}
+	if fallback != "" {
+		log.Printf("LLM processor: failover enabled primary=%s fallback=%s", primary, fallback)
+	}
+	return client
+}
+
+// providerKey resolves the configured API key for a provider, defaulting to
+// opencode.
+func providerKey(name, opencodeKey string) string {
+	key, known := providerEnvKeys[strings.ToLower(strings.TrimSpace(name))]
+	if !known {
+		return opencodeKey
+	}
+	return os.Getenv(key)
 }

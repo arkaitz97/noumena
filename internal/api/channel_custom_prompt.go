@@ -52,16 +52,14 @@ func (h *ChannelHandler) UpdateCustomPrompt(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	if req.CustomPrompt != nil && strings.TrimSpace(*req.CustomPrompt) == "" {
+		req.CustomPrompt = nil // whitespace-only clears the prompt
+	}
 	if req.CustomPrompt != nil {
-		prompt := strings.TrimSpace(*req.CustomPrompt)
-		if prompt != "" {
-			if err := ValidateCustomPrompt(prompt); err != nil {
-				ae := err.(*apiError)
-				writeJSON(w, http.StatusBadRequest, map[string]string{"code": ae.code, "error": ae.message})
-				return
-			}
-		} else {
-			req.CustomPrompt = nil
+		if err := ValidateCustomPrompt(strings.TrimSpace(*req.CustomPrompt)); err != nil {
+			ae := err.(*apiError)
+			writeJSON(w, http.StatusBadRequest, map[string]string{"code": ae.code, "error": ae.message})
+			return
 		}
 	}
 

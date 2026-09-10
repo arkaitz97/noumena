@@ -219,23 +219,22 @@ func (w *Worker) processJob(parent context.Context, job *db.IngestionJob) {
 	// Per-job request ceiling is enforced in the client via this context.
 	jobCtx = WithJobRequestBudget(jobCtx, w.MaxRequestsPerJob)
 
-	// otel-instrumentation: record fetch_duration on every return
-	// path. The outcome is mutated by the closure below as we learn
-	// the result (success / error / timeout). The deferred Record
-	// reads the final value once just before return.
+	// otel-instrumentation: record fetch_duration on every return path; the
+	// state machine reports the outcome we learned (success / error / timeout).
 	start := time.Now()
-	outcome := telemetry.OutcomeSuccess
-	defer func() {
-		recordFetchDuration(parent, start, outcome)
-	}()
+	outcome := w.runJobStateMachine(parent, jobCtx, job)
+	recordFetchDuration(parent, start, outcome)
+}
 
+// runJobStateMachine is the per-channel job lifecycle — lock, load, ingest,
+// settle — and returns the telemetry outcome for the run.
+func (w *Worker) runJobStateMachine(parent, jobCtx context.Context, job *db.IngestionJob) string {
 	// 1. Acquire per-channel advisory lock.
 	acquired, release, err := AcquireChannelLock(jobCtx, w.Pool, job.PlatformChannelID)
 	if err != nil {
 		log.Printf("worker: lock acquire failed job=%s channel=%s: %v", job.ID, job.PlatformChannelID, err)
 		_ = w.DB.ReleaseJobToPending(parent, job.ID, lockBusyRescheduleIn)
-		outcome = telemetry.OutcomeError
-		return
+		return telemetry.OutcomeError
 	}
 	if !acquired {
 		// Another worker is processing this channel; yield without consuming retry budget.
@@ -244,7 +243,7 @@ func (w *Worker) processJob(parent context.Context, job *db.IngestionJob) {
 		// what we were supposed to: defer to the lock holder).
 		recordLockContention(parent)
 		_ = w.DB.ReleaseJobToPending(parent, job.ID, lockBusyRescheduleIn)
-		return
+		return telemetry.OutcomeSuccess
 	}
 	defer release()
 
@@ -252,118 +251,166 @@ func (w *Worker) processJob(parent context.Context, job *db.IngestionJob) {
 	pc, err := w.DB.GetPlatformChannelByID(jobCtx, job.PlatformChannelID)
 	if err != nil {
 		w.failJob(parent, job, fmt.Errorf("load channel: %w", err))
-		outcome = telemetry.OutcomeError
 		recordIngestionError(parent, telemetry.ReasonOther)
-		return
+		return telemetry.OutcomeError
 	}
 	if pc.Platform != "youtube" {
 		// Mark completed; we don't currently support other platforms.
 		_ = w.DB.MarkJobCompleted(parent, job.ID)
-		return
+		return telemetry.OutcomeSuccess
+	}
+	accessTok, err := w.jobAccessToken(parent, jobCtx, job)
+	if err != nil {
+		return w.handleTokenFailure(parent, job, err)
 	}
 
-	accessTok := ""
-	if w.Client.APIKey == "" {
-		tok, terr := w.obtainAccessToken(jobCtx, job.PlatformChannelID)
-		if terr != nil {
-			// "no token" → job is a noop; mark completed without raising an error
-			// on the channel (the channel-management layer surfaces missing tokens).
-			if errors.Is(terr, errNoToken) {
-				// Initialize last_synced_at if it was NULL so we don't keep
-				// re-enqueuing this channel as a backfill on every tick.
-				_ = w.DB.UpdateLastSyncedAtIfNull(parent, job.PlatformChannelID)
-				_ = w.DB.MarkJobCompleted(parent, job.ID)
-				return
-			}
-			w.failJob(parent, job, terr)
-			outcome = telemetry.OutcomeError
-			recordIngestionError(parent, classifyIngestionError(terr))
-			return
-		}
-		accessTok = tok
-	}
-
-	// 3. Compute publishedAfter window.
-	publishedAfter := pc.LastSyncedAt
-	if job.JobType == "backfill" || pc.LastSyncedAt == nil {
-		days, derr := w.DB.GetMaxBackfillDays(jobCtx, job.PlatformChannelID)
-		if derr != nil {
-			days = 90
-		}
-		t := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
-		publishedAfter = &t
-	}
+	// 3. Compute the publishedAfter window: incremental since last sync,
+	//    backfill-horizon otherwise.
+	publishedAfter := w.publishedAfterWindow(jobCtx, pc, job)
 
 	// 4. Iterate videos → comment threads, batching inserts and checkpointing.
 	stats, err := w.runIngestion(jobCtx, parent, pc, accessTok, publishedAfter, job)
 	if err != nil {
-		// Categorize.
-		var rate *RateLimitError
-		var tokInv *TokenInvalidError
-		var quotaEx *QuotaExhaustedError
-		var ceiling *JobBudgetExceededError
-		switch {
-		case errors.As(err, &quotaEx):
-			// Daily project budget spent: defer the channel to the next
-			// budget window; the job itself is not a failure and must not
-			// burn retry budget.
-			until := quotaEx.RetryAt
-			if until.IsZero() {
-				until = time.Now().Add(time.Hour)
-			}
-			_ = w.DB.MarkChannelBackoff(parent, job.PlatformChannelID, until)
-			_ = w.DB.MarkJobCompleted(parent, job.ID)
-			recordIngestionError(parent, telemetry.ReasonRateLimited)
-			outcome = telemetry.OutcomeError
-			log.Printf("worker: quota exhausted job=%s channel=%s spent=%d retry_at=%s — deferred without retry burn",
-				job.ID, job.PlatformChannelID, quotaEx.UnitsSpent, until.UTC().Format(time.RFC3339))
-			return
-		case errors.As(err, &ceiling):
-			// Per-job ceiling: clean stop. Checkpoints are durable; the
-			// next scheduled poll resumes where we stopped.
-			_ = w.DB.MarkJobCompleted(parent, job.ID)
-			log.Printf("worker: job ceiling kind=%s limit=%d job=%s channel=%s — remainder deferred to next tick",
-				ceiling.Kind, ceiling.Limit, job.ID, job.PlatformChannelID)
-			return
-		case errors.As(err, &rate):
-			until := time.Now().Add(rate.RetryAfter)
-			_ = w.DB.MarkChannelBackoff(parent, job.PlatformChannelID, until)
-			_ = w.DB.MarkJobCompleted(parent, job.ID) // rate-limit is NOT a failure
-			recordIngestionError(parent, telemetry.ReasonRateLimited)
-			outcome = telemetry.OutcomeError
-			return
-		case errors.As(err, &tokInv):
-			// Try fallback token: promote next, then retry once without consuming retry budget.
-			recordIngestionError(parent, telemetry.ReasonTokenInvalid)
-			outcome = telemetry.OutcomeError
-			if perr := w.DB.PromoteNextIngestionToken(parent, job.PlatformChannelID); perr == nil {
-				_ = w.DB.ReleaseJobToPending(parent, job.ID, 5*time.Second)
-				return
-			}
-			// No fallback available; mark completed and move on.
-			_ = w.DB.UpdateLastSyncedAtIfNull(parent, job.PlatformChannelID)
-			_ = w.DB.MarkJobCompleted(parent, job.ID)
-			return
-		case errors.Is(err, context.DeadlineExceeded):
-			// Soft deadline: not a failure, the next tick will re-enqueue.
-			_ = w.DB.MarkJobCompleted(parent, job.ID)
-			recordIngestionError(parent, telemetry.ReasonDeadlineExceeded)
-			outcome = telemetry.OutcomeTimeout
-			return
-		}
-		w.failJob(parent, job, err)
-		recordIngestionError(parent, classifyIngestionError(err))
-		outcome = telemetry.OutcomeError
-		return
+		return w.handleRunError(parent, job, err)
 	}
 
 	// 5. Success.
+	w.completeJob(parent, job, pc, stats)
+	return telemetry.OutcomeSuccess
+}
+
+// jobAccessToken resolves the credential for YouTube calls: API-key clients
+// need none; OAuth channels get a refreshed token (errNoToken when absent).
+func (w *Worker) jobAccessToken(parent, jobCtx context.Context, job *db.IngestionJob) (string, error) {
+	if w.Client.APIKey != "" {
+		return "", nil
+	}
+	return w.obtainAccessToken(jobCtx, job.PlatformChannelID)
+}
+
+// handleTokenFailure completes the job for tokenless channels ("no token" →
+// noop; the channel-management layer surfaces missing tokens) and fails it
+// for refresh errors.
+func (w *Worker) handleTokenFailure(parent context.Context, job *db.IngestionJob, err error) string {
+	if errors.Is(err, errNoToken) {
+		// Initialize last_synced_at if it was NULL so we don't keep
+		// re-enqueuing this channel as a backfill on every tick.
+		_ = w.DB.UpdateLastSyncedAtIfNull(parent, job.PlatformChannelID)
+		_ = w.DB.MarkJobCompleted(parent, job.ID)
+		return telemetry.OutcomeSuccess
+	}
+	w.failJob(parent, job, err)
+	recordIngestionError(parent, classifyIngestionError(err))
+	return telemetry.OutcomeError
+}
+
+// publishedAfterWindow is the server-side freshness horizon: since the last
+// sync for polls; the configured max backfill window for backfills and the
+// very first run.
+func (w *Worker) publishedAfterWindow(ctx context.Context, pc *db.PlatformChannel, job *db.IngestionJob) *time.Time {
+	if job.JobType != "backfill" && pc.LastSyncedAt != nil {
+		return pc.LastSyncedAt
+	}
+	days, derr := w.DB.GetMaxBackfillDays(ctx, job.PlatformChannelID)
+	if derr != nil {
+		days = 90
+	}
+	t := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
+	return &t
+}
+
+// completeJob records the success bookkeeping and adapts the poll cadence.
+func (w *Worker) completeJob(parent context.Context, job *db.IngestionJob, pc *db.PlatformChannel, stats ingestStats) {
 	if err := w.DB.MarkJobCompleted(parent, job.ID); err != nil {
 		log.Printf("worker: mark completed job=%s: %v", job.ID, err)
 	}
 	_ = w.DB.ResetIngestionError(parent, job.PlatformChannelID)
 	_ = w.DB.UpdateLastSyncedAt(parent, job.PlatformChannelID, time.Now())
 	w.adaptPollInterval(parent, pc, stats)
+}
+
+// handleRunError categorizes an ingestion run error, applies the matching
+// side effects, and returns the telemetry outcome for the deferred record.
+func (w *Worker) handleRunError(parent context.Context, job *db.IngestionJob, err error) string {
+	var quotaEx *QuotaExhaustedError
+	if errors.As(err, &quotaEx) {
+		return w.deferQuotaExhausted(parent, job, quotaEx)
+	}
+	var ceiling *JobBudgetExceededError
+	if errors.As(err, &ceiling) {
+		return w.stopAtCeiling(parent, job, ceiling)
+	}
+	var rate *RateLimitError
+	if errors.As(err, &rate) {
+		return w.backoffRateLimited(parent, job, rate)
+	}
+	var tokInv *TokenInvalidError
+	if errors.As(err, &tokInv) {
+		return w.rotateInvalidToken(parent, job)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return w.completeOnDeadline(parent, job)
+	}
+	w.failJob(parent, job, err)
+	recordIngestionError(parent, classifyIngestionError(err))
+	return telemetry.OutcomeError
+}
+
+// deferQuotaExhausted: daily project budget spent — defer the channel to
+// the next budget window; the job itself is not a failure and must not burn
+// retry budget.
+func (w *Worker) deferQuotaExhausted(parent context.Context, job *db.IngestionJob, quotaEx *QuotaExhaustedError) string {
+	until := quotaEx.RetryAt
+	if until.IsZero() {
+		until = time.Now().Add(time.Hour)
+	}
+	_ = w.DB.MarkChannelBackoff(parent, job.PlatformChannelID, until)
+	_ = w.DB.MarkJobCompleted(parent, job.ID)
+	recordIngestionError(parent, telemetry.ReasonRateLimited)
+	log.Printf("worker: quota exhausted job=%s channel=%s spent=%d retry_at=%s — deferred without retry burn",
+		job.ID, job.PlatformChannelID, quotaEx.UnitsSpent, until.UTC().Format(time.RFC3339))
+	return telemetry.OutcomeError
+}
+
+// stopAtCeiling: per-job ceiling reached — clean stop. Checkpoints are
+// durable; the next scheduled poll resumes where we stopped.
+func (w *Worker) stopAtCeiling(parent context.Context, job *db.IngestionJob, ceiling *JobBudgetExceededError) string {
+	_ = w.DB.MarkJobCompleted(parent, job.ID)
+	log.Printf("worker: job ceiling kind=%s limit=%d job=%s channel=%s — remainder deferred to next tick",
+		ceiling.Kind, ceiling.Limit, job.ID, job.PlatformChannelID)
+	return telemetry.OutcomeSuccess
+}
+
+// backoffRateLimited honors the provider Retry-After window; rate-limit is
+// NOT a failure, so the job completes.
+func (w *Worker) backoffRateLimited(parent context.Context, job *db.IngestionJob, rate *RateLimitError) string {
+	until := time.Now().Add(rate.RetryAfter)
+	_ = w.DB.MarkChannelBackoff(parent, job.PlatformChannelID, until)
+	_ = w.DB.MarkJobCompleted(parent, job.ID)
+	recordIngestionError(parent, telemetry.ReasonRateLimited)
+	return telemetry.OutcomeError
+}
+
+// rotateInvalidToken tries the fallback token: promote next, then requeue
+// without consuming retry budget; with no fallback, complete the job.
+func (w *Worker) rotateInvalidToken(parent context.Context, job *db.IngestionJob) string {
+	recordIngestionError(parent, telemetry.ReasonTokenInvalid)
+	if perr := w.DB.PromoteNextIngestionToken(parent, job.PlatformChannelID); perr == nil {
+		_ = w.DB.ReleaseJobToPending(parent, job.ID, 5*time.Second)
+		return telemetry.OutcomeError
+	}
+	// No fallback available; mark completed and move on.
+	_ = w.DB.UpdateLastSyncedAtIfNull(parent, job.PlatformChannelID)
+	_ = w.DB.MarkJobCompleted(parent, job.ID)
+	return telemetry.OutcomeError
+}
+
+// completeOnDeadline: soft deadline — not a failure, the next tick will
+// re-enqueue.
+func (w *Worker) completeOnDeadline(parent context.Context, job *db.IngestionJob) string {
+	_ = w.DB.MarkJobCompleted(parent, job.ID)
+	recordIngestionError(parent, telemetry.ReasonDeadlineExceeded)
+	return telemetry.OutcomeTimeout
 }
 
 // ============================================================================
@@ -387,20 +434,7 @@ func (w *Worker) adaptPollInterval(ctx context.Context, pc *db.PlatformChannel, 
 	if pc.PollIntervalMinutes != nil && *pc.PollIntervalMinutes > cur {
 		cur = *pc.PollIntervalMinutes
 	}
-	next := cur
-	if st.newContent() {
-		if next > floor {
-			if next /= 2; next < floor {
-				next = floor
-			}
-		}
-	} else {
-		ceiling := floor * mult
-		next = cur * 2
-		if next > ceiling {
-			next = ceiling
-		}
-	}
+	next := nextInterval(st, cur, floor, mult)
 	if next == cur {
 		return
 	}
@@ -410,6 +444,79 @@ func (w *Worker) adaptPollInterval(ctx context.Context, pc *db.PlatformChannel, 
 	}
 	log.Printf("worker: adaptive poll channel=%s %dmin → %dmin (videos=%d comments=%d)",
 		pc.ID, cur, next, st.videos, st.comments)
+}
+
+// walkState holds the durable position for the video being ingested.
+type walkState struct {
+	videoID    string
+	watermark  time.Time // per-video, from video_sync_state
+	videoMax   time.Time // newest comment queued this video
+	checkpoint string    // token to re-fetch the page being consumed
+}
+
+// resumeWalkState loads the durable per-video sync state into walk.
+// skip=true means the video was previously marked comments-unavailable;
+// a missing row is a fresh video (full walk).
+func resumeWalkState(ctx context.Context, sdb SyncStateDB, pcID, videoID string, walk *walkState) (bool, error) {
+	st, serr := sdb.GetVideoSyncState(ctx, pcID, videoID)
+	if errors.Is(serr, db.ErrNotFound) {
+		return false, nil
+	}
+	if serr != nil {
+		return false, fmt.Errorf("load video sync state: %w", serr)
+	}
+	if st.Status == "skipped" {
+		log.Printf("worker: skip video=%s channel=%s: previously marked comments-unavailable", videoID, pcID)
+		return true, nil
+	}
+	walk.applySyncState(st)
+	return false, nil
+}
+
+// applySyncState copies watermark + page checkpoint onto the walk.
+func (s *walkState) applySyncState(st *db.VideoSyncState) {
+	if st.CommentWatermarkAt != nil {
+		s.watermark = *st.CommentWatermarkAt
+	}
+	if st.PageCheckpoint != nil {
+		s.checkpoint = *st.PageCheckpoint
+	}
+}
+
+// nextInterval adapts the polling cadence: fresh content halves toward the
+// floor; silence doubles up to floor*mult.
+func nextInterval(st ingestStats, cur, floor, mult int) int {
+	if st.newContent() {
+		return fasterInterval(cur, floor)
+	}
+	return slowerInterval(cur, floor*mult)
+}
+
+// fasterInterval halves cur, never below floor.
+func fasterInterval(cur, floor int) int {
+	if cur <= floor {
+		return cur
+	}
+	return max2int(cur/2, floor)
+}
+
+// slowerInterval doubles cur, never above ceiling.
+func slowerInterval(cur, ceiling int) int {
+	return min2int(cur*2, ceiling)
+}
+
+func max2int(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min2int(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // discoverVideos picks the quota-cheapest video source for a job:
@@ -427,11 +534,7 @@ func (w *Worker) discoverVideos(ctx context.Context, pc *db.PlatformChannel, acc
 	}
 	playlistID, err := w.Client.ResolveUploadsPlaylist(ctx, accessTok, pc.PlatformChannelID)
 	if err != nil {
-		var rate *RateLimitError
-		var tokInv *TokenInvalidError
-		var ceiling *JobBudgetExceededError
-		switch {
-		case errors.As(err, &rate), errors.As(err, &tokInv), errors.As(err, &ceiling):
+		if isAuthOrLimitError(err) {
 			return nil, err // auth/limits must not be masked by fallback
 		}
 		// Bounded fallback: one search.list walk per job, telemetry makes
@@ -441,15 +544,30 @@ func (w *Worker) discoverVideos(ctx context.Context, pc *db.PlatformChannel, acc
 		return w.Client.ListVideos(ctx, accessTok, pc.PlatformChannelID, publishedAfter), nil
 	}
 	pc.UploadsPlaylistID = &playlistID
-	if sdb, ok := w.syncDB(); ok {
-		if err := sdb.SetUploadsPlaylistID(ctx, pc.ID, playlistID); err != nil {
-			log.Printf("worker: cache uploads playlist channel=%s: %v", pc.ID, err)
-		}
-	} else {
-		log.Printf("worker: uploads playlist resolved channel=%s playlist=%s (no sync-state store to cache in)", pc.ID, playlistID)
-	}
+	w.cacheUploadsPlaylist(ctx, pc.ID, playlistID)
 	recordYoutubeDiscovery(ctx, "playlist")
 	return w.Client.ListUploads(ctx, accessTok, playlistID, stopBefore), nil
+}
+
+// isAuthOrLimitError reports the errors whose meaning a fallback walk would
+// mask: auth failures and budget/rate ceilings.
+func isAuthOrLimitError(err error) bool {
+	var rate *RateLimitError
+	var tokInv *TokenInvalidError
+	var ceiling *JobBudgetExceededError
+	return errors.As(err, &rate) || errors.As(err, &tokInv) || errors.As(err, &ceiling)
+}
+
+// cacheUploadsPlaylist stores the resolved id when a sync-state store exists.
+func (w *Worker) cacheUploadsPlaylist(ctx context.Context, pcID, playlistID string) {
+	sdb, ok := w.syncDB()
+	if !ok {
+		log.Printf("worker: uploads playlist resolved channel=%s playlist=%s (no sync-state store to cache in)", pcID, playlistID)
+		return
+	}
+	if err := sdb.SetUploadsPlaylistID(ctx, pcID, playlistID); err != nil {
+		log.Printf("worker: cache uploads playlist channel=%s: %v", pcID, err)
+	}
 }
 
 // ingestStats carries what one ingestion run did — feeds adaptive polling
@@ -484,12 +602,6 @@ func (w *Worker) runIngestion(jobCtx, persistCtx context.Context, pc *db.Platfor
 	var maxPostedAt time.Time // channel-wide, feeds last_synced_at
 
 	// walk holds the durable position for the video being ingested now.
-	type walkState struct {
-		videoID    string
-		watermark  time.Time // per-video, from video_sync_state
-		videoMax   time.Time // newest comment queued this video
-		checkpoint string    // token to re-fetch the page being consumed
-	}
 	var walk *walkState
 
 	flush := func() error {
@@ -569,23 +681,12 @@ func (w *Worker) runIngestion(jobCtx, persistCtx context.Context, pc *db.Platfor
 
 		walk = &walkState{videoID: v.ID}
 		if hasSDB {
-			st, serr := sdb.GetVideoSyncState(jobCtx, pc.ID, v.ID)
-			switch {
-			case serr == nil:
-				if st.Status == "skipped" {
-					log.Printf("worker: skip video=%s channel=%s: previously marked comments-unavailable", v.ID, pc.ID)
-					continue
-				}
-				if st.CommentWatermarkAt != nil {
-					walk.watermark = *st.CommentWatermarkAt
-				}
-				if st.PageCheckpoint != nil {
-					walk.checkpoint = *st.PageCheckpoint
-				}
-			case errors.Is(serr, db.ErrNotFound):
-				// fresh video — full walk
-			default:
-				return stats, fmt.Errorf("load video sync state: %w", serr)
+			skip, serr := resumeWalkState(jobCtx, sdb, pc.ID, v.ID, walk)
+			if serr != nil {
+				return stats, serr
+			}
+			if skip {
+				continue
 			}
 			if walk.checkpoint != "" {
 				log.Printf("worker: resuming video=%s channel=%s from page checkpoint", v.ID, pc.ID)
@@ -788,32 +889,55 @@ func (w *Worker) obtainAccessToken(ctx context.Context, platformChannelID string
 		return "", &TokenInvalidError{StatusCode: 401, Body: err.Error()}
 	}
 	// Persist refreshed token/expiry so each poll doesn't re-refresh.
-	if fresh != nil && (fresh.AccessToken != access || !fresh.Expiry.IsZero()) {
-		if row, ok, rerr := w.DB.GetIngestionTokenRow(ctx, platformChannelID); rerr == nil && ok {
-			expiry := row.TokenExpiresAt
-			if !fresh.Expiry.IsZero() {
-				expiry = &fresh.Expiry
-			}
-			encAccess, eerr := auth.Encrypt(fresh.AccessToken)
-			if eerr == nil {
-				encRefresh := accessEnc
-				// oauth2 reuses refresh token unless rotated.
-				if fresh.RefreshToken != "" && fresh.RefreshToken != refresh {
-					if enc, e2 := auth.Encrypt(fresh.RefreshToken); e2 == nil {
-						encRefresh = enc
-					}
-				} else {
-					encRefresh = refreshEnc
-				}
-				exp := time.Now().UTC().Add(time.Hour)
-				if expiry != nil {
-					exp = *expiry
-				}
-				_ = w.DB.UpdateTokenAndExpiry(ctx, row.ID, encAccess, encRefresh, exp)
-			}
-		}
-	}
+	w.persistRefreshedToken(ctx, platformChannelID, fresh, access, refresh, accessEnc, refreshEnc)
 	return fresh.AccessToken, nil
+}
+
+// persistRefreshedToken stores a rotated access/refresh token and its expiry
+// so each poll doesn't re-refresh. Best-effort: any DB or crypto failure is
+// swallowed and the next poll re-refreshes.
+func (w *Worker) persistRefreshedToken(ctx context.Context, platformChannelID string, fresh *oauth2.Token, access, refresh, accessEnc, refreshEnc string) {
+	if fresh == nil || (fresh.AccessToken == access && fresh.Expiry.IsZero()) {
+		return
+	}
+	row, found, rerr := w.DB.GetIngestionTokenRow(ctx, platformChannelID)
+	if rerr != nil || !found {
+		return
+	}
+	encAccess, eerr := auth.Encrypt(fresh.AccessToken)
+	if eerr != nil {
+		return
+	}
+	encRefresh := encryptedRefresh(fresh, refresh, accessEnc, refreshEnc)
+	exp := persistedExpiry(fresh, row.TokenExpiresAt)
+	_ = w.DB.UpdateTokenAndExpiry(ctx, row.ID, encAccess, encRefresh, exp)
+}
+
+// encryptedRefresh re-encrypts the refresh token only when oauth2 rotated
+// it; otherwise the previous ciphertext is kept. (Keeps the historical
+// fallback of storing accessEnc when rotation-time encryption fails — the
+// only path where that stale value could surface.)
+func encryptedRefresh(fresh *oauth2.Token, plainRefresh, accessEnc, refreshEnc string) string {
+	if fresh.RefreshToken == "" || fresh.RefreshToken == plainRefresh {
+		return refreshEnc
+	}
+	enc, err := auth.Encrypt(fresh.RefreshToken)
+	if err != nil {
+		return accessEnc
+	}
+	return enc
+}
+
+// persistedExpiry prefers the fresh provider expiry, then the stored row
+// expiry, and finally a +1h fallback.
+func persistedExpiry(fresh *oauth2.Token, rowExpiry *time.Time) time.Time {
+	if !fresh.Expiry.IsZero() {
+		return fresh.Expiry
+	}
+	if rowExpiry != nil {
+		return *rowExpiry
+	}
+	return time.Now().UTC().Add(time.Hour)
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) {
@@ -833,19 +957,27 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 // Every reset is logged for auditability.
 func (w *Worker) RecoverStaleJobs(ctx context.Context) {
 	n, err := w.DB.RecoverStaleIngestionJobs(ctx, staleJobAge)
-	if err != nil {
-		log.Printf("worker: reaper ingestion err=%v", err)
-	} else if n > 0 {
-		log.Printf("worker: reaper reset %d stale ingestion jobs to pending", n)
+	logReaperResult("ingestion", n, err)
+	if llmReaper, ok := w.DB.(llmReaperDB); ok {
+		m, err := llmReaper.RecoverStaleLLMJobs(ctx, llmStaleJobAge)
+		logReaperResult("llm", m, err)
 	}
-	if llmReaper, ok := w.DB.(interface {
-		RecoverStaleLLMJobs(context.Context, time.Duration) (int64, error)
-	}); ok {
-		if m, err := llmReaper.RecoverStaleLLMJobs(ctx, llmStaleJobAge); err != nil {
-			log.Printf("worker: reaper llm err=%v", err)
-		} else if m > 0 {
-			log.Printf("worker: reaper reset %d stale llm jobs to pending", m)
-		}
+}
+
+// llmReaperDB is the optional LLM reaper surface of the job store.
+type llmReaperDB interface {
+	RecoverStaleLLMJobs(context.Context, time.Duration) (int64, error)
+}
+
+// logReaperResult logs the error (reapers are best-effort) or the reset
+// count when anything moved.
+func logReaperResult(kind string, n int64, err error) {
+	if err != nil {
+		log.Printf("worker: reaper %s err=%v", kind, err)
+		return
+	}
+	if n > 0 {
+		log.Printf("worker: reaper reset %d stale %s jobs to pending", n, kind)
 	}
 }
 

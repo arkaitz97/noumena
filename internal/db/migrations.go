@@ -70,9 +70,11 @@ var migrations = []migration{
 				return err
 			}
 			// partial_export no longer exists; drop if a legacy DB has it.
-			if has, err := columnExists(ctx, tx, "data_export_jobs", "partial_export"); err != nil {
+			has, err := columnExists(ctx, tx, "data_export_jobs", "partial_export")
+			if err != nil {
 				return err
-			} else if has {
+			}
+			if has {
 				if _, err := tx.ExecContext(ctx, `ALTER TABLE data_export_jobs DROP COLUMN partial_export`); err != nil {
 					return fmt.Errorf("drop partial_export: %w", err)
 				}

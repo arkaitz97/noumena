@@ -366,12 +366,12 @@ func (q *SQLiteQuery) DeleteTracking(ctx context.Context, userID, platformChanne
 	return tx.Commit()
 }
 
+// backfillDayOptions are the selectable initial-backfill windows (kept in
+// sync with the API validation in internal/api).
+var backfillDayOptions = map[int]bool{30: true, 60: true, 90: true, 180: true}
+
 func validBackfillDays(d int) bool {
-	switch d {
-	case 30, 60, 90, 180:
-		return true
-	}
-	return false
+	return backfillDayOptions[d]
 }
 
 func (q *SQLiteQuery) UpdateBackfillDays(ctx context.Context, userID, platformChannelID string, days int) error {

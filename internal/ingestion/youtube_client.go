@@ -138,27 +138,39 @@ func nextUTCDay(t time.Time) time.Time {
 // ytErrorStatus buckets a doGET error into the closed status set recorded
 // on noumena_youtube_requests_total{status}.
 func ytErrorStatus(err error) string {
-	var tok *TokenInvalidError
-	var rl *RateLimitError
-	var cd *CommentsDisabledError
-	var qe *QuotaExhaustedError
-	var jb *JobBudgetExceededError
-	switch {
-	case errors.As(err, &tok):
-		return "unauthorized"
-	case errors.As(err, &rl):
-		return "rate_limited"
-	case errors.As(err, &cd):
-		return "comments_disabled"
-	case errors.As(err, &qe):
-		return "quota_exhausted"
-	case errors.As(err, &jb):
-		return "job_ceiling"
-	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-		return "ctx_error"
-	default:
-		return "error"
+	if label, ok := typedErrorStatus(err); ok {
+		return label
 	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return "ctx_error"
+	}
+	return "error"
+}
+
+// typedErrorStatus probes the closed typed-error set with errors.As; order
+// preserves the original bucketing.
+func typedErrorStatus(err error) (string, bool) {
+	var tok *TokenInvalidError
+	if errors.As(err, &tok) {
+		return "unauthorized", true
+	}
+	var rl *RateLimitError
+	if errors.As(err, &rl) {
+		return "rate_limited", true
+	}
+	var cd *CommentsDisabledError
+	if errors.As(err, &cd) {
+		return "comments_disabled", true
+	}
+	var qe *QuotaExhaustedError
+	if errors.As(err, &qe) {
+		return "quota_exhausted", true
+	}
+	var jb *JobBudgetExceededError
+	if errors.As(err, &jb) {
+		return "job_ceiling", true
+	}
+	return "", false
 }
 
 // TryReserve consumes units for an outgoing request, returning false when the
@@ -351,17 +363,20 @@ type VideoRef struct {
 	PublishedAt time.Time
 }
 
+// searchItem is one search.list row.
+type searchItem struct {
+	ID struct {
+		VideoID string `json:"videoId"`
+	} `json:"id"`
+	Snippet struct {
+		PublishedAt string `json:"publishedAt"`
+		Title       string `json:"title"`
+	} `json:"snippet"`
+}
+
 type searchListResponse struct {
-	NextPageToken string `json:"nextPageToken"`
-	Items         []struct {
-		ID struct {
-			VideoID string `json:"videoId"`
-		} `json:"id"`
-		Snippet struct {
-			PublishedAt string `json:"publishedAt"`
-			Title       string `json:"title"`
-		} `json:"snippet"`
-	} `json:"items"`
+	NextPageToken string       `json:"nextPageToken"`
+	Items         []searchItem `json:"items"`
 }
 
 // ListVideos returns a function that paginates search.list, yielding
@@ -370,87 +385,107 @@ type searchListResponse struct {
 //
 // publishedAfter filters server-side; results are returned in descending
 // publishedAt (order=date).
+// pageIterator walks a page-buffered list endpoint: load refills the
+// buffer and reports whether a next page exists; next serves buffered items
+// until the stream is exhausted. The first next() call triggers a fetch.
+type pageIterator[T any] struct {
+	load    func() ([]T, bool, error)
+	items   []T
+	idx     int
+	hasMore bool
+	done    bool
+}
+
+func (it *pageIterator[T]) next() (T, bool, error) {
+	var zero T
+	for !it.done && it.idx >= len(it.items) {
+		if !it.hasMore {
+			it.done = true
+			return zero, false, nil
+		}
+		items, more, err := it.load()
+		if err != nil {
+			it.done = true
+			return zero, false, err
+		}
+		it.items, it.idx, it.hasMore = items, 0, more
+	}
+	if it.idx >= len(it.items) {
+		it.done = true
+		return zero, false, nil
+	}
+	item := it.items[it.idx]
+	it.idx++
+	return item, true, nil
+}
+
+// pageFields appends the shared list-pagination params.
+func pageFields(q url.Values, maxResults int, fields, pageToken string) {
+	q.Set("maxResults", strconv.Itoa(maxResults))
+	q.Set("fields", fields)
+	if pageToken != "" {
+		q.Set("pageToken", pageToken)
+	}
+}
+
 func (c *YouTubeClient) ListVideos(ctx context.Context, accessToken, channelID string, publishedAfter time.Time) func() (VideoRef, bool, error) {
 	pageToken := ""
-	bufferIdx := 0
-	var buffer []VideoRef
-	exhausted := false
-
-	fetchPage := func() error {
+	it := &pageIterator[VideoRef]{hasMore: true}
+	it.load = func() ([]VideoRef, bool, error) {
 		q := url.Values{}
 		q.Set("part", "id,snippet")
 		q.Set("channelId", channelID)
 		q.Set("type", "video")
 		q.Set("order", "date")
-		q.Set("maxResults", "50")
-		q.Set("fields", "nextPageToken,items(id/videoId,snippet/publishedAt,snippet/title)")
+		pageFields(q, 50, "nextPageToken,items(id/videoId,snippet/publishedAt,snippet/title)", pageToken)
 		if !publishedAfter.IsZero() {
 			q.Set("publishedAfter", publishedAfter.UTC().Format(time.RFC3339))
 		}
-		if pageToken != "" {
-			q.Set("pageToken", pageToken)
-		}
 		body, err := c.doGET(ctx, accessToken, "/search?"+q.Encode())
 		if err != nil {
-			return err
+			return nil, false, err
 		}
 		var parsed searchListResponse
 		if err := json.Unmarshal(body, &parsed); err != nil {
-			return fmt.Errorf("decode search.list: %w", err)
+			return nil, false, fmt.Errorf("decode search.list: %w", err)
 		}
-		buffer = buffer[:0]
-		for _, it := range parsed.Items {
-			if it.ID.VideoID == "" {
-				continue
-			}
-			pubAt, _ := time.Parse(time.RFC3339, it.Snippet.PublishedAt)
-			buffer = append(buffer, VideoRef{ID: it.ID.VideoID, Title: it.Snippet.Title, PublishedAt: pubAt})
-		}
-		bufferIdx = 0
 		pageToken = parsed.NextPageToken
-		if pageToken == "" && len(buffer) == 0 {
-			exhausted = true
-		}
-		return nil
+		return videoRefsFromSearch(parsed.Items), pageToken != "", nil
 	}
+	return it.next
+}
 
-	return func() (VideoRef, bool, error) {
-		if exhausted {
-			return VideoRef{}, false, nil
+// videoRefsFromSearch decodes search.list items, skipping rows without an id.
+func videoRefsFromSearch(items []searchItem) []VideoRef {
+	refs := make([]VideoRef, 0, len(items))
+	for _, it := range items {
+		if it.ID.VideoID == "" {
+			continue
 		}
-		if bufferIdx >= len(buffer) {
-			if pageToken == "" && buffer != nil {
-				exhausted = true
-				return VideoRef{}, false, nil
-			}
-			if err := fetchPage(); err != nil {
-				return VideoRef{}, false, err
-			}
-			if exhausted {
-				return VideoRef{}, false, nil
-			}
-		}
-		ref := buffer[bufferIdx]
-		bufferIdx++
-		return ref, true, nil
+		pubAt, _ := time.Parse(time.RFC3339, it.Snippet.PublishedAt)
+		refs = append(refs, VideoRef{ID: it.ID.VideoID, Title: it.Snippet.Title, PublishedAt: pubAt})
 	}
+	return refs
 }
 
 // ============================================================================
 // playlistItems.list — quota-efficient uploads-playlist discovery
 // ============================================================================
 
+// playlistItem is one playlistItems.list row.
+type playlistItem struct {
+	ContentDetails struct {
+		VideoID string `json:"videoId"`
+	} `json:"contentDetails"`
+	Snippet struct {
+		PublishedAt string `json:"publishedAt"`
+		Title       string `json:"title"`
+	} `json:"snippet"`
+}
+
 type playlistItemsResponse struct {
-	NextPageToken string `json:"nextPageToken"`
-	Items         []struct {
-		ContentDetails struct {
-			VideoID string `json:"videoId"`
-		} `json:"contentDetails"`
-		Snippet struct {
-			PublishedAt string `json:"publishedAt"`
-			Title       string `json:"title"`
-		} `json:"snippet"`
-	} `json:"items"`
+	NextPageToken string         `json:"nextPageToken"`
+	Items         []playlistItem `json:"items"`
 }
 
 // ResolveUploadsPlaylist returns the channel's uploads playlist id via
@@ -489,69 +524,43 @@ func (c *YouTubeClient) ResolveUploadsPlaylist(ctx context.Context, accessToken,
 // published before it — the per-sync watermark boundary.
 func (c *YouTubeClient) ListUploads(ctx context.Context, accessToken, playlistID string, stopBefore time.Time) func() (VideoRef, bool, error) {
 	pageToken := ""
-	bufferIdx := 0
-	var buffer []VideoRef
-	exhausted := false
-
-	fetchPage := func() error {
+	it := &pageIterator[VideoRef]{hasMore: true}
+	it.load = func() ([]VideoRef, bool, error) {
 		q := url.Values{}
 		q.Set("part", "snippet,contentDetails")
 		q.Set("playlistId", playlistID)
-		q.Set("maxResults", "50")
-		q.Set("fields", "nextPageToken,items(contentDetails/videoId,snippet/publishedAt,snippet/title)")
-		if pageToken != "" {
-			q.Set("pageToken", pageToken)
-		}
+		pageFields(q, 50, "nextPageToken,items(contentDetails/videoId,snippet/publishedAt,snippet/title)", pageToken)
 		body, err := c.doGET(ctx, accessToken, "/playlistItems?"+q.Encode())
 		if err != nil {
-			return err
+			return nil, false, err
 		}
 		var parsed playlistItemsResponse
 		if err := json.Unmarshal(body, &parsed); err != nil {
-			return fmt.Errorf("decode playlistItems.list: %w", err)
+			return nil, false, fmt.Errorf("decode playlistItems.list: %w", err)
 		}
-		buffer = buffer[:0]
-		for _, it := range parsed.Items {
-			if it.ContentDetails.VideoID == "" {
-				continue
-			}
-			pubAt, _ := time.Parse(time.RFC3339, it.Snippet.PublishedAt)
-			// Descending publishedAt: everything after the first item
-			// older than the watermark is already ingested.
-			if !stopBefore.IsZero() && !pubAt.IsZero() && pubAt.Before(stopBefore) {
-				exhausted = true
-				break
-			}
-			buffer = append(buffer, VideoRef{ID: it.ContentDetails.VideoID, Title: it.Snippet.Title, PublishedAt: pubAt})
-		}
-		bufferIdx = 0
 		pageToken = parsed.NextPageToken
-		if pageToken == "" && len(buffer) == 0 {
-			exhausted = true
-		}
-		return nil
+		refs, stopped := refsFromPlaylistItems(parsed.Items, stopBefore)
+		return refs, !stopped && pageToken != "", nil
 	}
+	return it.next
+}
 
-	return func() (VideoRef, bool, error) {
-		if exhausted {
-			return VideoRef{}, false, nil
+// refsFromPlaylistItems decodes one uploads page. Descending publishedAt:
+// everything after the first item older than the watermark is already
+// ingested (stopped=true).
+func refsFromPlaylistItems(items []playlistItem, stopBefore time.Time) ([]VideoRef, bool) {
+	refs := make([]VideoRef, 0, len(items))
+	for _, it := range items {
+		if it.ContentDetails.VideoID == "" {
+			continue
 		}
-		if bufferIdx >= len(buffer) {
-			if pageToken == "" && buffer != nil {
-				exhausted = true
-				return VideoRef{}, false, nil
-			}
-			if err := fetchPage(); err != nil {
-				return VideoRef{}, false, err
-			}
-			if exhausted {
-				return VideoRef{}, false, nil
-			}
+		pubAt, _ := time.Parse(time.RFC3339, it.Snippet.PublishedAt)
+		if !stopBefore.IsZero() && !pubAt.IsZero() && pubAt.Before(stopBefore) {
+			return refs, true
 		}
-		ref := buffer[bufferIdx]
-		bufferIdx++
-		return ref, true, nil
+		refs = append(refs, VideoRef{ID: it.ContentDetails.VideoID, Title: it.Snippet.Title, PublishedAt: pubAt})
 	}
+	return refs, false
 }
 
 // ============================================================================
@@ -595,81 +604,60 @@ type commentsListResponse struct {
 
 func (c *YouTubeClient) ListReplies(ctx context.Context, accessToken, parentCommentID string) func() (CommentThread, bool, error) {
 	pageToken := ""
-	var buffer []CommentThread
-	idx := 0
-	exhausted := false
-
-	fetchPage := func() error {
+	it := &pageIterator[CommentThread]{hasMore: true}
+	it.load = func() ([]CommentThread, bool, error) {
 		q := url.Values{}
 		q.Set("part", "snippet")
 		q.Set("parentId", parentCommentID)
-		q.Set("maxResults", "100")
 		q.Set("textFormat", "plainText")
-		q.Set("fields", "nextPageToken,items(id,snippet(authorDisplayName,textDisplay,textOriginal,publishedAt,parentId,videoId))")
-		if pageToken != "" {
-			q.Set("pageToken", pageToken)
-		}
+		pageFields(q, 100, "nextPageToken,items(id,snippet(authorDisplayName,textDisplay,textOriginal,publishedAt,parentId,videoId))", pageToken)
 		body, err := c.doGET(ctx, accessToken, "/comments?"+q.Encode())
 		if err != nil {
-			return err
+			return nil, false, err
 		}
 		var parsed commentsListResponse
 		if err := json.Unmarshal(body, &parsed); err != nil {
-			return fmt.Errorf("decode comments.list (replies): %w", err)
+			return nil, false, fmt.Errorf("decode comments.list (replies): %w", err)
 		}
-		buffer = buffer[:0]
-		for _, c := range parsed.Items {
-			if c.ID == "" {
-				continue
-			}
-			rPosted, _ := time.Parse(time.RFC3339, c.Snippet.PublishedAt)
-			rBody := c.Snippet.TextDisplay
-			if rBody == "" {
-				rBody = c.Snippet.TextOriginal
-			}
-			pID := c.Snippet.ParentID
-			depth := 1
-			if pID != "" && pID != parentCommentID {
-				depth = 2
-			}
-			buffer = append(buffer, CommentThread{
-				CommentID:       c.ID,
-				ParentCommentID: &pID,
-				ReplyDepth:      depth,
-				AuthorHandle:    c.Snippet.AuthorDisplayName,
-				Body:            rBody,
-				PostedAt:        rPosted,
-				VideoID:         c.Snippet.VideoID,
-			})
-		}
-		idx = 0
 		pageToken = parsed.NextPageToken
-		if pageToken == "" && len(buffer) == 0 {
-			exhausted = true
-		}
-		return nil
+		return repliesFromComments(parsed.Items, parentCommentID), pageToken != "", nil
 	}
+	return it.next
+}
 
-	return func() (CommentThread, bool, error) {
-		if exhausted {
-			return CommentThread{}, false, nil
+// repliesFromComments decodes comments.list rows into reply threads; a reply
+// whose parentId differs from the top-level comment sits one level deeper.
+func repliesFromComments(items []ytComment, parentCommentID string) []CommentThread {
+	out := make([]CommentThread, 0, len(items))
+	for _, c := range items {
+		if c.ID == "" {
+			continue
 		}
-		if idx >= len(buffer) {
-			if pageToken == "" && buffer != nil {
-				exhausted = true
-				return CommentThread{}, false, nil
-			}
-			if err := fetchPage(); err != nil {
-				return CommentThread{}, false, err
-			}
-			if exhausted {
-				return CommentThread{}, false, nil
-			}
+		rPosted, _ := time.Parse(time.RFC3339, c.Snippet.PublishedAt)
+		pID := c.Snippet.ParentID
+		depth := 1
+		if pID != "" && pID != parentCommentID {
+			depth = 2
 		}
-		t := buffer[idx]
-		idx++
-		return t, true, nil
+		out = append(out, CommentThread{
+			CommentID:       c.ID,
+			ParentCommentID: &pID,
+			ReplyDepth:      depth,
+			AuthorHandle:    c.Snippet.AuthorDisplayName,
+			Body:            commentBody(c.Snippet),
+			PostedAt:        rPosted,
+			VideoID:         c.Snippet.VideoID,
+		})
 	}
+	return out
+}
+
+// commentBody prefers the display text, falling back to the original.
+func commentBody(s commentSnippet) string {
+	if s.TextDisplay != "" {
+		return s.TextDisplay
+	}
+	return s.TextOriginal
 }
 
 // ListCommentThreads returns an iterator over CommentThread records for a
@@ -688,112 +676,98 @@ func (c *YouTubeClient) ListCommentThreads(ctx context.Context, accessToken, vid
 // unique comment constraints deduplicate the replay).
 func (c *YouTubeClient) ListCommentThreadsPaged(ctx context.Context, accessToken, videoID, startToken string, afterPage func(fetchedWith, nextToken string)) func() (CommentThread, bool, error) {
 	pageToken := startToken
-	var pending []CommentThread
-	idx := 0
-	exhausted := false
-	fetchedWith := ""
-
-	fetchPage := func() error {
-		fetchedWith = pageToken
-		q := url.Values{}
-		q.Set("part", "snippet,replies")
-		q.Set("videoId", videoID)
-		q.Set("maxResults", "100")
-		q.Set("order", "time")
-		q.Set("fields", "nextPageToken,items(snippet/topLevelComment(id,snippet(authorDisplayName,textDisplay,textOriginal,publishedAt,videoId)),snippet/totalReplyCount,replies/comments(id,snippet(authorDisplayName,textDisplay,textOriginal,publishedAt,parentId,videoId)))")
-		if pageToken != "" {
-			q.Set("pageToken", pageToken)
-		}
-		body, err := c.doGET(ctx, accessToken, "/commentThreads?"+q.Encode())
+	it := &pageIterator[CommentThread]{hasMore: true}
+	it.load = func() ([]CommentThread, bool, error) {
+		fetchedWith := pageToken
+		body, err := c.doGET(ctx, accessToken, "/commentThreads?"+commentThreadsQuery(videoID, pageToken).Encode())
 		if err != nil {
-			return err
+			return nil, false, err
 		}
 		var parsed commentThreadsResponse
 		if err := json.Unmarshal(body, &parsed); err != nil {
-			return fmt.Errorf("decode commentThreads.list: %w", err)
+			return nil, false, fmt.Errorf("decode commentThreads.list: %w", err)
 		}
-		pending = pending[:0]
-		for _, item := range parsed.Items {
-			tlc := item.Snippet.TopLevelComment
-			if tlc.ID == "" {
-				continue
-			}
-			topPosted, _ := time.Parse(time.RFC3339, tlc.Snippet.PublishedAt)
-			body := tlc.Snippet.TextDisplay
-			if body == "" {
-				body = tlc.Snippet.TextOriginal
-			}
-			top := CommentThread{
-				CommentID:       tlc.ID,
-				ParentCommentID: nil,
-				ReplyDepth:      0,
-				AuthorHandle:    tlc.Snippet.AuthorDisplayName,
-				Body:            body,
-				PostedAt:        topPosted,
-				VideoID:         tlc.Snippet.VideoID,
-				TotalReplyCount: item.Snippet.TotalReplyCount,
-			}
-			topIdx := len(pending)
-			pending = append(pending, top)
-			if item.Replies != nil {
-				for _, reply := range item.Replies.Comments {
-					if reply.ID == "" {
-						continue
-					}
-					rPosted, _ := time.Parse(time.RFC3339, reply.Snippet.PublishedAt)
-					rBody := reply.Snippet.TextDisplay
-					if rBody == "" {
-						rBody = reply.Snippet.TextOriginal
-					}
-					parentID := tlc.ID
-					depth := 1
-					if reply.Snippet.ParentID != "" && reply.Snippet.ParentID != tlc.ID {
-						depth = 2
-					}
-					pending = append(pending, CommentThread{
-						CommentID:       reply.ID,
-						ParentCommentID: &parentID,
-						ReplyDepth:      depth,
-						AuthorHandle:    reply.Snippet.AuthorDisplayName,
-						Body:            rBody,
-						PostedAt:        rPosted,
-						VideoID:         reply.Snippet.VideoID,
-					})
-					pending[topIdx].EmbeddedReplyCount++
-				}
-			}
-		}
-		idx = 0
 		pageToken = parsed.NextPageToken
 		if afterPage != nil {
 			afterPage(fetchedWith, pageToken)
 		}
-		if pageToken == "" && len(pending) == 0 {
-			exhausted = true
-		}
-		return nil
+		return threadsFromItems(parsed.Items), pageToken != "", nil
 	}
+	return it.next
+}
 
-	return func() (CommentThread, bool, error) {
-		if exhausted {
-			return CommentThread{}, false, nil
+// commentThreadsQuery is the time-ordered top-level + inline-replies page
+// request.
+func commentThreadsQuery(videoID, pageToken string) url.Values {
+	q := url.Values{}
+	q.Set("part", "snippet,replies")
+	q.Set("videoId", videoID)
+	q.Set("order", "time")
+	pageFields(q, 100, "nextPageToken,items(snippet/topLevelComment(id,snippet(authorDisplayName,textDisplay,textOriginal,publishedAt,videoId)),snippet/totalReplyCount,replies/comments(id,snippet(authorDisplayName,textDisplay,textOriginal,publishedAt,parentId,videoId)))", pageToken)
+	return q
+}
+
+// threadsFromItems flattens a commentThreads.list page into a stream of
+// top-level threads with their inline replies.
+func threadsFromItems(items []commentThreadItem) []CommentThread {
+	pending := make([]CommentThread, 0, len(items))
+	for _, item := range items {
+		if item.Snippet.TopLevelComment.ID == "" {
+			continue
 		}
-		if idx >= len(pending) {
-			if pageToken == "" && pending != nil {
-				exhausted = true
-				return CommentThread{}, false, nil
-			}
-			if err := fetchPage(); err != nil {
-				return CommentThread{}, false, err
-			}
-			if exhausted {
-				return CommentThread{}, false, nil
-			}
-		}
-		t := pending[idx]
-		idx++
-		return t, true, nil
+		topIdx := len(pending)
+		pending = append(pending, topLevelThread(item))
+		pending = appendInlineReplies(pending, item, topIdx)
 	}
+	return pending
+}
+
+// topLevelThread decodes the page's parent comment row.
+func topLevelThread(item commentThreadItem) CommentThread {
+	tlc := item.Snippet.TopLevelComment
+	topPosted, _ := time.Parse(time.RFC3339, tlc.Snippet.PublishedAt)
+	return CommentThread{
+		CommentID:       tlc.ID,
+		ParentCommentID: nil,
+		ReplyDepth:      0,
+		AuthorHandle:    tlc.Snippet.AuthorDisplayName,
+		Body:            commentBody(tlc.Snippet),
+		PostedAt:        topPosted,
+		VideoID:         tlc.Snippet.VideoID,
+		TotalReplyCount: item.Snippet.TotalReplyCount,
+	}
+}
+
+// appendInlineReplies flattens the embedded replies under the thread at
+// topIdx and counts them (the worker gates the deep replies.list walk on
+// the difference to TotalReplyCount).
+func appendInlineReplies(pending []CommentThread, item commentThreadItem, topIdx int) []CommentThread {
+	if item.Replies == nil {
+		return pending
+	}
+	parentID := item.Snippet.TopLevelComment.ID
+	for _, reply := range item.Replies.Comments {
+		if reply.ID == "" {
+			continue
+		}
+		rPosted, _ := time.Parse(time.RFC3339, reply.Snippet.PublishedAt)
+		depth := 1
+		if reply.Snippet.ParentID != "" && reply.Snippet.ParentID != parentID {
+			depth = 2
+		}
+		pid := parentID
+		pending = append(pending, CommentThread{
+			CommentID:       reply.ID,
+			ParentCommentID: &pid,
+			ReplyDepth:      depth,
+			AuthorHandle:    reply.Snippet.AuthorDisplayName,
+			Body:            commentBody(reply.Snippet),
+			PostedAt:        rPosted,
+			VideoID:         reply.Snippet.VideoID,
+		})
+		pending[topIdx].EmbeddedReplyCount++
+	}
+	return pending
 }
 
 // ============================================================================
@@ -833,6 +807,15 @@ func ParseYouTubeChannelRef(ref string) (handle, channelID string) {
 	return "", ""
 }
 
+// setChannelQuery looks up a channel by id when known, else by @handle.
+func setChannelQuery(q url.Values, channelID, handle string) {
+	if channelID != "" {
+		q.Set("id", channelID)
+		return
+	}
+	q.Set("forHandle", handle)
+}
+
 // ResolveChannelRef resolves a public channel from a handle/URL/bare-id ref
 // via `channels.list` authenticated with the API key (OAuth-free). Returns
 // canonical channel id + display name. Requires APIKey to be set.
@@ -847,11 +830,7 @@ func (c *YouTubeClient) ResolveChannelRef(ctx context.Context, ref string) (*Cha
 	q := url.Values{}
 	q.Set("part", "snippet")
 	q.Set("fields", "items(id,snippet/title)")
-	if channelID != "" {
-		q.Set("id", channelID)
-	} else {
-		q.Set("forHandle", handle)
-	}
+	setChannelQuery(q, channelID, handle)
 	body, err := c.doGET(ctx, "", "/channels?"+q.Encode())
 	if err != nil {
 		return nil, err

@@ -143,11 +143,16 @@ func computeEngagementDepth(comments []*db.Comment) int {
 // computeHealthScore collapses the breakdown to a single 0–100 integer via
 // the equal-weight mean. Spec 06: engagement_health_score range.
 func computeHealthScore(b HealthScoreBreakdown) int {
-	v := (b.ResponseRate + b.EngagementDepth) / 2
+	return clampScore((b.ResponseRate + b.EngagementDepth) / 2)
+}
+
+// clampScore restricts v to the legal 0–100 score range.
+func clampScore(v int) int {
 	if v < 0 {
-		v = 0
-	} else if v > 100 {
-		v = 100
+		return 0
+	}
+	if v > 100 {
+		return 100
 	}
 	return v
 }

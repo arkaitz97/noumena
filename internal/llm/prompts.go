@@ -109,19 +109,16 @@ type LLMResult struct {
 	Sentiment          SentimentLabel `json:"sentiment"`
 }
 
-// SentimentScore maps the closed-set sentiment label to an integer score
-// (-1/0/1) for aggregation. Missing or unknown labels default to neutral (0)
-// so a single malformed field never fails the whole batch, mirroring the
-// tolerance applied to category parsing.
+// sentimentScores maps sentiment labels to aggregation scores; missing or
+// unknown labels default to neutral (0) so a single malformed field never
+// fails the whole batch, mirroring the tolerance applied to category parsing.
+var sentimentScores = map[SentimentLabel]int{
+	SentimentNegative: -1,
+	SentimentPositive: 1,
+}
+
 func SentimentScore(s SentimentLabel) int {
-	switch s {
-	case SentimentNegative:
-		return -1
-	case SentimentPositive:
-		return 1
-	default:
-		return 0
-	}
+	return sentimentScores[s]
 }
 
 // PromptComment is the minimal shape required to build a classification
@@ -146,23 +143,30 @@ func BuildClassificationPrompt(comments []PromptComment) (system string, user st
 	}
 	b.WriteString("Classify the following comments. Return a JSON array with one object per comment.\n\n")
 	for i, c := range comments {
-		body := c.Body
-		if len(body) > maxCommentBytes {
-			body = body[:maxCommentBytes]
-		}
-		body = strings.ReplaceAll(body, "\n", " ")
-		if c.ParentContext != "" {
-			parent := c.ParentContext
-			if len(parent) > 200 {
-				parent = parent[:200] + "..."
-			}
-			parent = strings.ReplaceAll(parent, "\n", " ")
-			fmt.Fprintf(&b, "[%d] (reply to: %s) %s\n", i, parent, body)
-		} else {
-			fmt.Fprintf(&b, "[%d] %s\n", i, body)
-		}
+		b.WriteString(promptCommentLine(i, c.Body, c.ParentContext))
 	}
 	return SystemPrompt, b.String()
+}
+
+// promptCommentLine renders one numbered comment line. Replies inline a
+// flattened, 200-char excerpt of the parent context.
+func promptCommentLine(i int, body, parentContext string) string {
+	body = oneLine(truncate(body, maxCommentBytes))
+	if parentContext == "" {
+		return fmt.Sprintf("[%d] %s\n", i, body)
+	}
+	return fmt.Sprintf("[%d] (reply to: %s) %s\n", i, oneLine(clipEllipsis(parentContext, 200)), body)
+}
+
+func clipEllipsis(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
+
+func oneLine(s string) string {
+	return strings.ReplaceAll(s, "\n", " ")
 }
 
 // maxCommentBytes is the per-comment truncation limit applied at prompt-build
@@ -178,20 +182,23 @@ var jsonArrayRe = regexp.MustCompile(`(?s)\[.*\]`)
 // trims surrounding whitespace.
 func stripMarkdownFences(raw string) string {
 	s := strings.TrimSpace(raw)
-	// ```json ... ```  or  ``` ... ```
-	if strings.HasPrefix(s, "```") {
-		// Drop the opening fence line.
-		if nl := strings.Index(s, "\n"); nl >= 0 {
-			s = s[nl+1:]
-		} else {
-			s = strings.TrimPrefix(s, "```")
-		}
-		// Drop trailing fence.
-		if idx := strings.LastIndex(s, "```"); idx >= 0 {
-			s = s[:idx]
-		}
+	if !strings.HasPrefix(s, "```") {
+		return s
+	}
+	s = dropOpenFence(s)
+	if idx := strings.LastIndex(s, "```"); idx >= 0 {
+		s = s[:idx] // Drop trailing fence.
 	}
 	return strings.TrimSpace(s)
+}
+
+// dropOpenFence removes the opening fence line (or prefix, when there is no
+// newline at all).
+func dropOpenFence(s string) string {
+	if nl := strings.Index(s, "\n"); nl >= 0 {
+		return s[nl+1:]
+	}
+	return strings.TrimPrefix(s, "```")
 }
 
 // extractFirstJSONArray returns the substring from the first '[' to the
@@ -221,14 +228,15 @@ func extractFirstJSONArray(s string) (string, bool) {
 		if inString {
 			continue
 		}
-		switch ch {
-		case '[':
+		if ch == '[' {
 			depth++
-		case ']':
-			depth--
-			if depth == 0 {
-				return s[start : i+1], true
-			}
+		}
+		if ch != ']' {
+			continue
+		}
+		depth--
+		if depth == 0 {
+			return s[start : i+1], true
 		}
 	}
 	return "", false
@@ -244,11 +252,11 @@ func ParseClassificationResponse(raw string, expectedCount int) ([]LLMResult, er
 	jsonStr, ok := extractFirstJSONArray(s)
 	if !ok {
 		// Last-resort regex fallback (greedy, takes the widest [...] span).
-		if m := jsonArrayRe.FindString(s); m != "" {
-			jsonStr = m
-		} else {
+		m := jsonArrayRe.FindString(s)
+		if m == "" {
 			return nil, fmt.Errorf("no JSON array found in response")
 		}
+		jsonStr = m
 	}
 
 	var rawResults []LLMResult

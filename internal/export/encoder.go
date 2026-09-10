@@ -103,19 +103,19 @@ func EncodeCSV(w io.Writer, rows <-chan *db.FeedRow) (int64, error) {
 
 // jsonExportRow mirrors the /feed object shape MINUS is_starred. Task 10.2.
 type jsonExportRow struct {
-	ID                 string     `json:"id"`
-	PlatformChannelID  string     `json:"platform_channel_id"`
-	ChannelName        string     `json:"channel_name"`
-	AuthorHandle       *string    `json:"author_handle,omitempty"`
-	Body               string     `json:"body"`
-	PostedAt           time.Time  `json:"posted_at"`
-	Category           *string    `json:"category,omitempty"`
+	ID                 string          `json:"id"`
+	PlatformChannelID  string          `json:"platform_channel_id"`
+	ChannelName        string          `json:"channel_name"`
+	AuthorHandle       *string         `json:"author_handle,omitempty"`
+	Body               string          `json:"body"`
+	PostedAt           time.Time       `json:"posted_at"`
+	Category           *string         `json:"category,omitempty"`
 	ActionableInsights json.RawMessage `json:"actionable_insights,omitempty"`
-	Topic              *string    `json:"topic,omitempty"`
-	Confidence         *float64   `json:"confidence,omitempty"`
-	VideoID            *string    `json:"video_id,omitempty"`
-	VideoTitle         *string    `json:"video_title,omitempty"`
-	ProcessedAt        *time.Time `json:"processed_at,omitempty"`
+	Topic              *string         `json:"topic,omitempty"`
+	Confidence         *float64        `json:"confidence,omitempty"`
+	VideoID            *string         `json:"video_id,omitempty"`
+	VideoTitle         *string         `json:"video_title,omitempty"`
+	ProcessedAt        *time.Time      `json:"processed_at,omitempty"`
 }
 
 func toJSONRow(r *db.FeedRow) jsonExportRow {
@@ -170,6 +170,13 @@ func EncodeJSON(w io.Writer, rows <-chan *db.FeedRow) (int64, error) {
 // strftime('%Y-%m-%dT%H:%M:%SZ')) into time.Time. The modernc driver
 // returns the column as a string; parsing explicitly keeps the export
 // cursor independent of driver time-format pragmas.
+// encoders maps an export format name to its stream encoder; new formats
+// register here instead of extending a switch statement.
+var encoders = map[string]func(io.Writer, <-chan *db.FeedRow) (int64, error){
+	"csv":  EncodeCSV,
+	"json": EncodeJSON,
+}
+
 func parseFeedTime(s sql.NullString) time.Time {
 	if !s.Valid {
 		return time.Time{}
@@ -239,18 +246,11 @@ func StreamExport(ctx context.Context, pool *sql.DB, userID string, filters db.F
 		errCh <- rows.Err()
 	}()
 
-	var (
-		count  int64
-		encErr error
-	)
-	switch format {
-	case "csv":
-		count, encErr = EncodeCSV(dst, rowCh)
-	case "json":
-		count, encErr = EncodeJSON(dst, rowCh)
-	default:
+	encode, known := encoders[format]
+	if !known {
 		return 0, fmt.Errorf("unknown format %q", format)
 	}
+	count, encErr := encode(dst, rowCh)
 	// Drain any pending scan errors.
 	for range rowCh {
 		// rowCh may already be closed; ignored

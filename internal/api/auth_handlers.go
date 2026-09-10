@@ -96,84 +96,120 @@ func normalizeEmail(s string) string {
 	return strings.ToLower(strings.TrimSpace(s))
 }
 
+// sendVerificationOrAutoVerify issues and emails a verification token when
+// verification is required; otherwise it marks the new account verified.
+func (h *AuthHandler) sendVerificationOrAutoVerify(r *http.Request, userID, email string) {
+	if !config.Default.EmailVerificationRequired {
+		_ = h.Queries.SetEmailVerified(r.Context(), userID)
+		return
+	}
+	if h.EmailClient == nil {
+		return
+	}
+	vRaw, vHash, err := auth.GenerateRefreshToken()
+	if err != nil {
+		return
+	}
+	expiresAt := time.Now().Add(config.Default.EmailVerificationTTL)
+	if err := h.Queries.InsertEmailVerificationToken(r.Context(), userID, vHash, expiresAt); err != nil {
+		return
+	}
+	_ = h.EmailClient.SendVerificationEmail(email, emailLink("/verify-email", vRaw))
+}
+
 // --- Registration -----------------------------------------------------------
 
 func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
-	var req AuthRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	req, ok := decodeRegistrationRequest(w, r)
+	if !ok {
 		return
 	}
-	req.Email = normalizeEmail(req.Email)
-	if req.Email == "" || req.Password == "" {
-		writeError(w, http.StatusBadRequest, "email and password are required")
-		return
-	}
-	if err := auth.ValidatePasswordPolicy(req.Password); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
 	// Detect 409 cases up-front for a clearer message.
-	if existing, _ := h.Queries.GetUserByEmail(r.Context(), req.Email); existing != nil {
-		if existing.PasswordHash != nil {
-			writeError(w, http.StatusConflict, "An account with this email already exists.")
-			return
-		}
-		if existing.GoogleSub != nil {
-			writeError(w, http.StatusConflict, "This email is registered with Google. Please sign in with Google.")
-			return
-		}
-	}
-
-	hash, err := auth.HashPassword(req.Password)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to process password")
+	if !h.requireRegistrationFree(w, r, req.Email) {
 		return
 	}
-
-	user, err := h.Queries.CreateUserWithPassword(r.Context(), req.Email, hash)
-	if err != nil {
-		writeError(w, http.StatusConflict, "email already registered or database error")
+	user, ok := h.createUserWithPassword(w, r, req)
+	if !ok {
 		return
 	}
-
 	// Create default workspace for new user (multi-seat workspaces change).
 	if h.DefaultWorkspaceCreator != nil {
 		_ = h.DefaultWorkspaceCreator(user.ID)
 	}
-
-	// Issue tokens.
-	accessTok, _, err := auth.IssueAccessToken(user.ID, user.TokenVersion)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to issue access token")
+	accessTok, ok := h.issueRegistrationTokens(w, r, user)
+	if !ok {
 		return
 	}
-	refreshRaw, refreshExp, err := auth.IssueRefreshToken(r.Context(), refreshStore{h.Queries}, user.ID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to issue refresh token")
-		return
-	}
-	setRefreshTokenCookie(w, refreshRaw, refreshExp, h.CookieSecure)
-
 	// Issue verification token + email (only when verification is required).
-	if config.Default.EmailVerificationRequired {
-		if h.EmailClient != nil {
-			if vRaw, vHash, err := auth.GenerateRefreshToken(); err == nil {
-				expiresAt := time.Now().Add(config.Default.EmailVerificationTTL)
-				if err := h.Queries.InsertEmailVerificationToken(r.Context(), user.ID, vHash, expiresAt); err == nil {
-					_ = h.EmailClient.SendVerificationEmail(req.Email, emailLink("/verify-email", vRaw))
-				}
-			}
-		}
-	} else {
-		_ = h.Queries.SetEmailVerified(r.Context(), user.ID)
-	}
-
+	h.sendVerificationOrAutoVerify(r, user.ID, req.Email)
 	writeJSON(w, http.StatusCreated, map[string]string{
 		"access_token": accessTok,
 		"message":      "check inbox to verify account",
 	})
+}
+
+// decodeRegistrationRequest normalizes and validates the signup payload.
+func decodeRegistrationRequest(w http.ResponseWriter, r *http.Request) (AuthRequest, bool) {
+	var req AuthRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return req, false
+	}
+	req.Email = normalizeEmail(req.Email)
+	if req.Email == "" || req.Password == "" {
+		writeError(w, http.StatusBadRequest, "email and password are required")
+		return req, false
+	}
+	if err := auth.ValidatePasswordPolicy(req.Password); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return req, false
+	}
+	return req, true
+}
+
+// requireRegistrationFree rejects emails that already have a password or
+// Google account; a Google-only row without password keeps its merge path.
+func (h *AuthHandler) requireRegistrationFree(w http.ResponseWriter, r *http.Request, email string) bool {
+	existing, _ := h.Queries.GetUserByEmail(r.Context(), email)
+	if existing == nil {
+		return true
+	}
+	if existing.PasswordHash != nil {
+		writeError(w, http.StatusConflict, "An account with this email already exists.")
+		return false
+	}
+	if existing.GoogleSub != nil {
+		writeError(w, http.StatusConflict, "This email is registered with Google. Please sign in with Google.")
+		return false
+	}
+	return true
+}
+
+func (h *AuthHandler) createUserWithPassword(w http.ResponseWriter, r *http.Request, req AuthRequest) (*db.User, bool) {
+	hash, err := auth.HashPassword(req.Password)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to process password")
+		return nil, false
+	}
+	user, err := h.Queries.CreateUserWithPassword(r.Context(), req.Email, hash)
+	if err != nil {
+		writeError(w, http.StatusConflict, "email already registered or database error")
+		return nil, false
+	}
+	return user, true
+}
+
+// issueRegistrationTokens opens the new session: access JWT + refresh cookie.
+func (h *AuthHandler) issueRegistrationTokens(w http.ResponseWriter, r *http.Request, user *db.User) (string, bool) {
+	accessTok, ok := h.issueAccessOr500(w, user)
+	if !ok {
+		return "", false
+	}
+	if err := h.setRefreshCookie(r.Context(), w, user.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to issue refresh token")
+		return "", false
+	}
+	return accessTok, true
 }
 
 // --- Login ------------------------------------------------------------------
@@ -509,77 +545,121 @@ func (h *AuthHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 // reissues the current session — a fresh refresh-token row + access token +
 // HttpOnly cookie — so the browser that made the request stays signed in.
 func (h *AuthHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
+	user, req, ok := h.requirePasswordChange(w, r)
+	if !ok {
+		return
+	}
+	if !h.applyNewPassword(w, r, user, req.NewPassword) {
+		return
+	}
+	// Reissue the current session with the new token_version so the access
+	// token stays valid and the browser receives a fresh refresh cookie.
+	h.reissueSession(w, r, user.ID)
+}
+
+// requirePasswordChange gates the flow: password account, valid body, and
+// the current password must verify.
+func (h *AuthHandler) requirePasswordChange(w http.ResponseWriter, r *http.Request) (*db.User, changePasswordRequest, bool) {
+	user, ok := h.requirePasswordAccount(w, r)
+	if !ok {
+		return nil, changePasswordRequest{}, false
+	}
+	req, ok := decodeChangePasswordRequest(w, r)
+	if !ok {
+		return user, req, false
+	}
+	if !h.verifyCurrentPassword(w, user, req.CurrentPassword) {
+		return user, req, false
+	}
+	return user, req, true
+}
+
+type changePasswordRequest struct {
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password"`
+}
+
+// requirePasswordAccount loads the caller's password-backed account.
+func (h *AuthHandler) requirePasswordAccount(w http.ResponseWriter, r *http.Request) (*db.User, bool) {
 	userID, ok := r.Context().Value(UserIDKey).(string)
 	if !ok || userID == "" {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
-		return
+		return nil, false
 	}
 	user, err := h.Queries.GetUserByID(r.Context(), userID)
 	if err != nil || user == nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
-		return
+		return nil, false
 	}
 	if user.PasswordHash == nil {
 		writeError(w, http.StatusBadRequest, "this account has no password set")
-		return
+		return nil, false
 	}
+	return user, true
+}
 
-	var req struct {
-		CurrentPassword string `json:"current_password"`
-		NewPassword     string `json:"new_password"`
-	}
+func decodeChangePasswordRequest(w http.ResponseWriter, r *http.Request) (changePasswordRequest, bool) {
+	var req changePasswordRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
+		return req, false
 	}
 	if req.CurrentPassword == "" || req.NewPassword == "" {
 		writeError(w, http.StatusBadRequest, "current_password and new_password are required")
-		return
+		return req, false
 	}
 	if err := auth.ValidatePasswordPolicy(req.NewPassword); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
-		return
+		return req, false
 	}
-	if !auth.VerifyPassword(*user.PasswordHash, req.CurrentPassword) {
-		writeError(w, http.StatusUnauthorized, "current password is incorrect")
-		return
-	}
+	return req, true
+}
 
-	newHash, err := auth.HashPassword(req.NewPassword)
+// verifyCurrentPassword checks the supplied password against the stored hash.
+func (h *AuthHandler) verifyCurrentPassword(w http.ResponseWriter, user *db.User, current string) bool {
+	if auth.VerifyPassword(*user.PasswordHash, current) {
+		return true
+	}
+	writeError(w, http.StatusUnauthorized, "current password is incorrect")
+	return false
+}
+
+// applyNewPassword stores the new hash, then revokes every session
+// (token_version bump + refresh-token wipe).
+func (h *AuthHandler) applyNewPassword(w http.ResponseWriter, r *http.Request, user *db.User, newPassword string) bool {
+	newHash, err := auth.HashPassword(newPassword)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to process password")
-		return
+		return false
 	}
 	if err := h.Queries.UpdatePasswordHash(r.Context(), user.ID, newHash); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to update password")
-		return
+		return false
 	}
-	// Invalidate every other session; the current one is reissued below.
 	if err := h.Queries.IncrementTokenVersion(r.Context(), user.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to revoke sessions")
-		return
+		return false
 	}
 	_ = h.Queries.DeleteAllRefreshTokensForUser(r.Context(), user.ID)
+	return true
+}
 
-	// Reissue the current session with the new token_version so the access
-	// token stays valid and the browser receives a fresh refresh cookie.
-	cur, err := h.Queries.GetUserByID(r.Context(), user.ID)
+// reissueSession loads the bumped user row and returns a fresh access token
+// + refresh cookie for the current session only.
+func (h *AuthHandler) reissueSession(w http.ResponseWriter, r *http.Request, userID string) {
+	cur, err := h.Queries.GetUserByID(r.Context(), userID)
 	if err != nil || cur == nil {
 		writeError(w, http.StatusInternalServerError, "failed to refresh session")
 		return
 	}
-	accessTok, _, err := auth.IssueAccessToken(cur.ID, cur.TokenVersion)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to issue access token")
+	accessTok, ok := h.issueAccessOr500(w, cur)
+	if !ok {
 		return
 	}
-	refreshRaw, refreshExp, err := auth.IssueRefreshToken(r.Context(), refreshStore{h.Queries}, cur.ID)
-	if err != nil {
+	if err := h.setRefreshCookie(r.Context(), w, cur.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to issue refresh token")
 		return
 	}
-	setRefreshTokenCookie(w, refreshRaw, refreshExp, h.CookieSecure)
-
 	writeJSON(w, http.StatusOK, map[string]string{
 		"message":      "password updated",
 		"access_token": accessTok,
@@ -801,45 +881,70 @@ func (h *AuthHandler) GoogleCallback(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// Preserve historical error messages of the redirect handler so any
 		// existing observability stays meaningful.
-		msg := err.Error()
-		switch {
-		case strings.Contains(msg, "state mismatch"):
-			writeError(w, http.StatusBadRequest, "state mismatch")
-		case strings.Contains(msg, "missing code"):
-			writeError(w, http.StatusBadRequest, "missing code")
-		case strings.Contains(msg, "invalid id token"):
-			writeError(w, http.StatusBadRequest, "invalid id token")
-		case strings.Contains(msg, "failed to create user"):
-			writeError(w, http.StatusInternalServerError, "failed to create user")
-		default:
-			writeError(w, http.StatusBadRequest, "invalid oauth state")
-		}
+		writeGoogleError(w, err, googleRedirectErrorRules, http.StatusBadRequest, "invalid oauth state")
 		return
 	}
+	h.redirectGoogleOutcome(w, r, result, strings.TrimRight(config.Default.AppBaseURL, "/"))
+}
 
-	base := strings.TrimRight(config.Default.AppBaseURL, "/")
+// postSignInPaths maps a callback outcome to the redirect landing page.
+var postSignInPaths = map[googleCallbackOutcome]string{
+	googleOutcomeReturningUser:      "/dashboard",
+	googleOutcomeLinkExistingGoogle: "/dashboard",
+	googleOutcomeNewUser:            "/onboarding",
+}
 
-	switch result.Outcome {
-	case googleOutcomeLinkRequired:
-		http.Redirect(w, r,
-			fmt.Sprintf("%s/auth/link-google?email=%s&sub=%s", base, result.Email, result.Sub),
-			http.StatusFound)
-		return
-	case googleOutcomeReturningUser, googleOutcomeLinkExistingGoogle:
-		if err := h.signInAndIssue(w, r, result.User); err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to sign in")
-			return
-		}
-		http.Redirect(w, r, base+"/dashboard", http.StatusFound)
-		return
-	case googleOutcomeNewUser:
-		if err := h.signInAndIssue(w, r, result.User); err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to sign in")
-			return
-		}
-		http.Redirect(w, r, base+"/onboarding", http.StatusFound)
+// redirectGoogleOutcome turns a successful callback into a 302:
+// link_required goes to the link page, signed-in outcomes to their
+// post-sign-in destination.
+func (h *AuthHandler) redirectGoogleOutcome(w http.ResponseWriter, r *http.Request, result *googleCallbackResult, base string) {
+	if result.Outcome == googleOutcomeLinkRequired {
+		http.Redirect(w, r, fmt.Sprintf("%s/auth/link-google?email=%s&sub=%s", base, result.Email, result.Sub), http.StatusFound)
 		return
 	}
+	dest, ok := postSignInPaths[result.Outcome]
+	if !ok {
+		return
+	}
+	if err := h.signInAndIssue(w, r, result.User); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to sign in")
+		return
+	}
+	http.Redirect(w, r, base+dest, http.StatusFound)
+}
+
+// googleErrorRule maps a processGoogleCallback error-message fragment to the
+// HTTP response each flow should emit for it.
+type googleErrorRule struct {
+	needle string
+	status int
+	msg    string
+}
+
+var googleRedirectErrorRules = []googleErrorRule{
+	{"state mismatch", http.StatusBadRequest, "state mismatch"},
+	{"missing code", http.StatusBadRequest, "missing code"},
+	{"invalid id token", http.StatusBadRequest, "invalid id token"},
+	{"failed to create user", http.StatusInternalServerError, "failed to create user"},
+}
+
+var googleJSONErrorRules = []googleErrorRule{
+	{"state mismatch", http.StatusBadRequest, "invalid_state"},
+	{"missing code", http.StatusBadRequest, "invalid_code"},
+	{"invalid id token", http.StatusBadRequest, "invalid_id_token"},
+	{"failed to create user", http.StatusInternalServerError, "failed to create user"},
+}
+
+// writeGoogleError classifies a pipeline error against a rule table;
+// unrecognised errors get the fallback response.
+func writeGoogleError(w http.ResponseWriter, err error, rules []googleErrorRule, fallbackStatus int, fallbackMsg string) {
+	for _, rule := range rules {
+		if strings.Contains(err.Error(), rule.needle) {
+			writeError(w, rule.status, rule.msg)
+			return
+		}
+	}
+	writeError(w, fallbackStatus, fallbackMsg)
 }
 
 // --- Google JSON popup-flow endpoints (auth-google-popup-endpoints) --------
@@ -902,46 +1007,60 @@ func (h *AuthHandler) GoogleCallbackJSON(w http.ResponseWriter, r *http.Request)
 
 	result, err := h.processGoogleCallback(r.Context(), req.Code, req.State, stateCookie, redirectURI)
 	if err != nil {
-		msg := err.Error()
-		switch {
-		case strings.Contains(msg, "state mismatch"):
-			writeError(w, http.StatusBadRequest, "invalid_state")
-		case strings.Contains(msg, "missing code"):
-			writeError(w, http.StatusBadRequest, "invalid_code")
-		case strings.Contains(msg, "invalid id token"):
-			writeError(w, http.StatusBadRequest, "invalid_id_token")
-		case strings.Contains(msg, "failed to create user"):
-			writeError(w, http.StatusInternalServerError, "failed to create user")
-		default:
-			writeError(w, http.StatusBadRequest, "invalid_state")
-		}
+		writeGoogleError(w, err, googleJSONErrorRules, http.StatusBadRequest, "invalid_state")
 		return
 	}
+	h.respondGoogleOutcomeJSON(w, r, result)
+}
 
-	switch result.Outcome {
-	case googleOutcomeLinkRequired:
-		writeJSON(w, http.StatusConflict, map[string]string{
-			"error":    "link_required",
-			"email":    result.Email,
-			"sub":      result.Sub,
-			"id_token": result.IDToken,
-		})
-		return
-	case googleOutcomeReturningUser, googleOutcomeNewUser, googleOutcomeLinkExistingGoogle:
-		access, _, err := auth.IssueAccessToken(result.User.ID, result.User.TokenVersion)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to issue access token")
-			return
-		}
-		refreshRaw, refreshExp, err := auth.IssueRefreshToken(r.Context(), refreshStore{h.Queries}, result.User.ID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to issue refresh token")
-			return
-		}
-		setRefreshTokenCookie(w, refreshRaw, refreshExp, h.CookieSecure)
-		writeJSON(w, http.StatusOK, map[string]string{"access_token": access})
+// respondGoogleOutcomeJSON turns a callback result into JSON: link_required
+// gets the 409 pairing payload, signed-in outcomes get token issuance.
+func (h *AuthHandler) respondGoogleOutcomeJSON(w http.ResponseWriter, r *http.Request, result *googleCallbackResult) {
+	if result.Outcome != googleOutcomeLinkRequired {
+		h.writeGoogleTokensJSON(w, r, result.User)
 		return
 	}
+	writeJSON(w, http.StatusConflict, map[string]string{
+		"error":    "link_required",
+		"email":    result.Email,
+		"sub":      result.Sub,
+		"id_token": result.IDToken,
+	})
+}
+
+// writeGoogleTokensJSON issues access + refresh tokens and returns the access
+// token in the same shape as POST /auth/login.
+func (h *AuthHandler) writeGoogleTokensJSON(w http.ResponseWriter, r *http.Request, user *db.User) {
+	access, ok := h.issueAccessOr500(w, user)
+	if !ok {
+		return
+	}
+	if err := h.setRefreshCookie(r.Context(), w, user.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to issue refresh token")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"access_token": access})
+}
+
+// issueAccessOr500 issues an access token; on failure it writes the 500 and
+// reports false.
+func (h *AuthHandler) issueAccessOr500(w http.ResponseWriter, user *db.User) (string, bool) {
+	access, _, err := auth.IssueAccessToken(user.ID, user.TokenVersion)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to issue access token")
+		return "", false
+	}
+	return access, true
+}
+
+// setRefreshCookie issues a refresh token and sets it as an HttpOnly cookie.
+func (h *AuthHandler) setRefreshCookie(ctx context.Context, w http.ResponseWriter, userID string) error {
+	refreshRaw, refreshExp, err := auth.IssueRefreshToken(ctx, refreshStore{h.Queries}, userID)
+	if err != nil {
+		return err
+	}
+	setRefreshTokenCookie(w, refreshRaw, refreshExp, h.CookieSecure)
+	return nil
 }
 
 // Me returns the authenticated user's profile in the same shape as

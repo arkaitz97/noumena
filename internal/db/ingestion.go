@@ -396,18 +396,7 @@ func (q *SQLiteQuery) GetSyncStatus(ctx context.Context, platformChannelID, requ
 	}
 
 	out := &SyncStatus{LastSyncedAt: parseTimePtr(lastSyncedAt)}
-
-	if lastSyncedAt.Valid {
-		ls := parseTime(lastSyncedAt.String)
-		nxt := ls.Add(30 * time.Minute)
-		if bu := parseTime(backoffUntil.String); backoffUntil.Valid && bu.After(nxt) {
-			nxt = bu
-		}
-		out.NextSyncAt = &nxt
-	} else if backoffUntil.Valid {
-		bu := parseTime(backoffUntil.String)
-		out.NextSyncAt = &bu
-	}
+	out.NextSyncAt = nextSyncAt(lastSyncedAt, backoffUntil)
 
 	if backfillInProgress && lastSyncedAt.Valid && backfillDays > 0 {
 		horizon := time.Now().Add(-time.Duration(backfillDays) * 24 * time.Hour)

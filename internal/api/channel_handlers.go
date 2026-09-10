@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"golang.org/x/oauth2"
 
 	"noumena/internal/auth"
 	"noumena/internal/billing"
@@ -146,29 +147,33 @@ func (h *ChannelHandler) List(w http.ResponseWriter, r *http.Request) {
 
 func (h *ChannelHandler) ConnectYouTube(w http.ResponseWriter, r *http.Request) {
 	userID, _ := r.Context().Value(UserIDKey).(string)
+	raw, ok := h.issueOAuthState(w, r, userID)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"auth_url": oauth.BuildAuthURL(raw),
+		"state":    raw,
+	})
+}
 
+// issueOAuthState mints a CSRF state and persists its hash for this user;
+// returns the raw state, or false after writing the error response.
+func (h *ChannelHandler) issueOAuthState(w http.ResponseWriter, r *http.Request, userID string) (string, bool) {
 	raw, hash, err := generateOAuthState()
 	if err != nil {
 		writeChannelError(w, http.StatusInternalServerError, "state_generation_failed", "could not generate state")
-		return
+		return "", false
 	}
-
 	ttl := config.Default.OAuthStateTTL
 	if ttl <= 0 {
 		ttl = 10 * time.Minute
 	}
-	expiresAt := time.Now().Add(ttl)
-
-	if err := h.Queries.InsertOAuthState(r.Context(), hash, userID, expiresAt); err != nil {
+	if err := h.Queries.InsertOAuthState(r.Context(), hash, userID, time.Now().Add(ttl)); err != nil {
 		writeChannelError(w, http.StatusInternalServerError, "state_persist_failed", "could not persist state")
-		return
+		return "", false
 	}
-
-	authURL := oauth.BuildAuthURL(raw)
-	writeJSON(w, http.StatusOK, map[string]string{
-		"auth_url": authURL,
-		"state":    raw,
-	})
+	return raw, true
 }
 
 // ============================================================================
@@ -183,139 +188,223 @@ type exchangeYouTubeRequest struct {
 
 func (h *ChannelHandler) ExchangeYouTubeCode(w http.ResponseWriter, r *http.Request) {
 	userID, _ := r.Context().Value(UserIDKey).(string)
+	req, ok := decodeExchangeYouTubeRequest(w, r)
+	if !ok {
+		return
+	}
+	// Validate CSRF state against the per-user store and consume it.
+	if !h.consumeOAuthState(w, r, userID, req.State) {
+		return
+	}
+	// Plan-limit guard (billing change, task 7.1). Agency is unlimited.
+	// Performed AFTER the CSRF check so an attacker cannot probe the billing
+	// limits without a valid OAuth flow, but BEFORE we burn a one-time
+	// Google authorization code.
+	if !h.requirePlanCapacity(w, r, userID) {
+		return
+	}
+	token, info, ok := exchangeOAuthCode(w, r, req.Code)
+	if !ok {
+		return
+	}
+	// Encrypt tokens before any DB write.
+	accessEnc, refreshEnc, ok := encryptTokenPair(w, token)
+	if !ok {
+		return
+	}
+	// Upsert shared channel and create / update tracking.
+	tc, ok := h.trackNewChannel(w, r, userID, info, accessEnc, refreshEnc, tokenExpiryOrNow(token), req.BackfillDays)
+	if !ok {
+		return
+	}
+	h.enqueueNewChannelBackfill(r, tc, req.BackfillDays)
+	writeTracking(w, tc, info.DisplayName)
+}
 
+func decodeExchangeYouTubeRequest(w http.ResponseWriter, r *http.Request) (exchangeYouTubeRequest, bool) {
 	var req exchangeYouTubeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeChannelError(w, http.StatusBadRequest, "invalid_body", "could not decode request body")
-		return
+		return req, false
 	}
 	if req.Code == "" {
 		writeChannelError(w, http.StatusBadRequest, "invalid_code", "code is required")
-		return
+		return req, false
 	}
 	if req.State == "" {
 		writeChannelError(w, http.StatusBadRequest, "invalid_state", "state is required")
-		return
+		return req, false
 	}
-	if req.BackfillDays == 0 {
-		req.BackfillDays = 90
-	}
-	if !validBackfillDaysAPI(req.BackfillDays) {
-		writeChannelError(w, http.StatusBadRequest, "invalid_backfill_days", "backfill_days must be 30, 60, 90, or 180")
-		return
-	}
+	return req, validateBackfillDays(w, &req.BackfillDays)
+}
 
-	// Validate CSRF state against the per-user store and consume it.
-	hash := hashOAuthState(req.State)
-	ok, err := h.Queries.ConsumeOAuthState(r.Context(), hash, userID)
+// validateBackfillDays applies the 90-day default and rejects windows
+// outside the supported set.
+func validateBackfillDays(w http.ResponseWriter, days *int) bool {
+	if *days == 0 {
+		*days = 90
+	}
+	if validBackfillDaysAPI(*days) {
+		return true
+	}
+	writeChannelError(w, http.StatusBadRequest, "invalid_backfill_days", "backfill_days must be 30, 60, 90, or 180")
+	return false
+}
+
+// consumeOAuthState validates the CSRF state and burns it (single use).
+func (h *ChannelHandler) consumeOAuthState(w http.ResponseWriter, r *http.Request, userID, state string) bool {
+	ok, err := h.Queries.ConsumeOAuthState(r.Context(), hashOAuthState(state), userID)
 	if err != nil {
 		writeChannelError(w, http.StatusInternalServerError, "state_check_failed", "could not validate state")
-		return
+		return false
 	}
-	if !ok {
-		writeChannelError(w, http.StatusBadRequest, "invalid_state", "state is missing, expired, or already used")
-		return
+	if ok {
+		return true
 	}
+	writeChannelError(w, http.StatusBadRequest, "invalid_state", "state is missing, expired, or already used")
+	return false
+}
 
-	// Plan-limit guard (billing change, task 7.1). Agency is unlimited.
-	// We perform this AFTER the CSRF check so an attacker cannot probe the
-	// billing limits without a valid OAuth flow, but BEFORE we burn a
-	// one-time Google authorization code.
-	if blocked, _ := checkChannelLimit(r.Context(), h.Queries, userID); blocked {
-		writeChannelError(w, http.StatusPaymentRequired, "plan_limit_reached",
-			"channel limit reached for the current plan; upgrade to add more channels")
-		return
+// requirePlanCapacity writes 402 when the user's plan is at its channel cap.
+func (h *ChannelHandler) requirePlanCapacity(w http.ResponseWriter, r *http.Request, userID string) bool {
+	if blocked, _ := checkChannelLimit(r.Context(), h.Queries, userID); !blocked {
+		return true
 	}
+	writeChannelError(w, http.StatusPaymentRequired, "plan_limit_reached",
+		"channel limit reached for the current plan; upgrade to add more channels")
+	return false
+}
 
-	// Exchange the code and fetch the channel metadata.
-	token, info, err := oauth.ExchangeAndFetchChannel(r.Context(), req.Code)
-	if err != nil {
-		if errors.Is(err, oauth.ErrNoRefreshToken) {
-			writeChannelError(w, http.StatusBadRequest, "no_refresh_token",
-				"google did not return a refresh token; revoke the app at myaccount.google.com/permissions and try again")
-			return
-		}
-		writeChannelError(w, http.StatusBadRequest, "exchange_failed", err.Error())
-		return
+// exchangeOAuthCode swaps the one-time code and fetches the channel metadata.
+func exchangeOAuthCode(w http.ResponseWriter, r *http.Request, code string) (*oauth2.Token, *ingestion.ChannelInfo, bool) {
+	token, info, err := oauth.ExchangeAndFetchChannel(r.Context(), code)
+	if err == nil {
+		return token, info, true
 	}
+	if errors.Is(err, oauth.ErrNoRefreshToken) {
+		writeChannelError(w, http.StatusBadRequest, "no_refresh_token",
+			"google did not return a refresh token; revoke the app at myaccount.google.com/permissions and try again")
+		return nil, nil, false
+	}
+	writeChannelError(w, http.StatusBadRequest, "exchange_failed", err.Error())
+	return nil, nil, false
+}
 
-	// Encrypt tokens before any DB write.
+// encryptTokenPair encrypts both tokens before any DB write.
+func encryptTokenPair(w http.ResponseWriter, token *oauth2.Token) (accessEnc, refreshEnc string, ok bool) {
 	accessEnc, err := auth.Encrypt(token.AccessToken)
 	if err != nil {
 		writeChannelError(w, http.StatusInternalServerError, "encryption_failed", "could not encrypt access token")
-		return
+		return "", "", false
 	}
-	refreshEnc, err := auth.Encrypt(token.RefreshToken)
+	refreshEnc, err = auth.Encrypt(token.RefreshToken)
 	if err != nil {
 		writeChannelError(w, http.StatusInternalServerError, "encryption_failed", "could not encrypt refresh token")
-		return
+		return "", "", false
 	}
+	return accessEnc, refreshEnc, true
+}
 
-	// Upsert shared channel and create / update tracking.
+// tokenExpiryOrNow is the persisted access-token expiry; zero means +1h.
+func tokenExpiryOrNow(token *oauth2.Token) time.Time {
+	if token.Expiry.IsZero() {
+		return time.Now().Add(1 * time.Hour)
+	}
+	return token.Expiry
+}
+
+// trackedChannel is the result of registering a shared channel for a user.
+type trackedChannel struct {
+	pcID     string
+	tracking *db.UserChannelTracking
+	inserted bool // platform_channels row newly created
+}
+
+// trackNewChannel upserts the shared platform channel and records the
+// caller's tracking row with the next token priority.
+func (h *ChannelHandler) trackNewChannel(w http.ResponseWriter, r *http.Request, userID string,
+	info *ingestion.ChannelInfo, accessEnc, refreshEnc string, expires time.Time, backfillDays int) (trackedChannel, bool) {
 	pcID, inserted, err := h.Queries.UpsertPlatformChannel(r.Context(), "youtube", info.ID, info.DisplayName)
 	if err != nil {
 		writeChannelError(w, http.StatusInternalServerError, "channel_upsert_failed", "could not upsert channel")
-		return
+		return trackedChannel{}, false
 	}
-
-	// Reject if the user already tracks this channel.
-	existing, err := h.Queries.GetUserTracking(r.Context(), userID, pcID)
-	if err != nil && !errors.Is(err, db.ErrNotFound) {
-		writeChannelError(w, http.StatusInternalServerError, "tracking_lookup_failed", "could not check existing tracking")
-		return
+	if !h.requireNotTracked(w, r, userID, pcID) {
+		return trackedChannel{}, false
 	}
-	if existing != nil {
-		writeChannelError(w, http.StatusConflict, "already_tracked", "channel is already tracked")
-		return
+	prio, ok := h.nextTokenPriority(w, r.Context(), pcID)
+	if !ok {
+		return trackedChannel{}, false
 	}
-
-	// Compute token_priority. First active tracker → 0, otherwise MAX+1.
-	maxPrio, err := h.Queries.GetMaxTokenPriority(r.Context(), pcID)
-	if err != nil {
-		writeChannelError(w, http.StatusInternalServerError, "priority_lookup_failed", "could not compute token priority")
-		return
-	}
-	prio := 0
-	if maxPrio >= 0 {
-		prio = maxPrio + 1
-	}
-
-	expires := token.Expiry
-	if expires.IsZero() {
-		expires = time.Now().Add(1 * time.Hour)
-	}
-
 	// Atomic plan-limit guard at write time (single-statement
 	// INSERT...SELECT...WHERE). Unlimited plans pass channelLimit=0 and
 	// skip the guarded insert.
 	tracking, err := insertTrackingRow(r.Context(), h.Queries, userID, pcID,
-		accessEnc, refreshEnc, expires, req.BackfillDays, prio,
+		accessEnc, refreshEnc, expires, backfillDays, prio,
 		planChannelLimit(r.Context(), h.Queries, userID))
+	if err != nil {
+		h.writeTrackingInsertError(w, err)
+		return trackedChannel{}, false
+	}
+	return trackedChannel{pcID: pcID, tracking: tracking, inserted: inserted}, true
+}
+
+// requireNotTracked rejects a second tracking row for the same channel.
+func (h *ChannelHandler) requireNotTracked(w http.ResponseWriter, r *http.Request, userID, pcID string) bool {
+	existing, err := h.Queries.GetUserTracking(r.Context(), userID, pcID)
+	if err != nil && !errors.Is(err, db.ErrNotFound) {
+		writeChannelError(w, http.StatusInternalServerError, "tracking_lookup_failed", "could not check existing tracking")
+		return false
+	}
+	if existing == nil {
+		return true
+	}
+	writeChannelError(w, http.StatusConflict, "already_tracked", "channel is already tracked")
+	return false
+}
+
+// nextTokenPriority gives the first active tracker 0, later trackers MAX+1.
+func (h *ChannelHandler) nextTokenPriority(w http.ResponseWriter, ctx context.Context, pcID string) (int, bool) {
+	maxPrio, err := h.Queries.GetMaxTokenPriority(ctx, pcID)
+	if err != nil {
+		writeChannelError(w, http.StatusInternalServerError, "priority_lookup_failed", "could not compute token priority")
+		return 0, false
+	}
+	if maxPrio < 0 {
+		return 0, true
+	}
+	return maxPrio + 1, true
+}
+
+func (h *ChannelHandler) writeTrackingInsertError(w http.ResponseWriter, err error) {
 	if errors.Is(err, db.ErrChannelLimitExceeded) {
 		writeChannelError(w, http.StatusPaymentRequired, "plan_limit_reached",
 			"channel limit reached for the current plan; upgrade to add more channels")
 		return
 	}
-	if err != nil {
-		writeChannelError(w, http.StatusInternalServerError, "tracking_create_failed",
-			"could not create tracking row")
+	writeChannelError(w, http.StatusInternalServerError, "tracking_create_failed", "could not create tracking row")
+}
+
+// enqueueNewChannelBackfill schedules the initial backfill for a brand-new
+// shared channel; enqueue failures never fail the connect.
+func (h *ChannelHandler) enqueueNewChannelBackfill(r *http.Request, tc trackedChannel, days int) {
+	if !tc.inserted || h.BackfillEnqueuer == nil {
 		return
 	}
-
-	if inserted && h.BackfillEnqueuer != nil {
-		if err := h.BackfillEnqueuer.EnqueueBackfill(r.Context(), pcID, req.BackfillDays); err != nil {
-			log.Printf("backfill enqueue failed for channel %s: %v", pcID, err)
-		}
+	if err := h.BackfillEnqueuer.EnqueueBackfill(r.Context(), tc.pcID, days); err != nil {
+		log.Printf("backfill enqueue failed for channel %s: %v", tc.pcID, err)
 	}
+}
 
+func writeTracking(w http.ResponseWriter, tc trackedChannel, displayName string) {
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
-		"id":                  tracking.ID,
-		"platform_channel_id": pcID,
-		"display_name":        info.DisplayName,
-		"tracking_status":     tracking.TrackingStatus,
-		"token_priority":      tracking.TokenPriority,
-		"backfill_days":       tracking.BackfillDays,
-		"token_expires_at":    tracking.TokenExpiresAt,
+		"id":                  tc.tracking.ID,
+		"platform_channel_id": tc.pcID,
+		"display_name":        displayName,
+		"tracking_status":     tc.tracking.TrackingStatus,
+		"token_priority":      tc.tracking.TokenPriority,
+		"backfill_days":       tc.tracking.BackfillDays,
+		"token_expires_at":    tc.tracking.TokenExpiresAt,
 	})
 }
 
@@ -332,21 +421,8 @@ type connectByNameRequest struct {
 
 func (h *ChannelHandler) ConnectYouTubeByName(w http.ResponseWriter, r *http.Request) {
 	userID, _ := r.Context().Value(UserIDKey).(string)
-
-	var req connectByNameRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeChannelError(w, http.StatusBadRequest, "invalid_body", "could not decode request body")
-		return
-	}
-	if strings.TrimSpace(req.Ref) == "" {
-		writeChannelError(w, http.StatusBadRequest, "invalid_ref", "ref is required (a @handle or channel URL)")
-		return
-	}
-	if req.BackfillDays == 0 {
-		req.BackfillDays = 90
-	}
-	if !validBackfillDaysAPI(req.BackfillDays) {
-		writeChannelError(w, http.StatusBadRequest, "invalid_backfill_days", "backfill_days must be 30, 60, 90, or 180")
+	req, ok := decodeConnectByNameRequest(w, r)
+	if !ok {
 		return
 	}
 	if h.YouTubeResolver == nil {
@@ -354,80 +430,37 @@ func (h *ChannelHandler) ConnectYouTubeByName(w http.ResponseWriter, r *http.Req
 			"public channel tracking is not configured on this server")
 		return
 	}
-
 	// Plan-limit guard: same semantics as the OAuth exchange, before any
 	// external resolution work.
-	if blocked, _ := checkChannelLimit(r.Context(), h.Queries, userID); blocked {
-		writeChannelError(w, http.StatusPaymentRequired, "plan_limit_reached",
-			"channel limit reached for the current plan; upgrade to add more channels")
+	if !h.requirePlanCapacity(w, r, userID) {
 		return
 	}
-
 	info, err := h.YouTubeResolver.ResolveChannelRef(r.Context(), req.Ref)
 	if err != nil {
 		writeChannelError(w, http.StatusBadRequest, "resolve_failed", err.Error())
 		return
 	}
-
-	// Upsert shared channel and create / update tracking (same shared-row
-	// semantics as the OAuth flow; tokenless rows are ingestion-key-driven).
-	pcID, inserted, err := h.Queries.UpsertPlatformChannel(r.Context(), "youtube", info.ID, info.DisplayName)
-	if err != nil {
-		writeChannelError(w, http.StatusInternalServerError, "channel_upsert_failed", "could not upsert channel")
-		return
-	}
-
-	existing, err := h.Queries.GetUserTracking(r.Context(), userID, pcID)
-	if err != nil && !errors.Is(err, db.ErrNotFound) {
-		writeChannelError(w, http.StatusInternalServerError, "tracking_lookup_failed", "could not check existing tracking")
-		return
-	}
-	if existing != nil {
-		writeChannelError(w, http.StatusConflict, "already_tracked", "channel is already tracked")
-		return
-	}
-
-	maxPrio, err := h.Queries.GetMaxTokenPriority(r.Context(), pcID)
-	if err != nil {
-		writeChannelError(w, http.StatusInternalServerError, "priority_lookup_failed", "could not compute token priority")
-		return
-	}
-	prio := 0
-	if maxPrio >= 0 {
-		prio = maxPrio + 1
-	}
-
 	// Tokenless row: empty tokens + zero expiry. Ingestion reads public
 	// data via the server API key; sweeper/revoke skip empty-token rows.
-	tracking, err := insertTrackingRow(r.Context(), h.Queries, userID, pcID,
-		"", "", time.Time{}, req.BackfillDays, prio,
-		planChannelLimit(r.Context(), h.Queries, userID))
-	if errors.Is(err, db.ErrChannelLimitExceeded) {
-		writeChannelError(w, http.StatusPaymentRequired, "plan_limit_reached",
-			"channel limit reached for the current plan; upgrade to add more channels")
+	tc, ok := h.trackNewChannel(w, r, userID, info, "", "", time.Time{}, req.BackfillDays)
+	if !ok {
 		return
 	}
-	if err != nil {
-		writeChannelError(w, http.StatusInternalServerError, "tracking_create_failed",
-			"could not create tracking row")
-		return
-	}
+	h.enqueueNewChannelBackfill(r, tc, req.BackfillDays)
+	writeTracking(w, tc, info.DisplayName)
+}
 
-	if inserted && h.BackfillEnqueuer != nil {
-		if err := h.BackfillEnqueuer.EnqueueBackfill(r.Context(), pcID, req.BackfillDays); err != nil {
-			log.Printf("backfill enqueue failed for channel %s: %v", pcID, err)
-		}
+func decodeConnectByNameRequest(w http.ResponseWriter, r *http.Request) (connectByNameRequest, bool) {
+	var req connectByNameRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeChannelError(w, http.StatusBadRequest, "invalid_body", "could not decode request body")
+		return req, false
 	}
-
-	writeJSON(w, http.StatusCreated, map[string]interface{}{
-		"id":                  tracking.ID,
-		"platform_channel_id": pcID,
-		"display_name":        info.DisplayName,
-		"tracking_status":     tracking.TrackingStatus,
-		"token_priority":      tracking.TokenPriority,
-		"backfill_days":       tracking.BackfillDays,
-		"token_expires_at":    tracking.TokenExpiresAt,
-	})
+	if strings.TrimSpace(req.Ref) == "" {
+		writeChannelError(w, http.StatusBadRequest, "invalid_ref", "ref is required (a @handle or channel URL)")
+		return req, false
+	}
+	return req, validateBackfillDays(w, &req.BackfillDays)
 }
 
 // ============================================================================
@@ -441,36 +474,32 @@ func (h *ChannelHandler) ConnectYouTubeByName(w http.ResponseWriter, r *http.Req
 func (h *ChannelHandler) Reauthorize(w http.ResponseWriter, r *http.Request) {
 	userID, _ := r.Context().Value(UserIDKey).(string)
 	pcID := chi.URLParam(r, "id")
-
-	tracking, err := h.Queries.GetUserTracking(r.Context(), userID, pcID)
-	if err != nil && !errors.Is(err, db.ErrNotFound) {
-		writeChannelError(w, http.StatusInternalServerError, "lookup_failed", "could not check tracking")
+	if _, ok := h.requireTracked(w, r, userID, pcID); !ok {
 		return
 	}
-	if tracking == nil {
-		writeChannelError(w, http.StatusNotFound, "not_found", "channel not tracked")
+	raw, ok := h.issueOAuthState(w, r, userID)
+	if !ok {
 		return
 	}
-
-	raw, hash, err := generateOAuthState()
-	if err != nil {
-		writeChannelError(w, http.StatusInternalServerError, "state_generation_failed", "could not generate state")
-		return
-	}
-	ttl := config.Default.OAuthStateTTL
-	if ttl <= 0 {
-		ttl = 10 * time.Minute
-	}
-	if err := h.Queries.InsertOAuthState(r.Context(), hash, userID, time.Now().Add(ttl)); err != nil {
-		writeChannelError(w, http.StatusInternalServerError, "state_persist_failed", "could not persist state")
-		return
-	}
-
 	writeJSON(w, http.StatusOK, map[string]string{
 		"auth_url":   oauth.BuildAuthURL(raw),
 		"state":      raw,
 		"channel_id": pcID,
 	})
+}
+
+// requireTracked loads the caller's tracking row, writing 404 when absent.
+func (h *ChannelHandler) requireTracked(w http.ResponseWriter, r *http.Request, userID, pcID string) (*db.UserChannelTracking, bool) {
+	tracking, err := h.Queries.GetUserTracking(r.Context(), userID, pcID)
+	if err != nil && !errors.Is(err, db.ErrNotFound) {
+		writeChannelError(w, http.StatusInternalServerError, "lookup_failed", "could not check tracking")
+		return nil, false
+	}
+	if tracking != nil {
+		return tracking, true
+	}
+	writeChannelError(w, http.StatusNotFound, "not_found", "channel not tracked")
+	return nil, false
 }
 
 type reauthorizeExchangeRequest struct {
@@ -485,49 +514,21 @@ type reauthorizeExchangeRequest struct {
 // best-effort.
 func (h *ChannelHandler) ExchangeReauthorize(w http.ResponseWriter, r *http.Request) {
 	userID, _ := r.Context().Value(UserIDKey).(string)
-
-	var req reauthorizeExchangeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeChannelError(w, http.StatusBadRequest, "invalid_body", "could not decode request body")
-		return
-	}
-	if req.Code == "" || req.State == "" || req.ChannelID == "" {
-		writeChannelError(w, http.StatusBadRequest, "invalid_request", "code, state, and channel_id are required")
-		return
-	}
-
-	hash := hashOAuthState(req.State)
-	ok, err := h.Queries.ConsumeOAuthState(r.Context(), hash, userID)
-	if err != nil {
-		writeChannelError(w, http.StatusInternalServerError, "state_check_failed", "could not validate state")
-		return
-	}
+	req, ok := decodeReauthorizeRequest(w, r)
 	if !ok {
-		writeChannelError(w, http.StatusBadRequest, "invalid_state", "state is missing, expired, or already used")
 		return
 	}
-
-	tracking, err := h.Queries.GetUserTracking(r.Context(), userID, req.ChannelID)
-	if err != nil && !errors.Is(err, db.ErrNotFound) {
-		writeChannelError(w, http.StatusInternalServerError, "lookup_failed", "could not check tracking")
+	if !h.consumeOAuthState(w, r, userID, req.State) {
 		return
 	}
-	if tracking == nil {
-		writeChannelError(w, http.StatusNotFound, "not_found", "channel not tracked")
+	tracking, ok := h.requireTracked(w, r, userID, req.ChannelID)
+	if !ok {
 		return
 	}
-
-	token, info, err := oauth.ExchangeAndFetchChannel(r.Context(), req.Code)
-	if err != nil {
-		if errors.Is(err, oauth.ErrNoRefreshToken) {
-			writeChannelError(w, http.StatusBadRequest, "no_refresh_token",
-				"google did not return a refresh token; revoke the app at myaccount.google.com/permissions and try again")
-			return
-		}
-		writeChannelError(w, http.StatusBadRequest, "exchange_failed", err.Error())
+	token, info, ok := exchangeOAuthCode(w, r, req.Code)
+	if !ok {
 		return
 	}
-
 	// The freshly authorized identity must own the channel being re-linked;
 	// otherwise the user signed in as a different YouTube account.
 	if info.ID != tracking.PlatformChannelID {
@@ -535,43 +536,54 @@ func (h *ChannelHandler) ExchangeReauthorize(w http.ResponseWriter, r *http.Requ
 			"the authorized account does not match this channel")
 		return
 	}
-
-	accessEnc, err := auth.Encrypt(token.AccessToken)
-	if err != nil {
-		writeChannelError(w, http.StatusInternalServerError, "encryption_failed", "could not encrypt access token")
+	accessEnc, refreshEnc, ok := encryptTokenPair(w, token)
+	if !ok {
 		return
 	}
-	refreshEnc, err := auth.Encrypt(token.RefreshToken)
-	if err != nil {
-		writeChannelError(w, http.StatusInternalServerError, "encryption_failed", "could not encrypt refresh token")
-		return
-	}
-
-	expires := token.Expiry
-	if expires.IsZero() {
-		expires = time.Now().Add(1 * time.Hour)
-	}
+	expires := tokenExpiryOrNow(token)
 	if err := h.Queries.UpdateTokenAndExpiry(r.Context(), tracking.ID, accessEnc, refreshEnc, expires); err != nil {
 		writeChannelError(w, http.StatusInternalServerError, "update_failed", "could not store new token")
 		return
 	}
+	revokeOldAccessToken(r.Context(), req.ChannelID, tracking.AccessTokenEnc)
+	writeReauthorized(w, tracking, info.DisplayName, expires)
+}
 
-	// Revoke the previous access token (best-effort hygiene).
-	if tracking.AccessTokenEnc != "" {
-		if oldRaw, derr := auth.Decrypt(tracking.AccessTokenEnc); derr == nil && oldRaw != "" {
-			if rerr := oauth.RevokeToken(r.Context(), oldRaw); rerr != nil {
-				log.Printf("reauthorize: revoke old token channel=%s err=%v", req.ChannelID, rerr)
-			}
-		}
+func decodeReauthorizeRequest(w http.ResponseWriter, r *http.Request) (reauthorizeExchangeRequest, bool) {
+	var req reauthorizeExchangeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeChannelError(w, http.StatusBadRequest, "invalid_body", "could not decode request body")
+		return req, false
 	}
+	if req.Code != "" && req.State != "" && req.ChannelID != "" {
+		return req, true
+	}
+	writeChannelError(w, http.StatusBadRequest, "invalid_request", "code, state, and channel_id are required")
+	return req, false
+}
 
+// revokeOldAccessToken is best-effort hygiene for the replaced token.
+func revokeOldAccessToken(ctx context.Context, channelID, accessEnc string) {
+	if accessEnc == "" {
+		return
+	}
+	oldRaw, derr := auth.Decrypt(accessEnc)
+	if derr != nil || oldRaw == "" {
+		return
+	}
+	if rerr := oauth.RevokeToken(ctx, oldRaw); rerr != nil {
+		log.Printf("reauthorize: revoke old token channel=%s err=%v", channelID, rerr)
+	}
+}
+
+func writeReauthorized(w http.ResponseWriter, t *db.UserChannelTracking, displayName string, expires time.Time) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"id":                  tracking.ID,
-		"platform_channel_id": tracking.PlatformChannelID,
-		"display_name":        info.DisplayName,
-		"tracking_status":     tracking.TrackingStatus,
-		"token_priority":      tracking.TokenPriority,
-		"backfill_days":       tracking.BackfillDays,
+		"id":                  t.ID,
+		"platform_channel_id": t.PlatformChannelID,
+		"display_name":        displayName,
+		"tracking_status":     t.TrackingStatus,
+		"token_priority":      t.TokenPriority,
+		"backfill_days":       t.BackfillDays,
 		"token_expires_at":    expires,
 	})
 }
@@ -672,7 +684,8 @@ func (h *ChannelHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	count, err := h.Queries.GetActiveTrackerCount(r.Context(), pcID)
 	if err != nil {
 		log.Printf("active-tracker count after delete failed: %v", err)
-	} else if count == 0 {
+	}
+	if err == nil && count == 0 {
 		grace := config.Default.ChannelDeletionGraceHours
 		if grace <= 0 {
 			grace = 24
@@ -792,21 +805,10 @@ func (h *ChannelHandler) SyncStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := map[string]interface{}{
-		"last_synced_at": status.LastSyncedAt,
-		"next_sync_at":   status.NextSyncAt,
-	}
-	if status.BackfillProgressPercent != nil {
-		resp["backfill_progress_percent"] = *status.BackfillProgressPercent
-	} else {
-		resp["backfill_progress_percent"] = nil
-	}
-	if status.RecentError != nil {
-		resp["recent_error"] = map[string]interface{}{
-			"at":      status.RecentError.At,
-			"message": status.RecentError.Message,
-		}
-	} else {
-		resp["recent_error"] = nil
+		"last_synced_at":            status.LastSyncedAt,
+		"next_sync_at":              status.NextSyncAt,
+		"backfill_progress_percent": nullable(status.BackfillProgressPercent),
+		"recent_error":              recentErrorJSON(status.RecentError),
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -815,12 +817,26 @@ func (h *ChannelHandler) SyncStatus(w http.ResponseWriter, r *http.Request) {
 // helpers
 // ============================================================================
 
-func validBackfillDaysAPI(d int) bool {
-	switch d {
-	case 30, 60, 90, 180:
-		return true
+// nullable dereferences an optional field, yielding JSON null for nil.
+func nullable[T any](p *T) any {
+	if p == nil {
+		return nil
 	}
-	return false
+	return *p
+}
+
+func recentErrorJSON(e *db.SyncError) any {
+	if e == nil {
+		return nil
+	}
+	return map[string]interface{}{"at": e.At, "message": e.Message}
+}
+
+// backfillDayOptions are the selectable initial-backfill windows.
+var backfillDayOptions = map[int]bool{30: true, 60: true, 90: true, 180: true}
+
+func validBackfillDaysAPI(d int) bool {
+	return backfillDayOptions[d]
 }
 
 // checkChannelLimit reports whether a new channel-connect should be blocked

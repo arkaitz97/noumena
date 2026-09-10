@@ -60,7 +60,8 @@ func (s *Scheduler) Tick(ctx context.Context) (TickResult, error) {
 		}
 		if jobType == "backfill" {
 			res.Backfills++
-		} else {
+		}
+		if jobType != "backfill" {
 			res.Polls++
 		}
 	}

@@ -17,6 +17,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -155,9 +156,8 @@ type feedResponse struct {
 
 // Feed handles GET /api/comments/feed. Tasks 5.1–5.4.
 func (h *InsightsHandler) Feed(w http.ResponseWriter, r *http.Request) {
-	userID, ok := r.Context().Value(UserIDKey).(string)
-	if !ok || userID == "" {
-		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+	userID, ok := requireAuthUser(w, r)
+	if !ok {
 		return
 	}
 	filters, err := parseFeedFilters(r, h.Cfg)
@@ -198,26 +198,23 @@ func (h *InsightsHandler) Feed(w http.ResponseWriter, r *http.Request) {
 	if rows == nil {
 		resp.Comments = []*db.FeedRow{}
 	}
-	if errors.Is(countErr, db.ErrCountTimeout) {
-		// 5.3: total=null, has_more from len(rows)==limit.
-		resp.Total = nil
-		resp.HasMore = len(rows) == filters.Limit
-	} else if countErr != nil {
-		// Other count error: degrade gracefully (total=null).
-		resp.Total = nil
-		resp.HasMore = len(rows) == filters.Limit
-	} else {
+	if countErr == nil {
 		resp.Total = &total
 		resp.HasMore = int64(filters.Offset+len(rows)) < total
+		writeJSON(w, http.StatusOK, resp)
+		return
 	}
+	// 5.3: count failed (timeout or other error) — degrade gracefully:
+	// total=null, has_more from the page size.
+	resp.Total = nil
+	resp.HasMore = len(rows) == filters.Limit
 	writeJSON(w, http.StatusOK, resp)
 }
 
 // Saved handles GET /api/comments/saved. Task 5.5.
 func (h *InsightsHandler) Saved(w http.ResponseWriter, r *http.Request) {
-	userID, ok := r.Context().Value(UserIDKey).(string)
-	if !ok || userID == "" {
-		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+	userID, ok := requireAuthUser(w, r)
+	if !ok {
 		return
 	}
 	filters, err := parseFeedFilters(r, h.Cfg)
@@ -246,9 +243,8 @@ func (h *InsightsHandler) Saved(w http.ResponseWriter, r *http.Request) {
 
 // Star handles POST /api/comments/{id}/star. Tasks 6.1, 6.3.
 func (h *InsightsHandler) Star(w http.ResponseWriter, r *http.Request) {
-	userID, ok := r.Context().Value(UserIDKey).(string)
-	if !ok || userID == "" {
-		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+	userID, ok := requireAuthUser(w, r)
+	if !ok {
 		return
 	}
 	commentID := chi.URLParam(r, "id")
@@ -270,9 +266,8 @@ func (h *InsightsHandler) Star(w http.ResponseWriter, r *http.Request) {
 
 // Unstar handles DELETE /api/comments/{id}/star. Task 6.2.
 func (h *InsightsHandler) Unstar(w http.ResponseWriter, r *http.Request) {
-	userID, ok := r.Context().Value(UserIDKey).(string)
-	if !ok || userID == "" {
-		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+	userID, ok := requireAuthUser(w, r)
+	if !ok {
 		return
 	}
 	commentID := chi.URLParam(r, "id")
@@ -297,19 +292,98 @@ func isUUID(s string) bool {
 	if len(s) != 36 {
 		return false
 	}
-	for i, ch := range s {
-		switch i {
-		case 8, 13, 18, 23:
-			if ch != '-' {
-				return false
-			}
-		default:
-			if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')) {
-				return false
-			}
+	return isHex(s[0:8]) && isHex(s[9:13]) && isHex(s[14:18]) && isHex(s[19:23]) && isHex(s[24:36]) &&
+		s[8] == '-' && s[13] == '-' && s[18] == '-' && s[23] == '-'
+}
+
+func isHex(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if !strings.ContainsRune("0123456789abcdefABCDEF", rune(s[i])) {
+			return false
 		}
 	}
 	return true
+}
+
+// --- window query parsing ---------------------------------------------------
+
+// insightWindowDays maps ?window= labels to day counts; insightWindowLabels
+// is the inverse. Data table in place of per-handler switch statements.
+var insightWindowDays = map[string]int{"7d": 7, "30d": 30, "90d": 90}
+var insightWindowLabels = map[int]string{7: "7d", 30: "30d", 90: "90d"}
+
+// parseWindowDays resolves the analysis window from ?window=7d|30d|90d, then
+// ?days=7|30|90; unknown or missing values fall back to defaultDays.
+func parseWindowDays(q url.Values, defaultDays int) int {
+	days := defaultDays
+	if d, ok := insightWindowDays[q.Get("window")]; ok {
+		days = d
+	}
+	if n, ok := queryDays(q); ok {
+		days = n
+	}
+	return days
+}
+
+// queryDays parses ?days=, accepting only the catalogued windows.
+func queryDays(q url.Values) (int, bool) {
+	n, err := strconv.Atoi(q.Get("days"))
+	if err != nil {
+		return 0, false
+	}
+	_, ok := insightWindowLabels[n]
+	return n, ok
+}
+
+// queryDaysStrict is the 400-on-garbage variant used by Trends/Sentiment:
+// missing ?days= yields defaultDays, an invalid value reports bad=true.
+func queryDaysStrict(q url.Values, defaultDays int) (days int, bad bool) {
+	if q.Get("days") == "" {
+		return defaultDays, false
+	}
+	days, ok := queryDays(q)
+	return days, !ok
+}
+
+// windowLabel renders a day count as its response label (e.g. "7d").
+func windowLabel(days int) string {
+	if w, ok := insightWindowLabels[days]; ok {
+		return w
+	}
+	return "30d"
+}
+
+// windowStart is the "since" timestamp for a day-count window.
+func windowStart(days int) time.Time {
+	return time.Now().Add(-time.Duration(days) * 24 * time.Hour)
+}
+
+// channelLabel renders a nullable channel id for flat JSON payloads.
+func channelLabel(channelID *string) string {
+	if channelID != nil {
+		return *channelID
+	}
+	return "all"
+}
+
+// exportContentTypes maps an export format to its download Content-Type.
+var exportContentTypes = map[string]string{"csv": "text/csv", "json": "application/json"}
+
+func contentTypeFor(format string) string {
+	if ct, ok := exportContentTypes[format]; ok {
+		return ct
+	}
+	return "application/octet-stream"
+}
+
+// requireAuthUser extracts the caller's user id, writing 401 when absent.
+func requireAuthUser(w http.ResponseWriter, r *http.Request) (string, bool) {
+	userID, ok := r.Context().Value(UserIDKey).(string)
+	if !ok || userID == "" {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return "", false
+	}
+	return userID, true
 }
 
 // --- Insights aggregates ----------------------------------------------------
@@ -321,9 +395,8 @@ func isUUID(s string) bool {
 // `window=7d|30d|90d` (frontend) or `days=7|30|90` (clamped like the other
 // aggregate endpoints; invalid values fall back to 30).
 func (h *InsightsHandler) ActionableInsights(w http.ResponseWriter, r *http.Request) {
-	userID, ok := r.Context().Value(UserIDKey).(string)
-	if !ok || userID == "" {
-		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+	userID, ok := requireAuthUser(w, r)
+	if !ok {
 		return
 	}
 	channelID, code := h.validateChannelID(r)
@@ -331,74 +404,69 @@ func (h *InsightsHandler) ActionableInsights(w http.ResponseWriter, r *http.Requ
 		writeJSONError(w, code, "not_tracked")
 		return
 	}
-	q := r.URL.Query()
-	days := 30
-	switch q.Get("window") {
-	case "7d":
-		days = 7
-	case "30d":
-		days = 30
-	case "90d":
-		days = 90
-	}
-	if v := q.Get("days"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && (n == 7 || n == 30 || n == 90) {
-			days = n
-		}
-	}
-	window := "30d"
-	switch days {
-	case 7:
-		window = "7d"
-	case 90:
-		window = "90d"
-	}
-	since := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
-	top, err := h.Queries.GetTopInsights(r.Context(), userID, channelID, since, 50)
+	days := parseWindowDays(r.URL.Query(), 30)
+	agg, err := h.buildAggregate(r.Context(), userID, channelID, days)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "aggregate_failed")
 		return
 	}
-	dist, err := h.Queries.GetInsightDistribution(r.Context(), userID, channelID, since)
+	writeJSON(w, http.StatusOK, agg)
+}
+
+// insightsAggregate is the /actionable-insights dashboard payload matching
+// the frontend contract.
+type insightsAggregate struct {
+	Window        string                `json:"window"`
+	ChannelID     *string               `json:"channel_id"`
+	Distribution  []db.InsightTypeCount `json:"distribution"`
+	TopInsights   []db.TopInsight       `json:"top_insights"`
+	TotalInsights int64                 `json:"total_insights"`
+}
+
+func (h *InsightsHandler) buildAggregate(ctx context.Context, userID string, channelID *string, days int) (insightsAggregate, error) {
+	top, dist, err := h.queryTopAndDistribution(ctx, userID, channelID, windowStart(days))
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "aggregate_failed")
-		return
+		return insightsAggregate{}, err
 	}
-	if top == nil {
-		top = []db.TopInsight{}
+	return insightsAggregate{Window: windowLabel(days), ChannelID: channelID,
+		Distribution: orEmptyDist(dist), TopInsights: orEmptyTop(top), TotalInsights: sumCounts(dist)}, nil
+}
+
+func (h *InsightsHandler) queryTopAndDistribution(ctx context.Context, userID string, channelID *string, since time.Time) ([]db.TopInsight, []db.InsightTypeCount, error) {
+	top, err := h.Queries.GetTopInsights(ctx, userID, channelID, since, 50)
+	if err != nil {
+		return nil, nil, err
 	}
-	if dist == nil {
-		dist = []db.InsightTypeCount{}
+	dist, err := h.Queries.GetInsightDistribution(ctx, userID, channelID, since)
+	return top, dist, err
+}
+
+func orEmptyTop(xs []db.TopInsight) []db.TopInsight {
+	if xs == nil {
+		return []db.TopInsight{}
 	}
+	return xs
+}
+
+func orEmptyDist(xs []db.InsightTypeCount) []db.InsightTypeCount {
+	if xs == nil {
+		return []db.InsightTypeCount{}
+	}
+	return xs
+}
+
+func sumCounts(dist []db.InsightTypeCount) int64 {
 	var total int64
 	for _, d := range dist {
 		total += d.Count
 	}
-	var channelIDOut *string
-	if channelID != nil {
-		s := *channelID
-		channelIDOut = &s
-	}
-	writeJSON(w, http.StatusOK, struct {
-		Window        string                `json:"window"`
-		ChannelID     *string               `json:"channel_id"`
-		Distribution  []db.InsightTypeCount `json:"distribution"`
-		TopInsights   []db.TopInsight       `json:"top_insights"`
-		TotalInsights int64                 `json:"total_insights"`
-	}{
-		Window:        window,
-		ChannelID:     channelIDOut,
-		Distribution:  dist,
-		TopInsights:   top,
-		TotalInsights: total,
-	})
+	return total
 }
 
 // TopInsights handles GET /api/insights/actionable-insights/top.
 func (h *InsightsHandler) TopInsights(w http.ResponseWriter, r *http.Request) {
-	userID, ok := r.Context().Value(UserIDKey).(string)
-	if !ok || userID == "" {
-		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+	userID, ok := requireAuthUser(w, r)
+	if !ok {
 		return
 	}
 	channelID, code := h.validateChannelID(r)
@@ -406,14 +474,8 @@ func (h *InsightsHandler) TopInsights(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, code, "not_tracked")
 		return
 	}
-	q := r.URL.Query()
-	days := 30
-	if v := q.Get("days"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && (n == 7 || n == 30 || n == 90) {
-			days = n
-		}
-	}
-	insights, err := h.Queries.GetTopInsights(r.Context(), userID, channelID, time.Now().Add(-time.Duration(days)*24*time.Hour), 10)
+	days := parseWindowDays(r.URL.Query(), 30)
+	insights, err := h.Queries.GetTopInsights(r.Context(), userID, channelID, windowStart(days), 10)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "aggregate_failed")
 		return
@@ -435,9 +497,8 @@ func (h *InsightsHandler) TopInsights(w http.ResponseWriter, r *http.Request) {
 
 // InsightDistribution handles GET /api/insights/actionable-insights/distribution.
 func (h *InsightsHandler) InsightDistribution(w http.ResponseWriter, r *http.Request) {
-	userID, ok := r.Context().Value(UserIDKey).(string)
-	if !ok || userID == "" {
-		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+	userID, ok := requireAuthUser(w, r)
+	if !ok {
 		return
 	}
 	channelID, code := h.validateChannelID(r)
@@ -445,14 +506,8 @@ func (h *InsightsHandler) InsightDistribution(w http.ResponseWriter, r *http.Req
 		writeJSONError(w, code, "not_tracked")
 		return
 	}
-	q := r.URL.Query()
-	days := 30
-	if v := q.Get("days"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && (n == 7 || n == 30 || n == 90) {
-			days = n
-		}
-	}
-	dist, err := h.Queries.GetInsightDistribution(r.Context(), userID, channelID, time.Now().Add(-time.Duration(days)*24*time.Hour))
+	days := parseWindowDays(r.URL.Query(), 30)
+	dist, err := h.Queries.GetInsightDistribution(r.Context(), userID, channelID, windowStart(days))
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "aggregate_failed")
 		return
@@ -474,9 +529,8 @@ func (h *InsightsHandler) RefreshInsightsView(w http.ResponseWriter, r *http.Req
 // Returns the requested window's toxicity aggregate in the flat shape the
 // dashboard shield card renders (window defaults to 7d).
 func (h *InsightsHandler) ToxicityShield(w http.ResponseWriter, r *http.Request) {
-	userID, ok := r.Context().Value(UserIDKey).(string)
-	if !ok || userID == "" {
-		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+	userID, ok := requireAuthUser(w, r)
+	if !ok {
 		return
 	}
 	channelID, code := h.validateChannelID(r)
@@ -484,50 +538,29 @@ func (h *InsightsHandler) ToxicityShield(w http.ResponseWriter, r *http.Request)
 		writeJSONError(w, code, "not_tracked")
 		return
 	}
-	q := r.URL.Query()
-	days := 7
-	switch q.Get("window") {
-	case "7d":
-		days = 7
-	case "30d":
-		days = 30
-	case "90d":
-		days = 90
-	}
-	if v := q.Get("days"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && (n == 7 || n == 30 || n == 90) {
-			days = n
-		}
-	}
-	window := "7d"
-	switch days {
-	case 30:
-		window = "30d"
-	case 90:
-		window = "90d"
-	}
-	b, err := h.Queries.GetToxicityShield(r.Context(), userID, channelID, time.Now().Add(-time.Duration(days)*24*time.Hour))
+	days := parseWindowDays(r.URL.Query(), 7)
+	b, err := h.Queries.GetToxicityShield(r.Context(), userID, channelID, windowStart(days))
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "aggregate_failed")
 		return
 	}
-	channelIDOut := "all"
-	if channelID != nil {
-		channelIDOut = *channelID
-	}
-	writeJSON(w, http.StatusOK, struct {
-		Window           string  `json:"window"`
-		ChannelID        string  `json:"channel_id"`
-		FilteredPct      float64 `json:"filtered_pct"`
-		FilteredComments int64   `json:"filtered_comments"`
-		TotalComments    int64   `json:"total_comments"`
-	}{
-		Window:           window,
-		ChannelID:        channelIDOut,
+	writeJSON(w, http.StatusOK, shieldResponse{
+		Window:           windowLabel(days),
+		ChannelID:        channelLabel(channelID),
 		FilteredPct:      b.FilteredPct,
 		FilteredComments: b.FilteredCount,
 		TotalComments:    b.TotalComments,
 	})
+}
+
+// shieldResponse is the flat payload the dashboard toxicity shield card
+// renders.
+type shieldResponse struct {
+	Window           string  `json:"window"`
+	ChannelID        string  `json:"channel_id"`
+	FilteredPct      float64 `json:"filtered_pct"`
+	FilteredComments int64   `json:"filtered_comments"`
+	TotalComments    int64   `json:"total_comments"`
 }
 
 type trendsResponse struct {
@@ -539,19 +572,14 @@ type trendsResponse struct {
 
 // Trends handles GET /api/insights/trends. Task 7.5.
 func (h *InsightsHandler) Trends(w http.ResponseWriter, r *http.Request) {
-	userID, ok := r.Context().Value(UserIDKey).(string)
-	if !ok || userID == "" {
-		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+	userID, ok := requireAuthUser(w, r)
+	if !ok {
 		return
 	}
-	days := 30
-	if v := r.URL.Query().Get("days"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || (n != 7 && n != 30 && n != 90) {
-			writeJSONError(w, http.StatusBadRequest, "invalid_days")
-			return
-		}
-		days = n
+	days, bad := queryDaysStrict(r.URL.Query(), 30)
+	if bad {
+		writeJSONError(w, http.StatusBadRequest, "invalid_days")
+		return
 	}
 	channelID, code := h.validateChannelID(r)
 	if code != 0 {
@@ -622,9 +650,8 @@ type sentimentResponse struct {
 // defaults to 7. Per-day aggregates are computed at the SQL layer joined on
 // the caller's channel access, so untracked channels never leak rows.
 func (h *InsightsHandler) Sentiment(w http.ResponseWriter, r *http.Request) {
-	userID, ok := r.Context().Value(UserIDKey).(string)
-	if !ok || userID == "" {
-		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+	userID, ok := requireAuthUser(w, r)
+	if !ok {
 		return
 	}
 	channelID, code := h.validateChannelID(r)
@@ -636,14 +663,10 @@ func (h *InsightsHandler) Sentiment(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, code, "not_tracked")
 		return
 	}
-	days := 7
-	if v := r.URL.Query().Get("days"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || (n != 7 && n != 30 && n != 90) {
-			writeJSONError(w, http.StatusBadRequest, "invalid_days")
-			return
-		}
-		days = n
+	days, bad := queryDaysStrict(r.URL.Query(), 7)
+	if bad {
+		writeJSONError(w, http.StatusBadRequest, "invalid_days")
+		return
 	}
 	scoped := ""
 	if channelID != nil {
@@ -703,88 +726,121 @@ func (er exportRequest) toFilters() (db.FeedFilters, error) {
 
 // CreateExport handles POST /api/comments/export. Tasks 8.1–8.4.
 func (h *InsightsHandler) CreateExport(w http.ResponseWriter, r *http.Request) {
-	userID, ok := r.Context().Value(UserIDKey).(string)
-	if !ok || userID == "" {
-		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+	userID, ok := requireAuthUser(w, r)
+	if !ok {
 		return
 	}
+	req, filters, ok := decodeExportRequest(w, r)
+	if !ok {
+		return
+	}
+	goAsync, ok := h.shouldGoAsync(w, r, userID, filters)
+	if !ok {
+		return
+	}
+	exp, ok := h.enqueueExportJob(w, r, userID, req)
+	if !ok {
+		return
+	}
+	if goAsync {
+		writeJSON(w, http.StatusAccepted, map[string]any{"job_id": exp.ID, "status": "queued"})
+		return
+	}
+	// 8.3: sync path — encode to disk inline using the same routine the
+	// worker uses.
+	h.writeSyncExport(w, r, userID, req.Format, filters, exp.ID)
+}
+
+// decodeExportRequest validates the format and converts the request into
+// feed filters.
+func decodeExportRequest(w http.ResponseWriter, r *http.Request) (exportRequest, db.FeedFilters, bool) {
 	var req exportRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid_body")
-		return
+		return req, db.FeedFilters{}, false
 	}
 	if req.Format != "csv" && req.Format != "json" {
 		writeJSONError(w, http.StatusBadRequest, "invalid_format")
-		return
+		return req, db.FeedFilters{}, false
 	}
 	filters, err := req.toFilters()
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
-		return
+		return req, db.FeedFilters{}, false
 	}
+	return req, filters, true
+}
 
-	// 8.2: count with COUNT_QUERY_TIMEOUT; on timeout OR > threshold go async.
+// shouldGoAsync implements 8.2: count with COUNT_QUERY_TIMEOUT; on timeout
+// OR a row count above the sync threshold the job goes async. A non-
+// timeout count error is a 500.
+func (h *InsightsHandler) shouldGoAsync(w http.ResponseWriter, r *http.Request, userID string, filters db.FeedFilters) (async, ok bool) {
 	count, cerr := h.Queries.CountCommentFeed(r.Context(), userID, filters, h.Cfg.CountQueryTimeout)
-	goAsync := errors.Is(cerr, db.ErrCountTimeout) || (cerr == nil && count > int64(h.Cfg.ExportSyncThreshold))
-	if cerr != nil && !errors.Is(cerr, db.ErrCountTimeout) {
-		writeJSONError(w, http.StatusInternalServerError, "count_failed")
-		return
+	if errors.Is(cerr, db.ErrCountTimeout) {
+		return true, true
 	}
+	if cerr != nil {
+		writeJSONError(w, http.StatusInternalServerError, "count_failed")
+		return false, false
+	}
+	return count > int64(h.Cfg.ExportSyncThreshold), true
+}
 
-	// Persist the request body verbatim into filters JSONB (audit/replay).
+// enqueueExportJob persists the request body verbatim into the filters
+// JSONB column (audit/replay).
+func (h *InsightsHandler) enqueueExportJob(w http.ResponseWriter, r *http.Request, userID string, req exportRequest) (*db.Export, bool) {
 	rawFilters, _ := json.Marshal(req)
-
 	exp, err := h.Queries.EnqueueExport(r.Context(), userID, req.Format, rawFilters)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "enqueue_failed")
-		return
+		return nil, false
 	}
+	return exp, true
+}
 
-	if goAsync {
-		writeJSON(w, http.StatusAccepted, map[string]any{
-			"job_id": exp.ID,
-			"status": "queued",
-		})
-		return
-	}
-
-	// 8.3: sync path — encode to disk inline using the same routine the
-	// worker uses.
+// writeSyncExport streams the export to disk and reports the result; every
+// failure marks the job failed and surfaces a stable error code.
+func (h *InsightsHandler) writeSyncExport(w http.ResponseWriter, r *http.Request, userID, format string, filters db.FeedFilters, exportID string) {
 	userDir := filepath.Join(h.Cfg.ExportDir, userID)
 	if err := os.MkdirAll(userDir, 0o700); err != nil {
-		_ = h.Queries.MarkExportFailed(context.Background(), exp.ID, err.Error(), false)
-		writeJSONError(w, http.StatusInternalServerError, "mkdir_failed")
+		h.failExport(w, exportID, err, "mkdir_failed")
 		return
 	}
-	filePath := filepath.Join(userDir, exp.ID+"."+req.Format)
+	filePath := filepath.Join(userDir, exportID+"."+format)
 	f, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
-		_ = h.Queries.MarkExportFailed(context.Background(), exp.ID, err.Error(), false)
-		writeJSONError(w, http.StatusInternalServerError, "open_failed")
+		h.failExport(w, exportID, err, "open_failed")
 		return
 	}
-	rowCount, eerr := export.StreamExport(r.Context(), h.Queries.ExportReadDB(), userID, filters, req.Format, f)
-	if eerr != nil {
-		_ = f.Close()
-		_ = h.Queries.MarkExportFailed(context.Background(), exp.ID, eerr.Error(), false)
-		writeJSONError(w, http.StatusInternalServerError, "encode_failed")
+	defer f.Close()
+	rowCount, err := export.StreamExport(r.Context(), h.Queries.ExportReadDB(), userID, filters, format, f)
+	if err != nil {
+		h.failExport(w, exportID, err, "encode_failed")
 		return
 	}
 	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		_ = h.Queries.MarkExportFailed(context.Background(), exp.ID, err.Error(), false)
-		writeJSONError(w, http.StatusInternalServerError, "fsync_failed")
+		h.failExport(w, exportID, err, "fsync_failed")
 		return
 	}
-	_ = f.Close()
-	if err := h.Queries.MarkExportCompleted(r.Context(), exp.ID, filePath, rowCount, h.Cfg.ExportTTLHours); err != nil {
+	h.writeCompletedExport(w, r, exportID, filePath, rowCount)
+}
+
+// failExport marks the job failed (outside the request context, which may
+// be dead) and writes the stable error code.
+func (h *InsightsHandler) failExport(w http.ResponseWriter, exportID string, cause error, code string) {
+	_ = h.Queries.MarkExportFailed(context.Background(), exportID, cause.Error(), false)
+	writeJSONError(w, http.StatusInternalServerError, code)
+}
+
+func (h *InsightsHandler) writeCompletedExport(w http.ResponseWriter, r *http.Request, exportID, filePath string, rowCount int64) {
+	if err := h.Queries.MarkExportCompleted(r.Context(), exportID, filePath, rowCount, h.Cfg.ExportTTLHours); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "mark_completed_failed")
 		return
 	}
 	expiresAt := time.Now().Add(time.Duration(h.Cfg.ExportTTLHours) * time.Hour)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"export_id":    exp.ID,
-		"download_url": "/api/comments/export/" + exp.ID + "/download",
+		"export_id":    exportID,
+		"download_url": "/api/comments/export/" + exportID + "/download",
 		"expires_at":   expiresAt.Format(time.RFC3339),
 		"row_count":    rowCount,
 	})
@@ -793,9 +849,8 @@ func (h *InsightsHandler) CreateExport(w http.ResponseWriter, r *http.Request) {
 // ListRecentExports handles GET /api/comments/export/recent (fix-frontend-
 // plumbing). Returns the caller's most recent comment exports, newest first.
 func (h *InsightsHandler) ListRecentExports(w http.ResponseWriter, r *http.Request) {
-	userID, ok := r.Context().Value(UserIDKey).(string)
-	if !ok || userID == "" {
-		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+	userID, ok := requireAuthUser(w, r)
+	if !ok {
 		return
 	}
 	limit := 10
@@ -837,9 +892,8 @@ func (h *InsightsHandler) ListRecentExports(w http.ResponseWriter, r *http.Reque
 
 // ExportStatus handles GET /api/comments/export/{job_id}/status. Task 8.5.
 func (h *InsightsHandler) ExportStatus(w http.ResponseWriter, r *http.Request) {
-	userID, ok := r.Context().Value(UserIDKey).(string)
-	if !ok || userID == "" {
-		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+	userID, ok := requireAuthUser(w, r)
+	if !ok {
 		return
 	}
 	jobID := chi.URLParam(r, "id")
@@ -883,9 +937,8 @@ func (h *InsightsHandler) ExportStatus(w http.ResponseWriter, r *http.Request) {
 
 // ExportDownload handles GET /api/comments/export/{export_id}/download. Task 8.6.
 func (h *InsightsHandler) ExportDownload(w http.ResponseWriter, r *http.Request) {
-	userID, ok := r.Context().Value(UserIDKey).(string)
-	if !ok || userID == "" {
-		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+	userID, ok := requireAuthUser(w, r)
+	if !ok {
 		return
 	}
 	exportID := chi.URLParam(r, "id")
@@ -914,23 +967,15 @@ func (h *InsightsHandler) ExportDownload(w http.ResponseWriter, r *http.Request)
 	}
 	defer f.Close()
 
-	contentType := "application/octet-stream"
-	switch exp.Format {
-	case "csv":
-		contentType = "text/csv"
-	case "json":
-		contentType = "application/json"
-	}
-	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Type", contentTypeFor(exp.Format))
 	w.Header().Set("Content-Disposition", `attachment; filename="noumena-export-`+exp.ID+`.`+exp.Format+`"`)
 	_, _ = io.Copy(w, f)
 }
 
 // LatestDigest handles GET /api/insights/digest/latest. Task 9.1, 9.2.
 func (h *InsightsHandler) LatestDigest(w http.ResponseWriter, r *http.Request) {
-	userID, ok := r.Context().Value(UserIDKey).(string)
-	if !ok || userID == "" {
-		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+	userID, ok := requireAuthUser(w, r)
+	if !ok {
 		return
 	}
 	d, err := h.Queries.GetLatestDigest(r.Context(), userID)
@@ -953,16 +998,23 @@ func (h *InsightsHandler) LatestDigest(w http.ResponseWriter, r *http.Request) {
 		"week_end":   d.WeekEnd,
 	}
 	if len(d.Content) > 0 {
-		var content map[string]any
-		if err := json.Unmarshal(d.Content, &content); err == nil {
-			for k, v := range content {
-				if _, exists := resp[k]; !exists {
-					resp[k] = v
-				}
-			}
-		} else {
-			resp["content"] = string(d.Content)
-		}
+		mergeDigestContent(resp, d.Content)
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// mergeDigestContent folds the top-level content keys into resp without
+// overwriting the documented fields; unparseable JSON is passed through as
+// a raw string so this read endpoint stays stable across producer changes.
+func mergeDigestContent(resp map[string]any, content []byte) {
+	var parsed map[string]any
+	if err := json.Unmarshal(content, &parsed); err != nil {
+		resp["content"] = string(content)
+		return
+	}
+	for k, v := range parsed {
+		if _, exists := resp[k]; !exists {
+			resp[k] = v
+		}
+	}
 }

@@ -261,94 +261,135 @@ func (w *Worker) runUserDigest(ctx context.Context, user *db.User, weekStart, we
 	if w.Logger == nil {
 		w.Logger = log.Default()
 	}
-	key := user.ID + ":" + weekStart.Format("2006-01-02")
-	w.dispatchedMu.Lock()
-	if w.dispatched == nil {
-		w.dispatched = map[string]struct{}{}
-	}
-	if _, seen := w.dispatched[key]; seen {
-		w.dispatchedMu.Unlock()
+	if !w.claimDigest(user.ID, weekStart) {
 		return
 	}
-	w.dispatched[key] = struct{}{}
-	w.dispatchedMu.Unlock()
-
-	digestID, inserted, err := w.Queries.InsertWeeklyDigestPending(ctx, user.ID, weekStart)
-	if err != nil {
-		w.Logger.Printf("digest worker: pending insert failed for user %s: %v", user.ID, err)
+	digestID, ok := w.insertPendingDigest(ctx, user, weekStart)
+	if !ok {
 		return
 	}
-	if !inserted {
-		// A row already exists — either completed earlier or another
-		// worker/process is handling it. Either way, nothing for us to do.
-		w.Logger.Printf("digest worker: skip user=%s week=%s (already exists, id=%s)",
-			user.ID, weekStart.Format("2006-01-02"), digestID)
+	comments, ok := w.fetchDigestComments(ctx, user.ID, weekStart, weekEnd)
+	if !ok || w.digestTooThin(ctx, user, digestID, weekStart, comments) {
 		return
 	}
-
-	comments, err := w.Queries.GetEligibleCommentsForUser(ctx, user.ID, weekStart, weekEnd)
-	if err != nil {
-		w.Logger.Printf("digest worker: fetch comments failed user=%s: %v", user.ID, err)
-		// Leave row pending; the next startup sweep promotes it to deferred.
-		return
-	}
-
-	if len(comments) < digestSkipThreshold {
-		w.Logger.Printf("digest worker: skip user=%s week=%s (count=%d < %d)",
-			user.ID, weekStart.Format("2006-01-02"), len(comments), digestSkipThreshold)
-		if err := w.Queries.UpdateDigestContent(ctx, digestID, nil, "skipped_insufficient_data"); err != nil {
-			w.Logger.Printf("digest worker: status update failed user=%s: %v", user.ID, err)
-		}
-		return
-	}
-
 	truth := w.computeTruth(ctx, user, weekStart, comments)
-
-	var profile *db.UserProfile
-	if isProfileContextEnabled() {
-		if p, err := w.Queries.GetUserProfile(ctx, user.ID); err == nil {
-			profile = p
-		}
-	}
-
 	prompt := BuildDigestPrompt(DigestPromptInputs{
 		Aggregates:     truth,
 		TopTopics:      computeTopTopics(comments, 10),
 		CategoryCounts: computeCategoryDistribution(comments),
 		SampleComments: selectSampleComments(comments, digestSampleLimit),
-		Profile:        profile,
+		Profile:        w.optionalProfile(ctx, user.ID),
 	})
-
 	// Per-user deadline so one stuck LLM chain can't stall the run loop.
 	// Retries beyond the deadline become deferred rows handled async.
 	userCtx, cancel := context.WithTimeout(ctx, dispatchDeadline)
 	defer cancel()
-	parsed, attemptErr := w.callWithRetry(userCtx, prompt, truth)
-	if attemptErr != nil {
-		w.Logger.Printf("digest worker: deferred user=%s week=%s: %v",
-			user.ID, weekStart.Format("2006-01-02"), attemptErr)
-		if err := w.Queries.UpdateDigestStatus(ctx, digestID, "deferred"); err != nil {
-			w.Logger.Printf("digest worker: defer-status update failed user=%s: %v", user.ID, err)
-		}
-		if w.Pipeline != nil && user.DigestEmailOptIn {
-			msg := email.Message{
-				ToUserID:       user.ID,
-				ToAddress:      user.Email,
-				Template:       "digest_delayed",
-				IdempotencyKey: "digest_delayed:" + digestID,
-				Variables: map[string]any{
-					"WeekRange":      weekStart.Format("Jan 2") + " – " + weekStart.AddDate(0, 0, 6).Format("Jan 2, 2006"),
-					"UnsubscribeURL": digestUnsubscribeURL(user.ID, digestID),
-				},
-				ListUnsubscribe: digestUnsubscribeURL(user.ID, digestID),
-			}
-			if err := w.Pipeline.Send(ctx, msg); err != nil {
-				w.Logger.Printf("digest worker: digest_delayed email failed user=%s: %v", user.ID, err)
-			}
-		}
+	parsed, err := w.callWithRetry(userCtx, prompt, truth)
+	if err != nil {
+		w.deferDigest(ctx, user, digestID, weekStart, err)
 		return
 	}
+	w.completeDigest(ctx, user, digestID, weekStart, parsed)
+}
 
+// claimDigest guards against double dispatch for a (user, week) pair within
+// the process.
+func (w *Worker) claimDigest(userID string, weekStart time.Time) bool {
+	key := userID + ":" + weekStart.Format("2006-01-02")
+	w.dispatchedMu.Lock()
+	defer w.dispatchedMu.Unlock()
+	if w.dispatched == nil {
+		w.dispatched = map[string]struct{}{}
+	}
+	if _, seen := w.dispatched[key]; seen {
+		return false
+	}
+	w.dispatched[key] = struct{}{}
+	return true
+}
+
+// insertPendingDigest creates the digest row. An existing row — completed
+// earlier or handled by another worker/process — means nothing to do.
+func (w *Worker) insertPendingDigest(ctx context.Context, user *db.User, weekStart time.Time) (string, bool) {
+	digestID, inserted, err := w.Queries.InsertWeeklyDigestPending(ctx, user.ID, weekStart)
+	if err != nil {
+		w.Logger.Printf("digest worker: pending insert failed for user %s: %v", user.ID, err)
+		return "", false
+	}
+	if inserted {
+		return digestID, true
+	}
+	w.Logger.Printf("digest worker: skip user=%s week=%s (already exists, id=%s)",
+		user.ID, weekStart.Format("2006-01-02"), digestID)
+	return "", false
+}
+
+func (w *Worker) fetchDigestComments(ctx context.Context, userID string, weekStart, weekEnd time.Time) ([]*db.Comment, bool) {
+	comments, err := w.Queries.GetEligibleCommentsForUser(ctx, userID, weekStart, weekEnd)
+	if err == nil {
+		return comments, true
+	}
+	w.Logger.Printf("digest worker: fetch comments failed user=%s: %v", userID, err)
+	// Leave row pending; the next startup sweep promotes it to deferred.
+	return nil, false
+}
+
+// digestTooThin marks the row skipped when the week yields too little data.
+func (w *Worker) digestTooThin(ctx context.Context, user *db.User, digestID string, weekStart time.Time, comments []*db.Comment) bool {
+	if len(comments) >= digestSkipThreshold {
+		return false
+	}
+	w.Logger.Printf("digest worker: skip user=%s week=%s (count=%d < %d)",
+		user.ID, weekStart.Format("2006-01-02"), len(comments), digestSkipThreshold)
+	if err := w.Queries.UpdateDigestContent(ctx, digestID, nil, "skipped_insufficient_data"); err != nil {
+		w.Logger.Printf("digest worker: status update failed user=%s: %v", user.ID, err)
+	}
+	return true
+}
+
+// optionalProfile fetches the caller's profile when the context flag is on.
+func (w *Worker) optionalProfile(ctx context.Context, userID string) *db.UserProfile {
+	if !isProfileContextEnabled() {
+		return nil
+	}
+	p, err := w.Queries.GetUserProfile(ctx, userID)
+	if err != nil {
+		return nil
+	}
+	return p
+}
+
+// deferDigest parks the row for async retry and warns opted-in users the
+// digest is delayed.
+func (w *Worker) deferDigest(ctx context.Context, user *db.User, digestID string, weekStart time.Time, cause error) {
+	w.Logger.Printf("digest worker: deferred user=%s week=%s: %v",
+		user.ID, weekStart.Format("2006-01-02"), cause)
+	if err := w.Queries.UpdateDigestStatus(ctx, digestID, "deferred"); err != nil {
+		w.Logger.Printf("digest worker: defer-status update failed user=%s: %v", user.ID, err)
+	}
+	w.sendDigestDelayedEmail(ctx, user, digestID, weekStart)
+}
+
+func (w *Worker) sendDigestDelayedEmail(ctx context.Context, user *db.User, digestID string, weekStart time.Time) {
+	if w.Pipeline == nil || !user.DigestEmailOptIn {
+		return
+	}
+	unsubURL := digestUnsubscribeURL(user.ID, digestID)
+	msg := email.Message{
+		ToUserID:        user.ID,
+		ToAddress:       user.Email,
+		Template:        "digest_delayed",
+		IdempotencyKey:  "digest_delayed:" + digestID,
+		Variables:       map[string]any{"WeekRange": weekRange(weekStart), "UnsubscribeURL": unsubURL},
+		ListUnsubscribe: unsubURL,
+	}
+	if err := w.Pipeline.Send(ctx, msg); err != nil {
+		w.Logger.Printf("digest worker: digest_delayed email failed user=%s: %v", user.ID, err)
+	}
+}
+
+// completeDigest persists the parsed content and emails opt-in users.
+func (w *Worker) completeDigest(ctx context.Context, user *db.User, digestID string, weekStart time.Time, parsed DigestContent) {
 	contentJSON, err := json.Marshal(parsed)
 	if err != nil {
 		w.Logger.Printf("digest worker: marshal failed user=%s: %v", user.ID, err)
@@ -361,39 +402,44 @@ func (w *Worker) runUserDigest(ctx context.Context, user *db.User, weekStart, we
 	}
 	w.Logger.Printf("digest worker: completed user=%s week=%s id=%s",
 		user.ID, weekStart.Format("2006-01-02"), digestID)
+	w.sendWeeklyDigestEmail(ctx, user, digestID, weekStart, parsed)
+}
 
-	// data-lifecycle (12.6): emit weekly_digest email when the user has
-	// opted in. Pipeline gate is checked first so non-pipeline deployments
-	// (mock mode, EMAIL_ENABLED=false) skip cleanly. Idempotency key is
-	// the digest ID, so retried runs collapse to one delivery.
-	if w.Pipeline != nil && user.DigestEmailOptIn {
-		weekRange := weekStart.Format("Jan 2") + " – " +
-			weekStart.AddDate(0, 0, 6).Format("Jan 2, 2006")
-		unsubURL := digestUnsubscribeURL(user.ID, digestID)
-		msg := email.Message{
-			ToUserID:       user.ID,
-			ToAddress:      user.Email,
-			Template:       email.TemplateWeeklyDigest,
-			IdempotencyKey: "weekly_digest:" + digestID,
-			Variables: map[string]any{
-				"WeekRange":      weekRange,
-				"DigestURL":      strings.TrimRight(config.Default.AppBaseURL, "/") + "/dashboard",
-				"TopIdeas":       digestIdeaStrings(parsed.TopIdeas),
-				"TopQuestions":   digestQuestionStrings(parsed.TopQuestions),
-				"UnsubscribeURL": unsubURL,
-			},
-			ListUnsubscribe: unsubURL,
-		}
-		if err := w.Pipeline.Send(ctx, msg); err != nil {
-			w.Logger.Printf("digest worker: weekly_digest email enqueue failed user=%s id=%s: %v",
-				user.ID, digestID, err)
-			return
-		}
-		if err := w.Queries.MarkDigestEmailed(ctx, digestID, user.ID, time.Now().UTC()); err != nil {
-			w.Logger.Printf("digest worker: MarkDigestEmailed failed user=%s id=%s: %v",
-				user.ID, digestID, err)
-		}
+// sendWeeklyDigestEmail emits the weekly_digest email for opted-in users
+// (data-lifecycle 12.6). The Pipeline gate lets non-pipeline deployments
+// (mock mode, EMAIL_ENABLED=false) skip cleanly. The idempotency key is the
+// digest ID, so retried runs collapse to one delivery.
+func (w *Worker) sendWeeklyDigestEmail(ctx context.Context, user *db.User, digestID string, weekStart time.Time, parsed DigestContent) {
+	if w.Pipeline == nil || !user.DigestEmailOptIn {
+		return
 	}
+	unsubURL := digestUnsubscribeURL(user.ID, digestID)
+	msg := email.Message{
+		ToUserID:       user.ID,
+		ToAddress:      user.Email,
+		Template:       email.TemplateWeeklyDigest,
+		IdempotencyKey: "weekly_digest:" + digestID,
+		Variables: map[string]any{
+			"WeekRange":      weekRange(weekStart),
+			"DigestURL":      strings.TrimRight(config.Default.AppBaseURL, "/") + "/dashboard",
+			"TopIdeas":       digestIdeaStrings(parsed.TopIdeas),
+			"TopQuestions":   digestQuestionStrings(parsed.TopQuestions),
+			"UnsubscribeURL": unsubURL,
+		},
+		ListUnsubscribe: unsubURL,
+	}
+	if err := w.Pipeline.Send(ctx, msg); err != nil {
+		w.Logger.Printf("digest worker: weekly_digest email enqueue failed user=%s id=%s: %v", user.ID, digestID, err)
+		return
+	}
+	if err := w.Queries.MarkDigestEmailed(ctx, digestID, user.ID, time.Now().UTC()); err != nil {
+		w.Logger.Printf("digest worker: MarkDigestEmailed failed user=%s id=%s: %v", user.ID, digestID, err)
+	}
+}
+
+// weekRange renders the digest period, e.g. "Jan 2 – Jan 8, 2026".
+func weekRange(weekStart time.Time) string {
+	return weekStart.Format("Jan 2") + " – " + weekStart.AddDate(0, 0, 6).Format("Jan 2, 2006")
 }
 
 // digestIdeaStrings flattens LLM-synthesised ideas into the template's

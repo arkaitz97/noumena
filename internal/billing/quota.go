@@ -2,6 +2,7 @@ package billing
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -90,52 +91,63 @@ func StartQuotaCron(ctx context.Context, store QuotaCronStore, cfg QuotaCronConf
 // errors at WARN; failures do not abort the loop.
 func runQuotaCronOnce(ctx context.Context, store QuotaCronStore, graceHours int, p *email.Pipeline) {
 	// 3.1: snapshot current-period usage before any reset zeroes it.
-	if n, err := store.RecordCurrentPeriodUsage(ctx); err != nil {
-		log.Printf("billing quota cron: RecordCurrentPeriodUsage err=%v", err)
-	} else if n > 0 {
-		log.Printf("billing quota cron: billing_usage rows=%d", n)
-	}
+	n, err := store.RecordCurrentPeriodUsage(ctx)
+	runQuotaStep("RecordCurrentPeriodUsage", "billing_usage", n, err)
 
-	if n, err := store.ResetFreeTierQuotas(ctx); err != nil {
-		log.Printf("billing quota cron: ResetFreeTierQuotas err=%v", err)
-	} else if n > 0 {
-		log.Printf("billing quota cron: reset_free_tier_quotas rows=%d", n)
-	}
+	n, err = store.ResetFreeTierQuotas(ctx)
+	runQuotaStep("ResetFreeTierQuotas", "reset_free_tier_quotas", n, err)
 
 	// 12.4: prefer the email-aware path when both a Pipeline and a store
 	// that supports RETURNING are available; fall back to the count-only
 	// transition otherwise (preserves existing behaviour for tests/mocks).
 	if emitter, ok := store.(QuotaCronGraceEmailer); ok && p != nil {
-		users, err := emitter.ExpirePastDueGraceWithUsers(ctx, graceHours)
-		if err != nil {
-			log.Printf("billing quota cron: ExpirePastDueGraceWithUsers err=%v", err)
-			return
-		}
-		if len(users) > 0 {
-			log.Printf("billing quota cron: expire_past_due_grace rows=%d hours=%d (with email)",
-				len(users), graceHours)
-		}
-		for _, u := range users {
-			msg := email.Message{
-				ToUserID:       u.ID,
-				ToAddress:      u.Email,
-				Template:       email.TemplatePaymentGraceFinal,
-				IdempotencyKey: "payment_grace_final:" + u.ID,
-				Variables: map[string]any{
-					"PortalURL": "",
-				},
-			}
-			if err := p.Send(ctx, msg); err != nil {
-				log.Printf("payment_grace_final email enqueue failed user=%s: %v", u.ID, err)
-			}
-		}
+		expirePastDueGraceWithEmail(ctx, emitter, p, graceHours)
 		return
 	}
+	n, err = store.ExpirePastDueGrace(ctx, graceHours)
+	runQuotaStep("ExpirePastDueGrace", fmt.Sprintf("expire_past_due_grace hours=%d", graceHours), n, err)
+}
 
-	if n, err := store.ExpirePastDueGrace(ctx, graceHours); err != nil {
-		log.Printf("billing quota cron: ExpirePastDueGrace err=%v", err)
-	} else if n > 0 {
-		log.Printf("billing quota cron: expire_past_due_grace rows=%d hours=%d", n, graceHours)
+// runQuotaStep logs one count-returning cron step: err at WARN, non-zero
+// rows at INFO.
+func runQuotaStep(errLabel, rowsLabel string, n int64, err error) {
+	if err != nil {
+		log.Printf("billing quota cron: %s err=%v", errLabel, err)
+		return
+	}
+	if n > 0 {
+		log.Printf("billing quota cron: %s rows=%d", rowsLabel, n)
+	}
+}
+
+func expirePastDueGraceWithEmail(ctx context.Context, emitter QuotaCronGraceEmailer, p *email.Pipeline, graceHours int) {
+	users, err := emitter.ExpirePastDueGraceWithUsers(ctx, graceHours)
+	if err != nil {
+		log.Printf("billing quota cron: ExpirePastDueGraceWithUsers err=%v", err)
+		return
+	}
+	logQuotaEmailRows(len(users), graceHours)
+	for _, u := range users {
+		sendGraceFinalEmail(ctx, p, u)
+	}
+}
+
+func logQuotaEmailRows(n, graceHours int) {
+	if n > 0 {
+		log.Printf("billing quota cron: expire_past_due_grace rows=%d hours=%d (with email)", n, graceHours)
+	}
+}
+
+func sendGraceFinalEmail(ctx context.Context, p *email.Pipeline, u db.ExpiredGraceUser) {
+	msg := email.Message{
+		ToUserID:       u.ID,
+		ToAddress:      u.Email,
+		Template:       email.TemplatePaymentGraceFinal,
+		IdempotencyKey: "payment_grace_final:" + u.ID,
+		Variables:      map[string]any{"PortalURL": ""},
+	}
+	if err := p.Send(ctx, msg); err != nil {
+		log.Printf("payment_grace_final email enqueue failed user=%s: %v", u.ID, err)
 	}
 }
 

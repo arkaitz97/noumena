@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 )
 
@@ -301,9 +302,12 @@ func (q *SQLiteQuery) GetRateLimitStatus(ctx context.Context, userKey string, wi
 	err := q.db.QueryRowContext(ctx,
 		`SELECT count FROM rate_limit_buckets WHERE user_key = ? AND window_start = ?`,
 		userKey, windowStart.Format(time.RFC3339)).Scan(&count)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
+		// No bucket yet for this window: full budget available.
 		count = 0
-	} else if err != nil {
+		err = nil
+	}
+	if err != nil {
 		return nil, err
 	}
 

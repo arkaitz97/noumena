@@ -14,6 +14,7 @@ package email
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -198,32 +199,7 @@ func encodeSubject(s string) string {
 // base64Std is the stdlib base64 with no padding stripping (RFC 2047
 // requires standard base64 with padding).
 func base64Std(s string) string {
-	const tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-	src := []byte(s)
-	var dst strings.Builder
-	for i := 0; i < len(src); i += 3 {
-		var n uint32
-		switch len(src) - i {
-		case 1:
-			n = uint32(src[i]) << 16
-			dst.WriteByte(tbl[(n>>18)&0x3f])
-			dst.WriteByte(tbl[(n>>12)&0x3f])
-			dst.WriteString("==")
-		case 2:
-			n = uint32(src[i])<<16 | uint32(src[i+1])<<8
-			dst.WriteByte(tbl[(n>>18)&0x3f])
-			dst.WriteByte(tbl[(n>>12)&0x3f])
-			dst.WriteByte(tbl[(n>>6)&0x3f])
-			dst.WriteByte('=')
-		default:
-			n = uint32(src[i])<<16 | uint32(src[i+1])<<8 | uint32(src[i+2])
-			dst.WriteByte(tbl[(n>>18)&0x3f])
-			dst.WriteByte(tbl[(n>>12)&0x3f])
-			dst.WriteByte(tbl[(n>>6)&0x3f])
-			dst.WriteByte(tbl[n&0x3f])
-		}
-	}
-	return dst.String()
+	return base64.StdEncoding.EncodeToString([]byte(s))
 }
 
 // boundarySalt returns a short pseudo-random hex string. Crypto-quality

@@ -24,31 +24,31 @@ type PriceMap struct {
 	AgencyAnnual   string
 }
 
+// priceEntry is one (plan, interval) → Stripe price ID row of the catalog.
+type priceEntry struct {
+	plan, interval, price string
+}
+
+// entries is the single source of truth for the price catalog: a data table
+// instead of nested switch statements (open for new plans, closed for edits).
+func (m PriceMap) entries() []priceEntry {
+	return []priceEntry{
+		{PlanCreator, IntervalMonth, m.CreatorMonthly},
+		{PlanCreator, IntervalYear, m.CreatorAnnual},
+		{PlanStudio, IntervalMonth, m.StudioMonthly},
+		{PlanStudio, IntervalYear, m.StudioAnnual},
+		{PlanAgency, IntervalMonth, m.AgencyMonthly},
+		{PlanAgency, IntervalYear, m.AgencyAnnual},
+	}
+}
+
 // Lookup returns the Stripe price ID for a (plan, interval) pair. The empty
 // string and an error are returned when the pair is unknown or the price is
 // not configured.
 func (m PriceMap) Lookup(plan, interval string) (string, error) {
-	switch plan {
-	case PlanCreator:
-		switch interval {
-		case IntervalMonth:
-			return m.CreatorMonthly, nilIfSet(m.CreatorMonthly, "creator monthly")
-		case IntervalYear:
-			return m.CreatorAnnual, nilIfSet(m.CreatorAnnual, "creator annual")
-		}
-	case PlanStudio:
-		switch interval {
-		case IntervalMonth:
-			return m.StudioMonthly, nilIfSet(m.StudioMonthly, "studio monthly")
-		case IntervalYear:
-			return m.StudioAnnual, nilIfSet(m.StudioAnnual, "studio annual")
-		}
-	case PlanAgency:
-		switch interval {
-		case IntervalMonth:
-			return m.AgencyMonthly, nilIfSet(m.AgencyMonthly, "agency monthly")
-		case IntervalYear:
-			return m.AgencyAnnual, nilIfSet(m.AgencyAnnual, "agency annual")
+	for _, e := range m.entries() {
+		if e.plan == plan && e.interval == interval {
+			return e.price, nilIfSet(e.price, plan+" "+interval)
 		}
 	}
 	return "", fmt.Errorf("unknown plan/interval: %q/%q", plan, interval)
@@ -65,19 +65,10 @@ func nilIfSet(v, name string) error {
 // return (plan, interval). Used by the customer.subscription.updated handler
 // to map the authoritative Stripe state back into our local catalog.
 func (m PriceMap) PlanFromPriceID(priceID string) (plan, interval string, ok bool) {
-	switch priceID {
-	case m.CreatorMonthly:
-		return PlanCreator, IntervalMonth, true
-	case m.CreatorAnnual:
-		return PlanCreator, IntervalYear, true
-	case m.StudioMonthly:
-		return PlanStudio, IntervalMonth, true
-	case m.StudioAnnual:
-		return PlanStudio, IntervalYear, true
-	case m.AgencyMonthly:
-		return PlanAgency, IntervalMonth, true
-	case m.AgencyAnnual:
-		return PlanAgency, IntervalYear, true
+	for _, e := range m.entries() {
+		if e.price != "" && e.price == priceID {
+			return e.plan, e.interval, true
+		}
 	}
 	return "", "", false
 }
@@ -166,12 +157,26 @@ func (c *StripeClient) PriceMap() PriceMap { return c.prices }
 // positive (a negative value would be a credit). The Idempotency-Key
 // header makes retries collapse server-side.
 func (c *StripeClient) CreateCustomerBalanceCharge(ctx context.Context, customerID string, amountCents int64, description, idempotencyKey string, metadata map[string]string) (string, error) {
+	if err := validateBalanceCharge(customerID, amountCents); err != nil {
+		return "", err
+	}
+	params := balanceChargeParams(customerID, amountCents, description, idempotencyKey, metadata)
+	params.Context = ctx
+	return postBalanceCharge(customerID, amountCents, params)
+}
+
+// validateBalanceCharge guards the debit preconditions.
+func validateBalanceCharge(customerID string, amountCents int64) error {
 	if customerID == "" {
-		return "", errors.New("customerID is required")
+		return errors.New("customerID is required")
 	}
 	if amountCents <= 0 {
-		return "", fmt.Errorf("amountCents must be positive, got %d", amountCents)
+		return fmt.Errorf("amountCents must be positive, got %d", amountCents)
 	}
+	return nil
+}
+
+func balanceChargeParams(customerID string, amountCents int64, description, idempotencyKey string, metadata map[string]string) *stripe.CustomerBalanceTransactionParams {
 	params := &stripe.CustomerBalanceTransactionParams{
 		Customer:    stripe.String(customerID),
 		Amount:      stripe.Int64(amountCents),
@@ -184,7 +189,10 @@ func (c *StripeClient) CreateCustomerBalanceCharge(ctx context.Context, customer
 	for k, v := range metadata {
 		params.AddMetadata(k, v)
 	}
-	params.Context = ctx
+	return params
+}
+
+func postBalanceCharge(customerID string, amountCents int64, params *stripe.CustomerBalanceTransactionParams) (string, error) {
 	txn, err := customerbalancetransaction.New(params)
 	if err != nil {
 		log.Printf("billing: stripe balance transaction failed customer=%s amount=%d err=%v", customerID, amountCents, err)
@@ -198,6 +206,15 @@ func (c *StripeClient) CreateCheckoutSession(ctx context.Context, userID, plan, 
 	if err != nil {
 		return nil, err
 	}
+	params := c.checkoutParams(userID, priceID, customerEmail)
+	params.Context = ctx
+	return newCheckoutSession(params)
+}
+
+// checkoutParams builds the Checkout request. Task 3.3: propagate user_id via
+// metadata so subscription/invoice events that lack a Checkout-session
+// context can still resolve us.
+func (c *StripeClient) checkoutParams(userID, priceID, customerEmail string) *stripe.CheckoutSessionParams {
 	params := &stripe.CheckoutSessionParams{
 		Mode: stripe.String(string(stripe.CheckoutSessionModeSubscription)),
 		LineItems: []*stripe.CheckoutSessionLineItemParams{
@@ -208,13 +225,13 @@ func (c *StripeClient) CreateCheckoutSession(ctx context.Context, userID, plan, 
 		CustomerEmail:     stripe.String(customerEmail),
 		ClientReferenceID: stripe.String(userID),
 	}
-	// Task 3.3: propagate user_id via metadata so subscription/invoice
-	// events that lack a Checkout-session context can still resolve us.
 	params.AddMetadata("user_id", userID)
 	params.SubscriptionData = &stripe.CheckoutSessionSubscriptionDataParams{}
 	params.SubscriptionData.AddMetadata("user_id", userID)
+	return params
+}
 
-	params.Context = ctx
+func newCheckoutSession(params *stripe.CheckoutSessionParams) (*stripe.CheckoutSession, error) {
 	s, err := session.New(params)
 	if err != nil {
 		log.Printf("billing: stripe CheckoutSession.New failed: %v", err)
@@ -227,11 +244,12 @@ func (c *StripeClient) CreatePortalSession(ctx context.Context, customerID strin
 	if customerID == "" {
 		return nil, errors.New("customerID is required")
 	}
-	params := &stripe.BillingPortalSessionParams{
-		Customer:  stripe.String(customerID),
-		ReturnURL: stripe.String(c.successURL),
-	}
+	params := &stripe.BillingPortalSessionParams{Customer: stripe.String(customerID), ReturnURL: stripe.String(c.successURL)}
 	params.Context = ctx
+	return newBillingPortalSession(params)
+}
+
+func newBillingPortalSession(params *stripe.BillingPortalSessionParams) (*stripe.BillingPortalSession, error) {
 	s, err := billingportal.New(params)
 	if err != nil {
 		log.Printf("billing: stripe BillingPortalSession.New failed: %v", err)
@@ -273,32 +291,26 @@ func (c *StripeClient) CancelSubscription(ctx context.Context, subID string) err
 	params := &stripe.SubscriptionCancelParams{}
 	params.Context = ctx
 	_, err := stripesub.Cancel(subID, params)
-	if err != nil {
-		var serr *stripe.Error
-		if errors.As(err, &serr) && serr.Code == stripe.ErrorCodeResourceMissing {
-			log.Printf("billing: CancelSubscription sub=%s already missing at Stripe (treating as success)", subID)
-			return nil
-		}
-		return err
-	}
-	return nil
+	return ignoreMissingSubscription(subID, err)
 }
 
 func (c *StripeClient) CancelSubscriptionAtPeriodEnd(ctx context.Context, subID string) error {
-	params := &stripe.SubscriptionParams{
-		CancelAtPeriodEnd: stripe.Bool(true),
-	}
+	params := &stripe.SubscriptionParams{CancelAtPeriodEnd: stripe.Bool(true)}
 	params.Context = ctx
 	_, err := stripesub.Update(subID, params)
-	if err != nil {
-		var serr *stripe.Error
-		if errors.As(err, &serr) && serr.Code == stripe.ErrorCodeResourceMissing {
-			log.Printf("billing: CancelSubscriptionAtPeriodEnd sub=%s already missing (treating as success)", subID)
-			return nil
-		}
-		return err
+	return ignoreMissingSubscription(subID, err)
+}
+
+// ignoreMissingSubscription maps Stripe's `resource_missing` to success: the
+// subscription is already canceled or never existed, so the caller's
+// post-condition ("no longer billing the user") is already satisfied.
+func ignoreMissingSubscription(subID string, err error) error {
+	var serr *stripe.Error
+	if errors.As(err, &serr) && serr.Code == stripe.ErrorCodeResourceMissing {
+		log.Printf("billing: subscription %s already missing at Stripe (treating as success)", subID)
+		return nil
 	}
-	return nil
+	return err
 }
 
 // MockClient is a no-op Client used by tests. It returns deterministic

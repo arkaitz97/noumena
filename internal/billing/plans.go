@@ -93,14 +93,13 @@ func LimitsFor(plan string) PlanLimits {
 	return catalog[PlanFree]
 }
 
+// paidPlans are the plans that currently incur a Stripe charge.
+var paidPlans = map[string]bool{PlanCreator: true, PlanStudio: true, PlanAgency: true}
+
 // IsPaidPlan reports whether the plan currently incurs a Stripe charge.
 // Used by enforcement and overage logic.
 func IsPaidPlan(plan string) bool {
-	switch plan {
-	case PlanCreator, PlanStudio, PlanAgency:
-		return true
-	}
-	return false
+	return paidPlans[plan]
 }
 
 // TracksOverage reports whether the system records overage rows in

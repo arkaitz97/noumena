@@ -11,6 +11,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -70,78 +71,118 @@ type deleteAccountRequest struct {
 // reversible window is a no-op (returns 202 with the existing
 // reversible_until timestamp).
 func (h *AccountHandler) DeleteAccount(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.requireDeletionUser(w, r)
+	if !ok {
+		return
+	}
+	if !h.confirmDeletionEmail(w, r, user) {
+		return
+	}
+	if !h.markDeletionRequested(w, r, user) {
+		return
+	}
+	h.cancelStripeSubscription(r, user)
+	job, ok := h.scheduleDeletionJob(w, r, user.ID)
+	if !ok {
+		return
+	}
+	until := time.Now().UTC().Add(time.Duration(h.Cfg.DeletionReversibleHours) * time.Hour)
+	h.sendDeletionScheduledEmail(r, user, until)
+	writeDeletionAccepted(w, job.ID, until)
+}
+
+// requireDeletionUser resolves the caller and loads their user row.
+func (h *AccountHandler) requireDeletionUser(w http.ResponseWriter, r *http.Request) (*db.User, bool) {
 	userID, ok := r.Context().Value(UserIDKey).(string)
 	if !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
+		return nil, false
 	}
 	user, err := h.Queries.GetUserByID(r.Context(), userID)
 	if err != nil || user == nil {
 		http.Error(w, "user not found", http.StatusNotFound)
-		return
+		return nil, false
 	}
+	return user, true
+}
 
+// confirmDeletionEmail checks the typed confirmation against the account
+// email (case-insensitive).
+func (h *AccountHandler) confirmDeletionEmail(w http.ResponseWriter, r *http.Request, user *db.User) bool {
 	var req deleteAccountRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(req.EmailConfirmation), user.Email) {
+		return true
+	}
+	http.Error(w, "email_confirmation does not match account email", http.StatusBadRequest)
+	return false
+}
+
+// markDeletionRequested sets deletion_requested_at so a parallel login
+// attempt sees the pending-deletion state immediately (idempotent). The
+// token_version bump is left to the deletion worker once it actually
+// starts deleting — doing it here would lock the user out of cancelling.
+func (h *AccountHandler) markDeletionRequested(w http.ResponseWriter, r *http.Request, user *db.User) bool {
+	if user.DeletionRequestedAt != nil {
+		return true
+	}
+	if _, err := h.exec(r, `UPDATE users SET deletion_requested_at = `+db.NowUTC()+` WHERE id = ?`, user.ID); err != nil {
+		http.Error(w, "failed to mark deletion", http.StatusInternalServerError)
+		return false
+	}
+	_ = h.Queries.InsertAuditLog(r.Context(), user.ID, "deletion_requested", `{"user_id":"`+user.ID+`"}`, clientIP(r, h.Cfg))
+	return true
+}
+
+// cancelStripeSubscription cancels a live subscription if present. Errors
+// are logged but do not block the deletion path — the user's intent is
+// paramount, and `customer.subscription.deleted` will eventually fire and
+// reconcile our state regardless.
+func (h *AccountHandler) cancelStripeSubscription(r *http.Request, user *db.User) {
+	if user.StripeSubscriptionID == nil || *user.StripeSubscriptionID == "" || h.Billing == nil {
 		return
 	}
-	if !strings.EqualFold(strings.TrimSpace(req.EmailConfirmation), user.Email) {
-		http.Error(w, "email_confirmation does not match account email", http.StatusBadRequest)
-		return
+	if err := h.Billing.CancelSubscription(r.Context(), *user.StripeSubscriptionID); err != nil {
+		log.Printf("DeleteAccount: stripe CancelSubscription user=%s sub=%s err=%v",
+			user.ID, *user.StripeSubscriptionID, err)
 	}
+}
 
-	// Mark the user row first so a parallel login attempt sees the
-	// pending-deletion state immediately. The token_version bump (not
-	// done here — it would lock the user out of cancelling) is left to
-	// the deletion worker once it actually starts deleting.
-	if user.DeletionRequestedAt == nil {
-		if _, err := h.exec(r, `UPDATE users SET deletion_requested_at = `+db.NowUTC()+` WHERE id = ?`, userID); err != nil {
-			http.Error(w, "failed to mark deletion", http.StatusInternalServerError)
-			return
-		}
-		_ = h.Queries.InsertAuditLog(r.Context(), userID, "deletion_requested", `{"user_id":"`+userID+`"}`, clientIP(r, h.Cfg))
-	}
-
-	// Cancel the live Stripe subscription, if any. Errors are logged
-	// but do not block the deletion path — the user's intent is
-	// paramount, and `customer.subscription.deleted` will eventually
-	// fire and reconcile our state regardless.
-	if user.StripeSubscriptionID != nil && *user.StripeSubscriptionID != "" && h.Billing != nil {
-		if err := h.Billing.CancelSubscription(r.Context(), *user.StripeSubscriptionID); err != nil {
-			log.Printf("DeleteAccount: stripe CancelSubscription user=%s sub=%s err=%v",
-				userID, *user.StripeSubscriptionID, err)
-		}
-	}
-
-	// Count tracked channels for progress reporting.
+// scheduleDeletionJob queues the idempotent account_deletion_jobs row with
+// the tracked-channel count for progress reporting.
+func (h *AccountHandler) scheduleDeletionJob(w http.ResponseWriter, r *http.Request, userID string) (*db.AccountDeletionJob, bool) {
 	channels, _ := h.Queries.GetUserTrackingChannels(r.Context(), userID)
 	job, err := h.Queries.ScheduleAccountDeletion(r.Context(), userID, len(channels))
 	if err != nil {
 		http.Error(w, "failed to schedule deletion", http.StatusInternalServerError)
+		return nil, false
+	}
+	return job, true
+}
+
+// sendDeletionScheduledEmail is non-fatal: the users row already carries
+// deletion_requested_at; the worker will proceed regardless.
+func (h *AccountHandler) sendDeletionScheduledEmail(r *http.Request, user *db.User, reversibleUntil time.Time) {
+	if h.Pipeline == nil {
 		return
 	}
+	_ = h.Pipeline.Send(r.Context(), email.Message{
+		Template:       email.TemplateDeletionScheduled,
+		ToUserID:       user.ID,
+		ToAddress:      user.Email,
+		IdempotencyKey: "deletion_scheduled:" + user.ID,
+		Variables:      map[string]any{"ReversibleUntil": reversibleUntil.Format(time.RFC1123)},
+	})
+}
 
-	// Emit the deletion_scheduled email. Failure is non-fatal — the
-	// users row already carries deletion_requested_at; the worker will
-	// proceed regardless.
-	reversibleUntil := time.Now().UTC().Add(time.Duration(h.Cfg.DeletionReversibleHours) * time.Hour)
-	if h.Pipeline != nil {
-		_ = h.Pipeline.Send(r.Context(), email.Message{
-			Template:       email.TemplateDeletionScheduled,
-			ToUserID:       userID,
-			ToAddress:      user.Email,
-			IdempotencyKey: "deletion_scheduled:" + userID,
-			Variables: map[string]any{
-				"ReversibleUntil": reversibleUntil.Format(time.RFC1123),
-			},
-		})
-	}
-
+func writeDeletionAccepted(w http.ResponseWriter, jobID string, reversibleUntil time.Time) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"job_id":           job.ID,
+		"job_id":           jobID,
 		"reversible_until": reversibleUntil,
 		"status":           "scheduled",
 	})
@@ -297,83 +338,131 @@ var emailRe = regexp.MustCompile(`^[^\s@]+@[^\s@]+\.[^\s@]+$`)
 //     and email_verified_at is cleared, so the user re-authenticates with
 //     the old email and completes the change from the new inbox.
 func (h *AccountHandler) PatchProfile(w http.ResponseWriter, r *http.Request) {
+	userID, user, newEmail, ok := h.validateEmailChange(w, r)
+	if !ok {
+		return
+	}
+	if !h.revokeSessionsAndUnverify(w, r, userID) {
+		return
+	}
+	raw, ok := h.storeEmailChangeToken(w, r, userID, newEmail)
+	if !ok {
+		return
+	}
+	h.sendEmailChangeEmail(r, userID, newEmail, raw)
+	writeEmailChangePending(w, user, newEmail)
+}
+
+// validateEmailChange decodes the request and applies every precondition:
+// format, not-the-current-email, not-owned-by-another-account.
+func (h *AccountHandler) validateEmailChange(w http.ResponseWriter, r *http.Request) (string, *db.User, string, bool) {
 	userID, ok := r.Context().Value(UserIDKey).(string)
 	if !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
+		return "", nil, "", false
 	}
+	newEmail, ok := decodeRequestedEmail(w, r)
+	if !ok {
+		return userID, nil, "", false
+	}
+	user, err := h.Queries.GetUserByID(r.Context(), userID)
+	if err != nil || user == nil {
+		http.Error(w, "user not found", http.StatusNotFound)
+		return userID, nil, "", false
+	}
+	if strings.EqualFold(newEmail, user.Email) {
+		http.Error(w, "that is already your email", http.StatusBadRequest)
+		return userID, nil, "", false
+	}
+	if h.emailTakenByOther(r.Context(), newEmail, userID) {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"code":  "email_in_use",
+			"error": "that email is already in use",
+		})
+		return userID, nil, "", false
+	}
+	return userID, user, newEmail, true
+}
+
+// decodeRequestedEmail normalizes and validates the requested address.
+func decodeRequestedEmail(w http.ResponseWriter, r *http.Request) (string, bool) {
 	var req struct {
 		Email string `json:"email"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
-		return
+		return "", false
 	}
 	newEmail := strings.ToLower(strings.TrimSpace(req.Email))
 	if newEmail == "" {
 		http.Error(w, "email is required", http.StatusBadRequest)
-		return
+		return "", false
 	}
 	if !emailRe.MatchString(newEmail) {
 		http.Error(w, "invalid email address", http.StatusBadRequest)
-		return
+		return "", false
 	}
+	return newEmail, true
+}
 
-	user, err := h.Queries.GetUserByID(r.Context(), userID)
-	if err != nil || user == nil {
-		http.Error(w, "user not found", http.StatusNotFound)
-		return
-	}
-	if strings.EqualFold(newEmail, user.Email) {
-		http.Error(w, "that is already your email", http.StatusBadRequest)
-		return
-	}
-	if existing, _ := h.Queries.GetUserByEmail(r.Context(), newEmail); existing != nil && existing.ID != userID {
-		writeJSON(w, http.StatusConflict, map[string]string{
-			"code":  "email_in_use",
-			"error": "that email is already in use",
-		})
-		return
-	}
+// emailTakenByOther reports whether the address belongs to a different account.
+func (h *AccountHandler) emailTakenByOther(ctx context.Context, email, userID string) bool {
+	existing, _ := h.Queries.GetUserByEmail(ctx, email)
+	return existing != nil && existing.ID != userID
+}
 
-	// Revoke all existing sessions: the user re-authenticates with the old
-	// email until the new one verifies (consistent with password reset).
+// revokeSessionsAndUnverify bumps token_version (all sessions, including
+// this one, are revoked) and clears email_verified_at: the account is
+// unverified until the new address confirms, and the user re-authenticates
+// with the old email (consistent with password reset).
+func (h *AccountHandler) revokeSessionsAndUnverify(w http.ResponseWriter, r *http.Request, userID string) bool {
 	if err := h.Queries.IncrementTokenVersion(r.Context(), userID); err != nil {
 		http.Error(w, "failed to invalidate sessions", http.StatusInternalServerError)
-		return
+		return false
 	}
-	// Account is unverified until the new address confirms.
 	if _, err := h.exec(r, `UPDATE users SET email_verified_at = NULL WHERE id = ?`, userID); err != nil {
 		http.Error(w, "failed to update profile", http.StatusInternalServerError)
-		return
+		return false
 	}
+	return true
+}
 
-	// Replace any previous pending change, then store the new one.
+// storeEmailChangeToken replaces any previous pending change with a new
+// single-use token and returns the raw token for the verification link.
+func (h *AccountHandler) storeEmailChangeToken(w http.ResponseWriter, r *http.Request, userID, newEmail string) (string, bool) {
 	if err := h.Queries.InvalidateEmailChangeTokensForUser(r.Context(), userID); err != nil {
 		http.Error(w, "failed to update profile", http.StatusInternalServerError)
-		return
+		return "", false
 	}
 	raw, hash, err := auth.GenerateRefreshToken()
 	if err != nil {
 		http.Error(w, "failed to issue verification token", http.StatusInternalServerError)
-		return
+		return "", false
 	}
 	expiresAt := time.Now().Add(config.Default.EmailVerificationTTL)
 	if err := h.Queries.InsertEmailChangeToken(r.Context(), userID, newEmail, hash, expiresAt); err != nil {
 		http.Error(w, "failed to store verification token", http.StatusInternalServerError)
+		return "", false
+	}
+	return raw, true
+}
+
+// sendEmailChangeEmail emails the verification link to the NEW address;
+// failure is non-fatal — the change simply stays pending until resend.
+func (h *AccountHandler) sendEmailChangeEmail(r *http.Request, userID, newEmail, raw string) {
+	if h.Pipeline == nil {
 		return
 	}
+	_ = h.Pipeline.Send(r.Context(), email.Message{
+		Template:       email.TemplateEmailVerification,
+		ToUserID:       userID,
+		ToAddress:      newEmail,
+		IdempotencyKey: "email_change:" + userID + ":" + newEmail,
+		Variables:      map[string]any{"VerifyURL": emailLink("/verify-email", raw)},
+	})
+}
 
-	if h.Pipeline != nil {
-		_ = h.Pipeline.Send(r.Context(), email.Message{
-			Template:       email.TemplateEmailVerification,
-			ToUserID:       userID,
-			ToAddress:      newEmail,
-			IdempotencyKey: "email_change:" + userID + ":" + newEmail,
-			Variables:      map[string]any{"VerifyURL": emailLink("/verify-email", raw)},
-		})
-	}
-
+func writeEmailChangePending(w http.ResponseWriter, user *db.User, newEmail string) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":                  user.ID,
 		"email":               user.Email,

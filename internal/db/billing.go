@@ -69,7 +69,8 @@ func (q *SQLiteQuery) ApplySubscriptionUpdate(ctx context.Context, tx *sql.Tx, u
 	}
 	if u.BillingIntervalClear {
 		sets = append(sets, "billing_interval = NULL")
-	} else if u.BillingInterval != nil {
+	}
+	if !u.BillingIntervalClear && u.BillingInterval != nil {
 		add("billing_interval", *u.BillingInterval)
 	}
 	if u.StripeCustomerID != nil {
@@ -92,12 +93,14 @@ func (q *SQLiteQuery) ApplySubscriptionUpdate(ctx context.Context, tx *sql.Tx, u
 	}
 	if u.PastDueSinceClear {
 		sets = append(sets, "past_due_since = NULL")
-	} else if u.PastDueSince != nil {
+	}
+	if !u.PastDueSinceClear && u.PastDueSince != nil {
 		add("past_due_since", u.PastDueSince.Format(time.RFC3339))
 	}
 	if u.StripeSubscriptionIDClear {
 		sets = append(sets, "stripe_subscription_id = NULL")
-	} else if u.StripeSubscriptionID != nil {
+	}
+	if !u.StripeSubscriptionIDClear && u.StripeSubscriptionID != nil {
 		add("stripe_subscription_id", *u.StripeSubscriptionID)
 	}
 	if len(sets) == 0 {

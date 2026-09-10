@@ -135,18 +135,24 @@ func (w *ExportWorker) run(ctx context.Context) {
 // once before the ticker starts, so no job is mid-flight: every row in
 // 'exporting' at boot is a crash leftover.
 func (w *ExportWorker) recoverAtBoot(ctx context.Context) {
+	w.sweepOrphanZips(ctx)
+	w.resetStuck(ctx)
+}
+
+// sweepOrphanZips removes ZIPs left by finished-but-uncleaned jobs; a
+// listing failure is logged and skipped so the requeue below still runs.
+func (w *ExportWorker) sweepOrphanZips(ctx context.Context) {
 	stale, err := w.Queries.ListExportJobsForSweep(ctx)
 	if err != nil {
 		w.Logger.Printf("export_worker_sweep_list_err err=%v", err)
-	} else {
-		for _, job := range stale {
-			if err := ctx.Err(); err != nil {
-				return
-			}
-			w.removeJobZip(job)
-		}
+		return
 	}
-	w.resetStuck(ctx)
+	for _, job := range stale {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		w.removeJobZip(job)
+	}
 }
 
 // resetStuck requeues 'exporting' jobs older than stuckExportResetAfter
@@ -222,19 +228,33 @@ func (w *ExportWorker) runJob(ctx context.Context, job *db.DataExportJob) error 
 	if err != nil {
 		return fmt.Errorf("load bundle: %w", err)
 	}
+	zipPath, err := w.jobZipPath(job)
+	if err != nil {
+		return err
+	}
+	partial, err := w.writeJobZip(ctx, job, zipPath, bundle)
+	if err != nil {
+		return err
+	}
+	return w.finishExport(ctx, job, bundle, zipPath, partial)
+}
 
-	// Build paths.
+// jobZipPath builds (and creates) the per-user storage directory.
+func (w *ExportWorker) jobZipPath(job *db.DataExportJob) (string, error) {
 	userDir := filepath.Join(w.Cfg.ExportStorageDir, job.UserID)
 	if err := os.MkdirAll(userDir, 0o750); err != nil {
-		return fmt.Errorf("mkdir storage: %w", err)
+		return "", fmt.Errorf("mkdir storage: %w", err)
 	}
-	zipPath := filepath.Join(userDir, job.ID+".zip")
+	return filepath.Join(userDir, job.ID+".zip"), nil
+}
 
+// writeJobZip writes the archive, removing a half-written file on failure,
+// and records the on-disk size for metrics.
+func (w *ExportWorker) writeJobZip(ctx context.Context, job *db.DataExportJob, zipPath string, bundle *db.UserExportBundle) (bool, error) {
 	partial, err := w.writeZip(zipPath, bundle)
 	if err != nil {
-		// Best-effort cleanup of a half-written file.
-		_ = os.Remove(zipPath)
-		return fmt.Errorf("write zip: %w", err)
+		_ = os.Remove(zipPath) // Best-effort cleanup of a half-written file.
+		return false, fmt.Errorf("write zip: %w", err)
 	}
 	// otel-instrumentation: stat the final ZIP for the bytes counter.
 	// We measure on-disk size (post-compression) rather than the raw
@@ -245,45 +265,59 @@ func (w *ExportWorker) runJob(ctx context.Context, job *db.DataExportJob) error 
 	if st, statErr := os.Stat(zipPath); statErr == nil {
 		recordExportBytes(ctx, st.Size())
 	}
+	return partial, nil
+}
 
-	// Sign the download URL.
+// finishExport signs the download URL, completes the job, and notifies.
+func (w *ExportWorker) finishExport(ctx context.Context, job *db.DataExportJob, bundle *db.UserExportBundle, zipPath string, partial bool) error {
 	expiry := w.Now().Add(time.Duration(w.Cfg.ExportLinkTTLDays) * 24 * time.Hour)
-	sigParams := email.SignURL(w.Cfg.ExportSignedURLSecret, job.UserID, job.ID, expiry)
-	downloadURL := fmt.Sprintf("%s/api/exports/%s/download?%s",
-		w.Cfg.AppBaseURL, job.ID, sigParams)
-
+	downloadURL := signedExportURL(w.Cfg, job, expiry)
 	if err := w.Queries.MarkDataExportCompleted(ctx, job.ID, job.UserID, zipPath, downloadURL, expiry, partial); err != nil {
-		// The ZIP is on disk but the completion tx failed (and rolled
-		// back — no URL-less 'completed' row exists). Remove the file
-		// and return the job to the retryable queue instead of leaving
-		// an orphan (fix-export-pipeline 4.1 / spec: mark-completion
-		// failure). MarkDataExportCompleted is atomic: either both the
-		// job flip and the users mirror commit, or neither does.
-		w.removeJobZip(job)
-		if rErr := w.Queries.RequeueDataExport(ctx, job.ID); rErr != nil {
-			w.Logger.Printf("export_worker_requeue_err job=%s err=%v", job.ID, rErr)
-		}
-		return fmt.Errorf("%w: %v", errExportRequeued, err)
+		return w.requeueFailedCompletion(ctx, job, err)
 	}
-
-	// Email is best-effort: the user's own dashboard also surfaces the
-	// link via /api/user/me. We log but don't fail the job if mail
-	// fails — the file + signed URL exist regardless.
-	if w.Pipeline != nil {
-		if err := w.Pipeline.Send(ctx, email.Message{
-			Template:       email.TemplateExportReady,
-			ToUserID:       bundle.User.ID,
-			ToAddress:      bundle.User.Email,
-			IdempotencyKey: "export_ready:" + job.ID,
-			Variables: map[string]any{
-				"DownloadURL": downloadURL,
-				"ExpiresAt":   expiry.Format(time.RFC1123),
-			},
-		}); err != nil {
-			w.Logger.Printf("export_worker_email_err job=%s err=%v", job.ID, err)
-		}
-	}
+	w.sendExportReadyEmail(ctx, job, bundle, downloadURL, expiry)
 	return nil
+}
+
+func signedExportURL(cfg *config.Config, job *db.DataExportJob, expiry time.Time) string {
+	sigParams := email.SignURL(cfg.ExportSignedURLSecret, job.UserID, job.ID, expiry)
+	return fmt.Sprintf("%s/api/exports/%s/download?%s", cfg.AppBaseURL, job.ID, sigParams)
+}
+
+// requeueFailedCompletion handles a failed completion mark: the ZIP is on
+// disk but the completion tx failed (and rolled back — no URL-less
+// 'completed' row exists). Remove the file and return the job to the
+// retryable queue instead of leaving an orphan (fix-export-pipeline 4.1 /
+// spec: mark-completion failure). MarkDataExportCompleted is atomic:
+// either both the job flip and the users mirror commit, or neither does.
+func (w *ExportWorker) requeueFailedCompletion(ctx context.Context, job *db.DataExportJob, cause error) error {
+	w.removeJobZip(job)
+	if rErr := w.Queries.RequeueDataExport(ctx, job.ID); rErr != nil {
+		w.Logger.Printf("export_worker_requeue_err job=%s err=%v", job.ID, rErr)
+	}
+	return fmt.Errorf("%w: %v", errExportRequeued, cause)
+}
+
+// sendExportReadyEmail is best-effort: the user's own dashboard also
+// surfaces the link via /api/user/me. We log but don't fail the job if mail
+// fails — the file + signed URL exist regardless.
+func (w *ExportWorker) sendExportReadyEmail(ctx context.Context, job *db.DataExportJob, bundle *db.UserExportBundle, downloadURL string, expiry time.Time) {
+	if w.Pipeline == nil {
+		return
+	}
+	msg := email.Message{
+		Template:       email.TemplateExportReady,
+		ToUserID:       bundle.User.ID,
+		ToAddress:      bundle.User.Email,
+		IdempotencyKey: "export_ready:" + job.ID,
+		Variables: map[string]any{
+			"DownloadURL": downloadURL,
+			"ExpiresAt":   expiry.Format(time.RFC1123),
+		},
+	}
+	if err := w.Pipeline.Send(ctx, msg); err != nil {
+		w.Logger.Printf("export_worker_email_err job=%s err=%v", job.ID, err)
+	}
 }
 
 // writeZip serialises each bundle section to JSON and writes them into
