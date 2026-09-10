@@ -59,6 +59,10 @@ path — preserves cardinality.
 | `noumena_ingestion_errors_total` | Counter | `1` | `platform`, `reason` |
 | `noumena_ingestion_lock_contention_total` | Counter | `1` | `platform` |
 | `noumena_fetch_duration_seconds` | Histogram | `s` | `platform`, `outcome` |
+| `noumena_youtube_requests_total` | Counter | `1` | `platform`, `method`, `status` |
+| `noumena_youtube_quota_units_total` | Counter | `1` | `platform`, `method` |
+| `noumena_youtube_requests_suppressed_total` | Counter | `1` | `platform`, `reason` |
+| `noumena_youtube_discovery_total` | Counter | `1` | `platform`, `via` |
 
 `reason` enum: `rate_limited`, `token_invalid`, `unknown`,
 `dead_letter`. `outcome` enum: `success`, `error`, `timeout`.

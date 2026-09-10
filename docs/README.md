@@ -47,6 +47,8 @@ Postmortem** shape. Configuration values are referenced from
   — weekly cron cadence, idempotency, retry semantics.
 - [`ops/runbooks/youtube-oauth-setup.md`](ops/runbooks/youtube-oauth-setup.md)
   — Google Cloud Console project setup, required scopes.
+- [`ops/runbooks/youtube-quota-budget.md`](ops/runbooks/youtube-quota-budget.md)
+  — YouTube unit costs, daily/per-job budgets, fallback, checkpoint reset.
 - [`ops/runbooks/account-deletion-and-gdpr.md`](ops/runbooks/account-deletion-and-gdpr.md)
   — support workflows; `cancel_deletion` CLI usage.
 - [`ops/runbooks/channel-grace-window.md`](ops/runbooks/channel-grace-window.md)
