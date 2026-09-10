@@ -1,13 +1,13 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none">
-  <!-- Left Signal Anchor (Flat Solid Cyan) -->
-  <rect x="8" y="8" width="6.5" height="32" rx="3.25" fill="#06b6d4" />
+  <!-- Left Signal Anchor (Flat Solid Pastel Cyan) -->
+  <rect x="8" y="8" width="6.5" height="32" rx="3.25" fill="#57acc8" />
 
-  <!-- Diagonal Signal Slash (Flat Solid Cyan) -->
+  <!-- Diagonal Signal Slash (Flat Solid Pastel Cyan) -->
   <path
     d="M 17 11.25 C 17 9.45 18.45 8 20.25 8 H 20.25 C 22.05 8 23.5 9.45 23.5 11.25 L 31 36.75 C 31 38.55 29.55 40 27.75 40 H 27.75 C 25.95 40 24.5 38.55 24.5 36.75 Z"
-    fill="#06b6d4"
+    fill="#57acc8"
   />
 
-  <!-- Right Signal Anchor (Flat Solid Cyan) -->
-  <rect x="33.5" y="8" width="6.5" height="32" rx="3.25" fill="#06b6d4" />
+  <!-- Right Signal Anchor (Flat Solid Pastel Cyan) -->
+  <rect x="33.5" y="8" width="6.5" height="32" rx="3.25" fill="#57acc8" />
 </svg>

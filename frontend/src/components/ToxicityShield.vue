@@ -20,9 +20,9 @@ const pct = computed(() => {
 
 const colorClass = computed(() => {
   const p = pct.value
-  if (p < 5) return '#10b981' // green
-  if (p < 15) return '#f59e0b' // amber
-  return '#f43f5e' // rose
+  if (p < 5) return '#6fc9a0' // green
+  if (p < 15) return '#e8c47a' // amber
+  return '#f2899b' // rose
 })
 
 const radius = computed(() => (SIZE.value - STROKE.value) / 2)

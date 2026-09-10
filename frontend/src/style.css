@@ -7,37 +7,36 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 @theme {
-  /* Neutrals: cool blue-charcoal instead of raw gray — a "studio
-     instrument" temperature that makes white cards and cyan accents read
-     crisper in light mode and gives dark mode layered depth (slate-charcoal,
-     never pure #000). Keeps the zinc-* names so every existing utility
-     resolves to the new ramp. */
-  --color-zinc-50: #f6f7f9;
-  --color-zinc-100: #eceef2;
-  --color-zinc-200: #dce0e7;
-  --color-zinc-300: #c2c9d3;
-  --color-zinc-400: #99a3b2;
-  --color-zinc-500: #6d7787;
-  --color-zinc-600: #525b6b;
-  --color-zinc-700: #414a59;
-  --color-zinc-800: #28303e;
-  --color-zinc-900: #191e28;
-  --color-zinc-950: #12161f;
+  /* Neutrals: soft cool-grey with a gentle lilac tint — a low-saturation,
+     pastel base that keeps white cards airy while dark mode stays layered
+     (soft charcoal, never pure #000). Keeps the zinc-* names so every
+     existing utility resolves to the new ramp. */
+  --color-zinc-50: #f7f7fb;
+  --color-zinc-100: #eeeff5;
+  --color-zinc-200: #e1e2ec;
+  --color-zinc-300: #c9cbd9;
+  --color-zinc-400: #a3a6bb;
+  --color-zinc-500: #6f7389;
+  --color-zinc-600: #565a70;
+  --color-zinc-700: #44475c;
+  --color-zinc-800: #2c2f3f;
+  --color-zinc-900: #1c1e2a;
+  --color-zinc-950: #14151e;
 
-  /* Brand: arctic cyan — "analytics engine" identity for a comment-insights
-     product. Chosen deliberately over framework indigo; 600 tuned for text
-     contrast on white, 500 is the vivid accent, 400 for dark surfaces. */
-  --color-brand-50: #ecfeff;
-  --color-brand-100: #cffafe;
-  --color-brand-200: #a5f3fc;
-  --color-brand-300: #67e8f9;
-  --color-brand-400: #22d3ee;
-  --color-brand-500: #06b6d4;
-  --color-brand-600: #0e7490;
-  --color-brand-700: #0c6478;
-  --color-brand-800: #0a5165;
-  --color-brand-900: #0c4557;
-  --color-brand-950: #072f3d;
+  /* Brand: pastel sky-cyan — a muted, icing-soft accent family. 600 stays
+     dark enough for text contrast on white; 500/400 are the gentle
+     decorative accents for ambient surfaces and dark mode. */
+  --color-brand-50: #f3fbfd;
+  --color-brand-100: #e4f5fa;
+  --color-brand-200: #c9eaf3;
+  --color-brand-300: #a4d9e9;
+  --color-brand-400: #7cc3da;
+  --color-brand-500: #57acc8;
+  --color-brand-600: #2d7f9c;
+  --color-brand-700: #276a82;
+  --color-brand-800: #1f5568;
+  --color-brand-900: #1c4757;
+  --color-brand-950: #122e3a;
 
   /* Type: Geist Sans (UI + display, 800 for dramatic headlines) with
      Geist Mono for data/numerics. Same-foundry pairing, no Inter default. */
@@ -59,10 +58,10 @@
   --text-display-lg--line-height: 1.04;
   --text-display-lg--letter-spacing: -0.03em;
 
-  /* Elevation tinted to the neutral hue (blue-charcoal), never pure black. */
-  --shadow-card: 0 1px 2px rgb(18 22 31 / 0.04), 0 8px 24px -16px rgb(18 22 31 / 0.12);
-  --shadow-pop: 0 2px 4px rgb(18 22 31 / 0.05), 0 12px 32px -12px rgb(18 22 31 / 0.18);
-  --shadow-glow: 0 0 0 1px rgb(6 182 212 / 0.2), 0 8px 30px -8px rgb(6 182 212 / 0.35);
+  /* Elevation tinted to the neutral hue (lilac-charcoal), never pure black. */
+  --shadow-card: 0 1px 2px rgb(20 21 30 / 0.04), 0 8px 24px -16px rgb(20 21 30 / 0.12);
+  --shadow-pop: 0 2px 4px rgb(20 21 30 / 0.05), 0 12px 32px -12px rgb(20 21 30 / 0.18);
+  --shadow-glow: 0 0 0 1px rgb(87 172 200 / 0.2), 0 8px 30px -8px rgb(87 172 200 / 0.35);
 }
 
 @layer base {

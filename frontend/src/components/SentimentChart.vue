@@ -100,12 +100,12 @@ function scoreColor(score: number): string {
       >
         <defs>
           <linearGradient id="sentiment-score-stroke" x1="0" y1="0" x2="1" y2="0">
-            <stop offset="0%" stop-color="#22d3ee" />
-            <stop offset="100%" stop-color="#06b6d4" />
+            <stop offset="0%" stop-color="#7cc3da" />
+            <stop offset="100%" stop-color="#57acc8" />
           </linearGradient>
           <linearGradient id="sentiment-score-fill" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stop-color="#22d3ee" stop-opacity="0.18" />
-            <stop offset="100%" stop-color="#22d3ee" stop-opacity="0" />
+            <stop offset="0%" stop-color="#7cc3da" stop-opacity="0.18" />
+            <stop offset="100%" stop-color="#7cc3da" stop-opacity="0" />
           </linearGradient>
         </defs>
         <line

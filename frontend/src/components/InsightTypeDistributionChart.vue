@@ -7,13 +7,13 @@ const props = defineProps<{
 }>()
 
 const INSIGHT_TYPE_COLORS: Record<InsightType, string> = {
-  video_idea: '#3b82f6',
-  editing_tip: '#f59e0b',
-  feature_request: '#06b6d4',
-  collaboration_ask: '#22c55e',
-  improvement_suggestion: '#f97316',
-  content_format_request: '#ec4899',
-  other: '#71717a',
+  video_idea: '#93b4e8',
+  editing_tip: '#e8c47a',
+  feature_request: '#7cc3da',
+  collaboration_ask: '#8fd0a8',
+  improvement_suggestion: '#f0a878',
+  content_format_request: '#f0a6c8',
+  other: '#a3a6bb',
 }
 
 const INSIGHT_TYPE_LABELS: Record<InsightType, string> = {
