@@ -13,7 +13,7 @@ import (
 
 // StartTokenExpiryNotifier launches a daily ticker that scans for OAuth
 // tokens nearing expiry and emails their owner exactly once per cycle.
-func StartTokenExpiryNotifier(ctx context.Context, q db.DBQuery, mail email.EmailSender, sched TokenExpirySchedule) {
+func StartTokenExpiryNotifier(ctx context.Context, q db.ChannelStore, mail email.EmailSender, sched TokenExpirySchedule) {
 	if q == nil || mail == nil {
 		log.Println("[token-expiry] missing dependencies, job not started")
 		return
@@ -39,7 +39,7 @@ type TokenExpirySchedule struct {
 	Interval time.Duration
 }
 
-func runTokenExpiryScan(ctx context.Context, q db.DBQuery, mail email.EmailSender) {
+func runTokenExpiryScan(ctx context.Context, q db.ChannelStore, mail email.EmailSender) {
 	warning := config.Default.TokenExpiryWarningDays
 	if warning <= 0 {
 		warning = 7
@@ -102,7 +102,7 @@ func runTokenExpiryScan(ctx context.Context, q db.DBQuery, mail email.EmailSende
 // StartChannelPurgeJob launches a recurring job that scans platform_channels
 // with a deletion_scheduled_at <= NOW() and purges them if they remain
 // trackerless. The job is idempotent and safe to invoke at any cadence.
-func StartChannelPurgeJob(ctx context.Context, q db.DBQuery, interval time.Duration) {
+func StartChannelPurgeJob(ctx context.Context, q db.ChannelStore, interval time.Duration) {
 	if q == nil {
 		return
 	}
@@ -114,7 +114,7 @@ func StartChannelPurgeJob(ctx context.Context, q db.DBQuery, interval time.Durat
 	})
 }
 
-func runChannelPurge(ctx context.Context, q db.DBQuery) {
+func runChannelPurge(ctx context.Context, q db.ChannelStore) {
 	// We rely on PurgeChannelData to re-check active-tracker count inside a
 	// single transaction. The set of candidates is selected via the legacy
 	// pgx pool through ListUserChannels / GetChannelsForSync isn't suitable;

@@ -8,8 +8,8 @@ import (
 	"noumena/internal/db"
 )
 
-// refreshStore adapts a db.DBQuery to the auth.RefreshTokenStore interface.
-type refreshStore struct{ q db.DBQuery }
+// refreshStore adapts a db.AuthStore to the auth.RefreshTokenStore interface.
+type refreshStore struct{ q db.AuthStore }
 
 func (s refreshStore) InsertRefreshToken(ctx context.Context, userID, tokenHash string, expiresAt time.Time) error {
 	return s.q.InsertRefreshToken(ctx, userID, tokenHash, expiresAt)

@@ -18,7 +18,7 @@ import (
 
 // AuthHandler bundles the dependencies for the /auth/* routes.
 type AuthHandler struct {
-	Queries      db.DBQuery
+	Queries      db.AuthStore
 	EmailSender  email.EmailSender
 	CookieSecure bool
 

@@ -33,7 +33,7 @@ import (
 // — the same pattern used by InsightsHandler. In mock-mode (tests) we fall
 // back to the DBQuery interface and pass nil for the tx.
 type BillingHandler struct {
-	Queries       db.DBQuery
+	Queries       db.BillingStore
 	BillingClient billing.Client
 
 	// Pool is optional. When set (in production via cmd/api/main.go), webhook

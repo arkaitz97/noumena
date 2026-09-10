@@ -13,6 +13,8 @@ The `db` package SHALL define narrow interfaces for each handler/worker consumer
 - `EmailLogStore` — email send log, idempotency check (already exists, embedded)
 - `RateLimitStore` — rate limit increment, status, cleanup
 
+`InsightsQuery` SHALL also be defined as the full surface of the insights handlers (feed queries, search/thread/bulk mutations, aggregates, exports). It SHALL be declared separately and SHALL NOT be embedded in `DBQuery`, because its methods are implemented only by `*SQLiteQuery`; embedding them would force every `DBQuery` consumer and `MockQuery` to implement them.
+
 #### Scenario: Interface compilation
 - **WHEN** the `db` package is compiled
 - **THEN** each listed interface SHALL be a valid Go interface type with no duplicate method signatures
@@ -28,7 +30,7 @@ The `db` package SHALL define narrow interfaces for each handler/worker consumer
 Each handler struct in `internal/api/` SHALL declare its `Queries` field as the narrow interface it actually uses, not `DBQuery`. The mapping is:
 - `AuthHandler.Queries` → `AuthStore`
 - `BillingHandler.Queries` → `BillingStore`
-- `InsightsHandler.Queries` → `InsightsStore`
+- `InsightsHandler.Queries` → `InsightsQuery` (separate interface; see the narrow-interfaces requirement)
 
 #### Scenario: AuthHandler receives AuthStore
 - **WHEN** `AuthHandler` is constructed with a `Queries` field

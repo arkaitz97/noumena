@@ -14,7 +14,7 @@ import (
 //
 // Failures are logged and do not stop subsequent ticks; CASCADE foreign keys
 // remove dependent token rows automatically.
-func StartUnverifiedAccountCleanup(ctx context.Context, q db.DBQuery, staleAfter time.Duration, interval time.Duration) {
+func StartUnverifiedAccountCleanup(ctx context.Context, q db.AuthStore, staleAfter time.Duration, interval time.Duration) {
 	if interval <= 0 {
 		interval = 24 * time.Hour
 	}

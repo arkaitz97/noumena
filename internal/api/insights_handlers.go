@@ -33,11 +33,11 @@ import (
 )
 
 // InsightsHandler bundles dependencies for the insights-api endpoints. It
-// requires a *db.SQLiteQuery (not the DBQuery interface) because several
-// new methods (BuildFeedQuery-driven ones, exports CRUD, aggregates) live
-// only on the concrete type.
+// depends on db.InsightsQuery rather than db.DBQuery because the feed,
+// export and aggregate methods it uses live only on the concrete type and
+// are intentionally not part of the global DBQuery surface.
 type InsightsHandler struct {
-	Queries *db.SQLiteQuery
+	Queries db.InsightsQuery
 	Cfg     *config.Config
 }
 
