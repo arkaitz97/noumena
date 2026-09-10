@@ -89,7 +89,7 @@ func (m *rlMockQuery) InsertComment(ctx context.Context, c *db.Comment) error {
 func (m *rlMockQuery) GetUnprocessedComments(ctx context.Context, limit int) ([]*db.Comment, error) {
 	return nil, nil
 }
-func (m *rlMockQuery) GetUnprocessedCommentsByChannel(ctx context.Context, limit int) (map[string][]*db.Comment, error) {
+func (m *rlMockQuery) GetUnprocessedCommentsByChannel(ctx context.Context, limit int, maxAttempts int) (map[string][]*db.Comment, error) {
 	return nil, nil
 }
 func (m *rlMockQuery) UpdateCommentLLMData(ctx context.Context, id, category, topic, provider, model string, actionableInsights []byte, confidence float64) error {

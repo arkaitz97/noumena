@@ -7,7 +7,7 @@ import (
 
 func TestParseClassificationResponse_WellFormed(t *testing.T) {
 	raw := `[{"comment_index":0,"category":"praise","confidence":0.9,"topic":"great video","actionable_insights":[]}]`
-	got, err := ParseClassificationResponse(raw, 1)
+	got, _, err := ParseClassificationResponse(raw, 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -19,7 +19,7 @@ func TestParseClassificationResponse_WellFormed(t *testing.T) {
 
 func TestParseClassificationResponse_WithInsights(t *testing.T) {
 	raw := `[{"comment_index":0,"category":"praise","confidence":0.9,"topic":"great video","actionable_insights":[{"type":"video_idea","description":"Make a tutorial on color grading","confidence":0.85}]}]`
-	got, err := ParseClassificationResponse(raw, 1)
+	got, _, err := ParseClassificationResponse(raw, 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -34,7 +34,7 @@ func TestParseClassificationResponse_WithInsights(t *testing.T) {
 // 8.8 — markdown-wrapped JSON tolerated.
 func TestParseClassificationResponse_MarkdownFenced(t *testing.T) {
 	raw := "```json\n[{\"comment_index\":0,\"category\":\"question\",\"confidence\":0.8,\"topic\":\"x\",\"actionable_insights\":[]}]\n```"
-	got, err := ParseClassificationResponse(raw, 1)
+	got, _, err := ParseClassificationResponse(raw, 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -47,7 +47,7 @@ func TestParseClassificationResponse_TrailingCommentary(t *testing.T) {
 	raw := `[{"comment_index":0,"category":"spam","confidence":0.99,"topic":"buy crypto","actionable_insights":[]}]
 
 Hope this helps!`
-	got, err := ParseClassificationResponse(raw, 1)
+	got, _, err := ParseClassificationResponse(raw, 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -58,14 +58,21 @@ Hope this helps!`
 
 func TestParseClassificationResponse_InvalidCategory(t *testing.T) {
 	raw := `[{"comment_index":0,"category":"compliment","confidence":0.9,"topic":"x","actionable_insights":[]}]`
-	if _, err := ParseClassificationResponse(raw, 1); err == nil {
-		t.Fatal("expected error for invalid category")
+	got, missing, err := ParseClassificationResponse(raw, 1)
+	if err != nil {
+		t.Fatalf("partial parse must not abort: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("invalid category must be excluded, got %d valid", len(got))
+	}
+	if len(missing) != 1 || missing[0] != 0 {
+		t.Errorf("missing indexes = %v, want [0]", missing)
 	}
 }
 
 func TestParseClassificationResponse_InvalidInsightTypeSkipped(t *testing.T) {
 	raw := `[{"comment_index":0,"category":"praise","confidence":0.9,"topic":"x","actionable_insights":[{"type":"invalid_type","description":"bad","confidence":0.8}]}]`
-	got, err := ParseClassificationResponse(raw, 1)
+	got, _, err := ParseClassificationResponse(raw, 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -84,7 +91,7 @@ func TestParseClassificationResponse_Max5Insights(t *testing.T) {
 		{"type":"video_idea","description":"idea 6","confidence":0.9},
 		{"type":"video_idea","description":"idea 7","confidence":0.9}
 	]}]`
-	got, err := ParseClassificationResponse(raw, 1)
+	got, _, err := ParseClassificationResponse(raw, 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -99,7 +106,7 @@ func TestParseClassificationResponse_DescriptionTruncated(t *testing.T) {
 		longDesc += "a"
 	}
 	raw := `[{"comment_index":0,"category":"praise","confidence":0.9,"topic":"x","actionable_insights":[{"type":"video_idea","description":"` + longDesc + `","confidence":0.8}]}]`
-	got, err := ParseClassificationResponse(raw, 1)
+	got, _, err := ParseClassificationResponse(raw, 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -110,7 +117,7 @@ func TestParseClassificationResponse_DescriptionTruncated(t *testing.T) {
 
 func TestParseClassificationResponse_TopicTruncated(t *testing.T) {
 	raw := `[{"comment_index":0,"category":"praise","confidence":0.9,"topic":"one two three four five six seven eight nine ten eleven twelve","actionable_insights":[]}]`
-	got, err := ParseClassificationResponse(raw, 1)
+	got, _, err := ParseClassificationResponse(raw, 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -121,14 +128,14 @@ func TestParseClassificationResponse_TopicTruncated(t *testing.T) {
 
 func TestParseClassificationResponse_CountMismatch(t *testing.T) {
 	raw := `[{"comment_index":0,"category":"praise","confidence":0.9,"topic":"x","actionable_insights":[]}]`
-	if _, err := ParseClassificationResponse(raw, 2); err == nil {
+	if _, _, err := ParseClassificationResponse(raw, 2); err == nil {
 		t.Fatal("expected count-mismatch error")
 	}
 }
 
 func TestParseClassificationResponse_NoArray(t *testing.T) {
 	raw := `the model decided to chat instead of returning JSON`
-	if _, err := ParseClassificationResponse(raw, 1); err == nil {
+	if _, _, err := ParseClassificationResponse(raw, 1); err == nil {
 		t.Fatal("expected error for missing array")
 	}
 }
@@ -265,7 +272,7 @@ func TestSentimentScore_ClosedSet(t *testing.T) {
 
 func TestParseClassificationResponse_SentimentParsed(t *testing.T) {
 	raw := `[{"comment_index":0,"category":"praise","confidence":0.9,"topic":"x","sentiment":"positive","actionable_insights":[]}]`
-	got, err := ParseClassificationResponse(raw, 1)
+	got, _, err := ParseClassificationResponse(raw, 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -281,7 +288,7 @@ func TestParseClassificationResponse_SentimentParsed(t *testing.T) {
 // neutral (0), same tolerance as category parsing.
 func TestParseClassificationResponse_SentimentMissingDefaultsNeutral(t *testing.T) {
 	raw := `[{"comment_index":0,"category":"question","confidence":0.8,"topic":"x","actionable_insights":[]}]`
-	got, err := ParseClassificationResponse(raw, 1)
+	got, _, err := ParseClassificationResponse(raw, 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -295,7 +302,7 @@ func TestParseClassificationResponse_SentimentMissingDefaultsNeutral(t *testing.
 
 func TestParseClassificationResponse_SentimentInvalidDefaultsNeutral(t *testing.T) {
 	raw := `[{"comment_index":0,"category":"question","confidence":0.8,"topic":"x","sentiment":"ecstatic","actionable_insights":[]}]`
-	got, err := ParseClassificationResponse(raw, 1)
+	got, _, err := ParseClassificationResponse(raw, 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -308,7 +315,7 @@ func TestParseClassificationResponse_SentimentInvalidDefaultsNeutral(t *testing.
 // batch: it collapses to neutral.
 func TestParseClassificationResponse_SentimentNumericTolerated(t *testing.T) {
 	raw := `[{"comment_index":0,"category":"question","confidence":0.8,"topic":"x","sentiment":0.5,"actionable_insights":[]}]`
-	got, err := ParseClassificationResponse(raw, 1)
+	got, _, err := ParseClassificationResponse(raw, 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

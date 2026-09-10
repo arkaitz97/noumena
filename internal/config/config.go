@@ -65,6 +65,9 @@ type Config struct {
 	LLMProcessorTickInterval  time.Duration
 	LLMProcessorBatchTimeout  time.Duration
 	LLMBatchSize              int
+	LLMMaxAttempts            int
+	LLMMaxConcurrency         int
+	LLMRetryBackoff           []time.Duration
 	LLMConfidenceThreshold    float64
 	LLMProcessorShutdownGrace time.Duration
 	OpenCodeAPIKey            string
@@ -98,8 +101,9 @@ type Config struct {
 	BillingOverageInvoicingEnabled bool
 
 	// LLM provider failover
-	LLMPrimaryProvider  string
-	LLMFallbackProvider string
+	LLMPrimaryProvider        string
+	LLMFallbackProvider       string
+	LLMFailoverErrorThreshold int
 
 	// Transactional email pipeline
 	EmailEnabled     bool
@@ -174,7 +178,10 @@ var Default = &Config{
 	LLMProcessorEnabled:       false,
 	LLMProcessorTickInterval:  10 * time.Second,
 	LLMProcessorBatchTimeout:  30 * time.Second,
-	LLMBatchSize:              50,
+	LLMBatchSize:              15,
+	LLMMaxAttempts:            3,
+	LLMMaxConcurrency:         4,
+	LLMRetryBackoff:           []time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute},
 	LLMConfidenceThreshold:    0.7,
 	LLMProcessorShutdownGrace: 30 * time.Second,
 	OpenCodeBaseURL:           "https://api.opencode.local/v1",
@@ -218,6 +225,7 @@ var Default = &Config{
 	BillingOverageInvoicingEnabled: false,
 	LLMPrimaryProvider:             "opencode",
 	LLMFallbackProvider:            "",
+	LLMFailoverErrorThreshold:      3,
 }
 
 // Load reads configuration from environment variables, applying defaults
@@ -363,6 +371,18 @@ func Load(strict bool) (*Config, error) {
 		c.LLMProcessorBatchTimeout = d
 	}
 	c.LLMBatchSize = envIntDef("LLM_BATCH_SIZE", c.LLMBatchSize)
+	c.LLMMaxAttempts = envIntDef("LLM_MAX_ATTEMPTS", c.LLMMaxAttempts)
+	c.LLMMaxConcurrency = envIntDef("LLM_MAX_CONCURRENCY", c.LLMMaxConcurrency)
+	if c.LLMMaxConcurrency < 1 {
+		c.LLMMaxConcurrency = 1
+	}
+	if v := os.Getenv("LLM_RETRY_BACKOFF"); v != "" {
+		backoff, err := envDurations("LLM_RETRY_BACKOFF", v)
+		if err != nil {
+			return nil, err
+		}
+		c.LLMRetryBackoff = backoff
+	}
 	if v := os.Getenv("LLM_CONFIDENCE_THRESHOLD"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil || f < 0 || f > 1 {
@@ -386,6 +406,10 @@ func Load(strict bool) (*Config, error) {
 		c.LLMPrimaryProvider = v
 	}
 	c.LLMFallbackProvider = os.Getenv("LLM_FALLBACK")
+	c.LLMFailoverErrorThreshold = envIntDef("LLM_FAILOVER_ERROR_THRESHOLD", c.LLMFailoverErrorThreshold)
+	if os.Getenv("LLM_FAILOVER_WINDOW_SECONDS") != "" {
+		log.Println("WARN: LLM_FAILOVER_WINDOW_SECONDS is deprecated; use LLM_FAILOVER_ERROR_THRESHOLD (consecutive failures)")
+	}
 
 	// --- Insights API -----------------------------------------------------
 	c.InsightsAPIEnabled = envBool(os.Getenv("INSIGHTS_API_ENABLED"))
@@ -566,6 +590,19 @@ func envDuration(key, v string) (time.Duration, error) {
 		return 0, fmt.Errorf("%s: %w", key, err)
 	}
 	return d, nil
+}
+
+func envDurations(key, v string) ([]time.Duration, error) {
+	parts := strings.Split(v, ",")
+	durations := make([]time.Duration, len(parts))
+	for i, part := range parts {
+		d, err := envDuration(key, strings.TrimSpace(part))
+		if err != nil {
+			return nil, err
+		}
+		durations[i] = d
+	}
+	return durations, nil
 }
 
 // envInt parses v as int. Returns (value, nil) on success or (0, error) on

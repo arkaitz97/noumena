@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -18,6 +19,7 @@ type fakeClient struct {
 	mu       sync.Mutex
 	calls    [][]PromptComment
 	results  []LLMResult // returned for every call (length must match input)
+	missing  []int       // indexes the fake reports as missing/invalid
 	err      error
 	provider string
 	model    string
@@ -29,18 +31,19 @@ type fakeClient struct {
 func (f *fakeClient) ProviderName() string { return f.provider }
 func (f *fakeClient) ModelName() string    { return f.model }
 
-func (f *fakeClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, error) {
+func (f *fakeClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, append([]PromptComment(nil), comments...))
 	f.mu.Unlock()
 	if f.resultsFn != nil {
-		return f.resultsFn(comments)
+		results, err := f.resultsFn(comments)
+		return results, f.missing, err
 	}
 	if f.err != nil {
-		return nil, f.err
+		return nil, nil, f.err
 	}
 	if len(f.results) > 0 {
-		return f.results, nil
+		return f.results, f.missing, nil
 	}
 	out := make([]LLMResult, len(comments))
 	for i := range comments {
@@ -52,7 +55,7 @@ func (f *fakeClient) ClassifyBatch(ctx context.Context, comments []PromptComment
 			ActionableInsights: []Insight{},
 		}
 	}
-	return out, nil
+	return out, nil, nil
 }
 
 // fakeQuery implements the slice of DBQuery the processor uses.
@@ -98,7 +101,7 @@ func newFakeQuery() *fakeQuery {
 	}
 }
 
-func (q *fakeQuery) GetUnprocessedCommentsByChannel(ctx context.Context, limit int) (map[string][]*db.Comment, error) {
+func (q *fakeQuery) GetUnprocessedCommentsByChannel(ctx context.Context, limit int, maxAttempts int) (map[string][]*db.Comment, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	out := map[string][]*db.Comment{}
@@ -670,5 +673,358 @@ func TestProcessor_DedupeSkipsLLMCall(t *testing.T) {
 	}
 	if len(inner.updates) != 0 {
 		t.Fatalf("deduped batch must not persist, got %d", len(inner.updates))
+	}
+}
+
+// blockingClient is a goroutine-safe LLMClient whose ClassifyBatch blocks on a
+// release channel. It records the maximum number of concurrent in-flight calls
+// so tests can assert the processor's effective concurrency.
+type blockingClient struct {
+	mu        sync.Mutex
+	active    int
+	maxActive int
+	calls     int
+	release   chan struct{}
+	entered   chan struct{}
+}
+
+func (c *blockingClient) ProviderName() string { return "test" }
+func (c *blockingClient) ModelName() string    { return "test-model" }
+
+func (c *blockingClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, error) {
+	c.mu.Lock()
+	c.active++
+	c.calls++
+	if c.active > c.maxActive {
+		c.maxActive = c.active
+	}
+	c.mu.Unlock()
+	if c.entered != nil {
+		select {
+		case c.entered <- struct{}{}:
+		default:
+		}
+	}
+	select {
+	case <-c.release:
+	case <-ctx.Done():
+	}
+	c.mu.Lock()
+	c.active--
+	c.mu.Unlock()
+	out := make([]LLMResult, len(comments))
+	for i := range comments {
+		out[i] = LLMResult{CommentIndex: i, Category: "praise", Confidence: 0.9, Topic: "topic", ActionableInsights: []Insight{}}
+	}
+	return out, nil, nil
+}
+
+func (c *blockingClient) max() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.maxActive
+}
+
+func (c *blockingClient) callCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+// seedChannels registers n single-comment channels with an active primary.
+func seedChannels(q *fakeQuery, n int) {
+	for i := 0; i < n; i++ {
+		ch := fmt.Sprintf("ch%d", i)
+		q.grouped[ch] = makeBatch(ch, 1)
+		q.primaryByChannel[ch] = withinQuotaUser("u-" + ch)
+	}
+}
+
+// 4.2 — with MaxConcurrency=3 and 6 channel batches, effective concurrency is
+// exactly 3: wait until 3 calls are blocked, release them, then assert the
+// semaphore never let a 4th overlap.
+func TestProcessor_ConcurrencyBounded(t *testing.T) {
+	q := newFakeQuery()
+	seedChannels(q, 6)
+	cli := &blockingClient{release: make(chan struct{}), entered: make(chan struct{}, 6)}
+	p := NewProcessor(cli, q)
+	p.MaxConcurrency = 3
+
+	done := make(chan struct{})
+	go func() { p.tickOnce(context.Background()); close(done) }()
+
+	for i := 0; i < 3; i++ {
+		select {
+		case <-cli.entered:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d concurrent batches entered, want 3", i)
+		}
+	}
+	// Give any (incorrectly) unbounded goroutines a chance to overlap.
+	time.Sleep(50 * time.Millisecond)
+	if got := cli.max(); got != 3 {
+		t.Fatalf("max concurrency = %d, want 3", got)
+	}
+	close(cli.release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tickOnce did not finish")
+	}
+	if got := cli.callCount(); got != 6 {
+		t.Fatalf("calls = %d, want 6", got)
+	}
+}
+
+// 4.3 — MaxConcurrency=1 keeps execution strictly serial.
+func TestProcessor_SerialAtConcurrencyOne(t *testing.T) {
+	q := newFakeQuery()
+	seedChannels(q, 5)
+	release := make(chan struct{})
+	close(release) // never block; we only care about overlap
+	cli := &blockingClient{release: release}
+	p := NewProcessor(cli, q)
+	p.MaxConcurrency = 1
+
+	p.tickOnce(context.Background())
+	if got := cli.max(); got != 1 {
+		t.Fatalf("max concurrency = %d, want 1 (serial)", got)
+	}
+	if got := cli.callCount(); got != 5 {
+		t.Fatalf("calls = %d, want 5", got)
+	}
+}
+
+// 4.4 — disjoint concurrent batches classify every comment exactly once.
+func TestProcessor_ConcurrentBatchesNoDuplicates(t *testing.T) {
+	q := newFakeQuery()
+	total := 0
+	for i := 0; i < 6; i++ {
+		ch := fmt.Sprintf("ch%d", i)
+		q.grouped[ch] = makeBatch(ch, 2)
+		q.primaryByChannel[ch] = withinQuotaUser("u-" + ch)
+		total += 2
+	}
+	cli := &fakeClient{provider: "openai", model: "gpt-4o"}
+	p := NewProcessor(cli, q)
+	p.MaxConcurrency = 3
+
+	p.tickOnce(context.Background())
+
+	seen := map[string]int{}
+	for _, call := range cli.calls {
+		for _, c := range call {
+			seen[c.Body]++
+		}
+	}
+	if len(seen) != total {
+		t.Fatalf("classified %d distinct comments, want %d", len(seen), total)
+	}
+	for body, n := range seen {
+		if n != 1 {
+			t.Errorf("comment %q classified %d times, want 1", body, n)
+		}
+	}
+	if len(q.updates) != total {
+		t.Fatalf("persisted %d updates, want %d", len(q.updates), total)
+	}
+}
+
+// 4.5 — shutdown waits for in-flight concurrent batches; no goroutine leaks
+// once tickOnce returns.
+func TestProcessor_ShutdownWaitsForConcurrentBatches(t *testing.T) {
+	q := newFakeQuery()
+	seedChannels(q, 4)
+	cli := &blockingClient{release: make(chan struct{}), entered: make(chan struct{}, 4)}
+	p := NewProcessor(cli, q)
+	p.MaxConcurrency = 4
+
+	before := runtime.NumGoroutine()
+	done := make(chan struct{})
+	go func() { p.tickOnce(context.Background()); close(done) }()
+	for i := 0; i < 4; i++ {
+		select {
+		case <-cli.entered:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d batches entered, want 4", i)
+		}
+	}
+
+	shutdownDone := make(chan struct{})
+	go func() { p.shutdown(); close(shutdownDone) }()
+	select {
+	case <-shutdownDone:
+		t.Fatal("shutdown returned while batches were in flight")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(cli.release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tickOnce did not finish after release")
+	}
+	select {
+	case <-shutdownDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not return after batches drained")
+	}
+
+	// Goroutines should settle back to ~baseline.
+	deadline := time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if after := runtime.NumGoroutine(); after > before+2 {
+		t.Fatalf("goroutine leak: before=%d after=%d", before, after)
+	}
+}
+
+// 4.6 — a cancelled context prevents any batch from starting.
+func TestProcessor_CancelledContextStartsNoBatches(t *testing.T) {
+	q := newFakeQuery()
+	seedChannels(q, 3)
+	release := make(chan struct{})
+	close(release)
+	cli := &blockingClient{release: release}
+	p := NewProcessor(cli, q)
+	p.MaxConcurrency = 4
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	p.tickOnce(ctx)
+
+	if got := cli.callCount(); got != 0 {
+		t.Fatalf("calls = %d, want 0 (cancelled context)", got)
+	}
+}
+
+// comment fabricates a single comment with a known body for scripted tests.
+func comment(id, channel, body string) *db.Comment {
+	return &db.Comment{ID: id, PlatformChannelID: channel, Body: body}
+}
+
+// roundQuery serves a fixed sequence of claim rounds regardless of the SQL
+// claim query (which the db tests cover). Each call returns the next scripted
+// map, so a test can control exactly which batches are claimable when.
+type roundQuery struct {
+	*fakeQuery
+	rounds []map[string][]*db.Comment
+	i      int
+}
+
+func (q *roundQuery) GetUnprocessedCommentsByChannel(ctx context.Context, limit, maxAttempts int) (map[string][]*db.Comment, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.i >= len(q.rounds) {
+		return map[string][]*db.Comment{}, nil
+	}
+	r := q.rounds[q.i]
+	q.i++
+	return r, nil
+}
+
+// scriptedClient blocks the "b1" batch until released and signals when the
+// second "a2" batch starts.
+type scriptedClient struct {
+	a2       chan struct{}
+	releaseB chan struct{}
+}
+
+func (c *scriptedClient) ProviderName() string { return "test" }
+func (c *scriptedClient) ModelName() string    { return "test" }
+
+func (c *scriptedClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, error) {
+	if len(comments) > 0 && comments[0].Body == "b1" {
+		select {
+		case <-c.releaseB:
+		case <-ctx.Done():
+		}
+	}
+	if len(comments) > 0 && comments[0].Body == "a2" {
+		select {
+		case c.a2 <- struct{}{}:
+		default:
+		}
+	}
+	out := make([]LLMResult, len(comments))
+	for i := range comments {
+		out[i] = LLMResult{CommentIndex: i, Category: "praise", Confidence: 0.9, Topic: "topic", ActionableInsights: []Insight{}}
+	}
+	return out, nil, nil
+}
+
+// 6.1 — a freed worker takes the next claimed batch immediately instead of
+// waiting for the other in-flight batch (the per-tick barrier is gone).
+func TestProcessor_WorkerRefillsWithoutBarrier(t *testing.T) {
+	inner := newFakeQuery()
+	inner.primaryByChannel["A"] = withinQuotaUser("uA")
+	inner.primaryByChannel["B"] = withinQuotaUser("uB")
+	q := &roundQuery{fakeQuery: inner, rounds: []map[string][]*db.Comment{
+		{"A": {comment("a1", "A", "a1")}, "B": {comment("b1", "B", "b1")}},
+		{"A": {comment("a2", "A", "a2")}},
+	}}
+	cli := &scriptedClient{a2: make(chan struct{}, 1), releaseB: make(chan struct{})}
+	p := NewProcessor(cli, q)
+	p.MaxConcurrency = 2
+	p.TickInterval = 10 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { p.Run(ctx); close(done) }()
+
+	select {
+	case <-cli.a2:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second A batch did not start while B was still in flight")
+	}
+	close(cli.releaseB)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
+// 6.2 — reservations/started jobs are bounded by MaxConcurrency, not by the
+// number of claimable channels: with 9 channels and a limit of 4, only 4
+// batches may be reserved and started while none complete.
+func TestProcessor_ReservationsBoundedByConcurrency(t *testing.T) {
+	q := newFakeQuery()
+	seedChannels(q, 9)
+	cli := &blockingClient{release: make(chan struct{}), entered: make(chan struct{}, 9)}
+	p := NewProcessor(cli, q)
+	p.MaxConcurrency = 4
+	p.TickInterval = 10 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { p.Run(ctx); close(done) }()
+
+	for i := 0; i < 4; i++ {
+		select {
+		case <-cli.entered:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d batches started, want 4", i)
+		}
+	}
+	time.Sleep(150 * time.Millisecond) // let any over-reservation surface
+	if got := cli.callCount(); got != 4 {
+		t.Fatalf("classify calls = %d, want 4 (reservations must be bounded)", got)
+	}
+	q.mu.Lock()
+	jobs := len(q.jobs)
+	q.mu.Unlock()
+	if jobs != 4 {
+		t.Fatalf("reserved jobs = %d, want 4", jobs)
+	}
+
+	cancel()
+	close(cli.release)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not return")
 	}
 }

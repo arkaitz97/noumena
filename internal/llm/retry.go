@@ -3,6 +3,7 @@ package llm
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,30 +12,72 @@ import (
 	"time"
 )
 
+// TerminalError marks an error as non-retryable (deterministic failure).
+// HTTP 4xx except 429, auth failures, JSON decode/parse errors are terminal.
+type TerminalError struct{ error }
+
+func (e *TerminalError) Unwrap() error { return e.error }
+
+// IsTerminal reports whether err (or any error in its chain) is a TerminalError.
+func IsTerminal(err error) bool {
+	var term *TerminalError
+	return errors.As(err, &term)
+}
+
+// terminal wraps err as a TerminalError.
+func terminal(err error) error {
+	if err == nil {
+		return nil
+	}
+	if IsTerminal(err) {
+		return err
+	}
+	return &TerminalError{err}
+}
+
 // transientBackoff is the static retry schedule applied by retryTransient:
 // 1s, 2s, 4s between attempts. A call gets len(transientBackoff)+1 total
 // attempts (initial + 3 retries), matching the OpenCode client's budget.
 var transientBackoff = []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
 
-// retryTransient runs `attempt` up to len(transientBackoff)+1 times. An
-// attempt returns (result, retryAfter, retryable, err): nil err wins
-// immediately; non-retryable errors abort; retryable errors wait the next
-// static backoff slot (or the server's Retry-After hint when positive)
-// unless the context is done. exhaustedMsg prefixes the final wrapped error,
-// e.g. "openai: all retries exhausted".
-func retryTransient[T any](ctx context.Context, exhaustedMsg string, attempt func() (T, time.Duration, bool, error)) (T, error) {
+// retryTransient runs `attempt` up to len(transientBackoff)+1 times.
+// Each attempt receives a context with a deadline equal to the remaining
+// caller context budget divided by the number of attempts left.
+// Server Retry-After is honored only when shorter than that share.
+// Every HTTP attempt increments noumena_llm_provider_calls_total{provider,retryable}.
+// exhaustedMsg prefixes the final wrapped error, e.g. "openai: all retries exhausted".
+func retryTransient[T any](ctx context.Context, provider, exhaustedMsg string, attempt func(ctx context.Context) (T, time.Duration, bool, error)) (T, error) {
 	var lastErr error
-	for attemptNo := 0; attemptNo < len(transientBackoff)+1; attemptNo++ {
-		result, retryAfter, retryable, err := attempt()
+	maxAttempts := len(transientBackoff) + 1
+	for attemptNo := 0; attemptNo < maxAttempts; attemptNo++ {
+		remainingAttempts := maxAttempts - attemptNo
+		var attemptCtx context.Context
+		var cancel context.CancelFunc
+		if deadline, ok := ctx.Deadline(); ok {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				var zero T
+				return zero, ctx.Err()
+			}
+			perAttempt := remaining / time.Duration(remainingAttempts)
+			attemptCtx, cancel = context.WithTimeout(ctx, perAttempt)
+		} else {
+			attemptCtx, cancel = context.WithCancel(ctx)
+		}
+
+		result, retryAfter, retryable, err := attempt(attemptCtx)
+		recordLLMProviderCall(ctx, provider, retryable)
+		cancel()
+
 		if err == nil {
 			return result, nil
 		}
 		lastErr = err
-		if !retryable || attemptNo == len(transientBackoff) {
+		if !retryable || attemptNo == maxAttempts-1 {
 			break
 		}
 		wait := transientBackoff[attemptNo]
-		if retryAfter > 0 {
+		if retryAfter > 0 && retryAfter < wait {
 			wait = retryAfter
 		}
 		select {
@@ -85,13 +128,13 @@ func httpClassifyOnce[T any](ctx context.Context, hc *http.Client, endpoint stri
 	if resp.StatusCode >= 400 {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		var zero T
-		return zero, 0, false, fmt.Errorf("%s: HTTP %d: %s", provider, resp.StatusCode, strings.TrimSpace(string(snippet)))
+		return zero, 0, false, terminal(fmt.Errorf("%s: HTTP %d: %s", provider, resp.StatusCode, strings.TrimSpace(string(snippet))))
 	}
 
 	result, derr := decode(resp.Body)
 	if derr != nil {
 		var zero T
-		return zero, 0, false, derr
+		return zero, 0, false, terminal(derr)
 	}
 	return result, 0, false, nil
 }

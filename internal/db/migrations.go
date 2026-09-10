@@ -524,6 +524,29 @@ FROM users`); err != nil {
 			return nil
 		},
 	},
+	{
+		version: 18,
+		name:    "comments LLM retry state",
+		run: func(ctx context.Context, tx *sql.Tx) error {
+			for _, col := range []struct{ name, ddl string }{
+				{"llm_attempts", "INTEGER NOT NULL DEFAULT 0"},
+				{"llm_next_retry_at", "TEXT"},
+			} {
+				has, err := columnExists(ctx, tx, "comments", col.name)
+				if err != nil {
+					return err
+				}
+				if has {
+					continue
+				}
+				if _, err := tx.ExecContext(ctx,
+					fmt.Sprintf("ALTER TABLE comments ADD COLUMN %s %s", col.name, col.ddl)); err != nil {
+					return fmt.Errorf("add comments.%s: %w", col.name, err)
+				}
+			}
+			return nil
+		},
+	},
 }
 
 // Migrate applies all pending migrations to the given database inside a

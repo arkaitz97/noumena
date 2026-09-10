@@ -30,3 +30,16 @@ LLM processing already counts tokens per batch (internal/llm metrics: request/to
 - **Rounding:** cost stored in integer micro-cents (`cost_usd_micro`) to avoid float drift; converted at the API boundary.
 - **Attribution dispute** (shared channels): documented rule — cost follows the user whose quota/period decremented; matches existing overage invoicing attribution.
 - **Metric cardinality:** per-channel cost labels bounded by channel count; fine for OTel.
+## Sync notes (fix-llm-duplicate-processing)
+
+- The `fix-llm-duplicate-processing` change adds
+  `noumena_llm_provider_calls_total{provider,retryable}` and
+  `noumena_llm_job_attempts_total{provider,outcome}`. Use
+  `job_attempts_total` (distinct job outcomes) as the cost denominator and
+  `provider_calls_total` as the numerator when validating cost-per-comment:
+  a ratio > 1.2 calls/job means duplicate work is inflating the bill.
+- Per-comment attempts are now bounded (`LLM_MAX_ATTEMPTS`, default 3) and
+  parked comments are excluded from claiming; cost rollups must not assume a
+  failed comment will keep being billed.
+- `comments.llm_attempts` / `comments.llm_next_retry_at` are available for
+  per-comment retry accounting if cost attribution needs attempt counts.

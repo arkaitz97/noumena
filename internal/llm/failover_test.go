@@ -21,40 +21,40 @@ type recordingClient struct {
 func (r *recordingClient) ProviderName() string { return r.provider }
 func (r *recordingClient) ModelName() string    { return r.model }
 
-func (r *recordingClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, error) {
+func (r *recordingClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, error) {
 	r.calls++
 	if r.err != nil {
-		return nil, r.err
+		return nil, nil, r.err
 	}
-	return nil, nil
+	return nil, nil, nil
 }
 
-func TestFailover_FlipsToFallbackAfterThreshold(t *testing.T) {
+func TestFailover_FlipsAfterConsecutiveThreshold(t *testing.T) {
 	primary := &recordingClient{provider: "opencode", model: "opencode/default", err: errors.New("boom")}
 	fallback := &recordingClient{provider: "openai", model: "gpt-4o-mini"}
 
-	fc := NewFailoverClient(primary, fallback, 60*time.Second, 5)
+	fc := NewFailoverClient(primary, fallback, 3)
 
-	for i := 0; i < 5; i++ {
-		if _, err := fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}}); err == nil {
+	for i := 0; i < 3; i++ {
+		if _, _, err := fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}}); err == nil {
 			t.Fatalf("call %d: expected error from failing primary", i+1)
 		}
 	}
-	if primary.calls != 5 {
-		t.Fatalf("primary calls: got %d, want 5", primary.calls)
+	if primary.calls != 3 {
+		t.Fatalf("primary calls: got %d, want 3", primary.calls)
 	}
 	if fc.ProviderName() != "openai" || fc.ModelName() != "gpt-4o-mini" {
 		t.Errorf("post-flip attribution: got %s/%s, want openai/gpt-4o-mini", fc.ProviderName(), fc.ModelName())
 	}
 
-	if _, err := fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}}); err != nil {
+	if _, _, err := fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}}); err != nil {
 		t.Fatalf("post-flip call: expected fallback success, got %v", err)
 	}
 	if fallback.calls != 1 {
 		t.Fatalf("fallback calls: got %d, want 1", fallback.calls)
 	}
-	if primary.calls != 5 {
-		t.Fatalf("primary calls after flip: got %d, want 5 (no more primary traffic)", primary.calls)
+	if primary.calls != 3 {
+		t.Fatalf("primary calls after flip: got %d, want 3 (no more primary traffic)", primary.calls)
 	}
 }
 
@@ -62,58 +62,87 @@ func TestFailover_FlipIsPermanent(t *testing.T) {
 	primary := &recordingClient{provider: "opencode", model: "m", err: errors.New("down")}
 	fallback := &recordingClient{provider: "anthropic", model: "c", err: errors.New("also down")}
 
-	fc := NewFailoverClient(primary, fallback, 60*time.Second, 5)
-	for i := 0; i < 5; i++ {
-		_, _ = fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
+	fc := NewFailoverClient(primary, fallback, 3)
+	for i := 0; i < 3; i++ {
+		_, _, _ = fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
 	}
 
 	for i := 0; i < 20; i++ {
-		if _, err := fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}}); err == nil {
+		if _, _, err := fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}}); err == nil {
 			t.Fatalf("call %d: expected fallback error to propagate", i+1)
 		}
 	}
-	if primary.calls != 5 {
-		t.Errorf("primary calls: got %d, want 5 (never returns to primary)", primary.calls)
+	if primary.calls != 3 {
+		t.Errorf("primary calls: got %d, want 3 (never returns to primary)", primary.calls)
 	}
 	if fallback.calls != 20 {
 		t.Errorf("fallback calls: got %d, want 20", fallback.calls)
 	}
 }
 
-func TestFailover_ErrorsSpreadBeyondWindowDoNotFlip(t *testing.T) {
+// The old sliding window could never fill because errors arrive minutes apart.
+// The consecutive counter makes timing irrelevant: failures separated by a long
+// gap still accumulate and flip.
+func TestFailover_SlowFailureCadenceStillFlips(t *testing.T) {
 	primary := &recordingClient{provider: "opencode", model: "m", err: errors.New("flaky")}
 	fallback := &recordingClient{provider: "openai", model: "m2"}
 
-	fc := NewFailoverClient(primary, fallback, 60*time.Second, 5)
-	now := time.Unix(1_000_000, 0)
-	fc.now = func() time.Time { return now }
+	fc := NewFailoverClient(primary, fallback, 3)
 
-	// One error every 61s: each ages out before the next arrives, so the
-	// window never holds >= 5 errors and the wrapper must never flip.
-	for i := 0; i < 10; i++ {
-		if _, err := fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}}); err == nil {
+	for i := 0; i < 3; i++ {
+		if _, _, err := fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}}); err == nil {
 			t.Fatalf("call %d: expected error", i+1)
 		}
-		now = now.Add(61 * time.Second)
+		time.Sleep(2 * time.Millisecond) // errors minutes apart in production; timing irrelevant
 	}
-	if primary.calls != 10 {
-		t.Errorf("primary calls: got %d, want 10", primary.calls)
+	if primary.calls != 3 {
+		t.Errorf("primary calls: got %d, want 3", primary.calls)
 	}
-	if fallback.calls != 0 {
-		t.Errorf("fallback calls: got %d, want 0 (no flip)", fallback.calls)
+	if fc.ProviderName() != "openai" {
+		t.Errorf("provider after slow-cadence failures: got %q, want openai (flipped)", fc.ProviderName())
 	}
-	if fc.ProviderName() != "opencode" {
-		t.Errorf("provider after spread errors: got %q, want opencode", fc.ProviderName())
+}
+
+// A success between failures resets the consecutive counter, so interleaved
+// successes prevent the flip until the threshold is reached consecutively.
+func TestFailover_SuccessResetsCounter(t *testing.T) {
+	primary := &recordingClient{provider: "opencode", model: "m", err: errors.New("flaky")}
+	fallback := &recordingClient{provider: "openai", model: "m2"}
+
+	fc := NewFailoverClient(primary, fallback, 3)
+
+	// 2 failures, a success, then 2 failures → counter never reaches 3.
+	for i := 0; i < 2; i++ {
+		_, _, _ = fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
+	}
+	primary.err = nil
+	if _, _, err := fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}}); err != nil {
+		t.Fatalf("success call: %v", err)
+	}
+	primary.err = errors.New("flaky")
+	for i := 0; i < 2; i++ {
+		_, _, _ = fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
+	}
+	if fc.flipped {
+		t.Errorf("flipped after non-consecutive failures; success must reset the counter")
+	}
+
+	// Three consecutive failures now flip.
+	for i := 0; i < 3; i++ {
+		_, _, _ = fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
+	}
+	if !fc.flipped {
+		t.Errorf("3 consecutive errors must flip")
 	}
 }
 
 func TestFailover_NilFallbackNeverFlipsAndPropagates(t *testing.T) {
 	primary := &recordingClient{provider: "opencode", model: "m", err: errors.New("down")}
 
-	fc := NewFailoverClient(primary, nil, 60*time.Second, 5)
+	fc := NewFailoverClient(primary, nil, 3)
 
 	for i := 0; i < 10; i++ {
-		if _, err := fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}}); err == nil {
+		if _, _, err := fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}}); err == nil {
 			t.Fatalf("call %d: expected error to propagate (no fallback configured)", i+1)
 		}
 	}
@@ -129,65 +158,9 @@ func TestFailover_ConstructorDefaults(t *testing.T) {
 	primary := &recordingClient{provider: "opencode", model: "m", err: errors.New("x")}
 	fallback := &recordingClient{provider: "openai", model: "m2"}
 
-	fc := NewFailoverClient(primary, fallback, 0, 0)
-	if fc.window != 60*time.Second {
-		t.Errorf("window default: got %s, want 60s", fc.window)
-	}
-	if fc.threshold != 5 {
-		t.Errorf("threshold default: got %d, want 5", fc.threshold)
-	}
-
-	// 4 errors then a >60s quiet gap then 1 more error: the 4th error has
-	// aged out, so the default window must still prevent a flip.
-	now := time.Unix(1_000_000, 0)
-	fc.now = func() time.Time { return now }
-	for i := 0; i < 4; i++ {
-		_, _ = fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
-	}
-	now = now.Add(61 * time.Second)
-	_, _ = fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
-	if fc.flipped {
-		t.Errorf("flipped with only 1 error in the default window; want no flip")
-	}
-
-	// Five errors back-to-back inside the window still flip.
-	now = now.Add(61 * time.Second)
-	for i := 0; i < 5; i++ {
-		_, _ = fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
-	}
-	if !fc.flipped {
-		t.Errorf("5 errors inside the default window: want flip")
-	}
-	if fc.ProviderName() != "openai" {
-		t.Errorf("provider after flip: got %q, want openai", fc.ProviderName())
-	}
-}
-
-func TestFailover_SuccessesDoNotClearWindow(t *testing.T) {
-	primary := &recordingClient{provider: "opencode", model: "m"}
-	fallback := &recordingClient{provider: "openai", model: "m2"}
-
-	fc := NewFailoverClient(primary, fallback, 60*time.Second, 3)
-
-	// Two failures, four successes in between (successes must NOT reset the
-	// window), then a third failure inside the same 60s → flip.
-	primary.err = errors.New("flaky")
-	_, _ = fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
-	_, _ = fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
-	primary.err = nil
-	for i := 0; i < 4; i++ {
-		if _, err := fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}}); err != nil {
-			t.Fatalf("success call %d: %v", i+1, err)
-		}
-	}
-	primary.err = errors.New("flaky")
-	_, _ = fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
-
-	if !fc.flipped {
-		t.Errorf("3 errors within window despite interleaved successes: want flip")
-	}
-	if primary.calls != 7 || fallback.calls != 0 {
-		t.Errorf("calls: primary=%d fallback=%d, want 7/0 pre-flip", primary.calls, fallback.calls)
+	fc := NewFailoverClient(primary, fallback, 0)
+	if fc.threshold != 3 {
+		t.Errorf("threshold default: got %d, want 3", fc.threshold)
 	}
 }
 
@@ -222,8 +195,8 @@ func TestNewConfiguredClient(t *testing.T) {
 	if w.primary.ProviderName() != "opencode" || w.fallback.ProviderName() != "openai" {
 		t.Errorf("wrapped providers: primary=%s fallback=%s", w.primary.ProviderName(), w.fallback.ProviderName())
 	}
-	if w.threshold != 5 || w.window != 60*time.Second {
-		t.Errorf("wrapper defaults: threshold=%d window=%s", w.threshold, w.window)
+	if w.threshold != 3 {
+		t.Errorf("wrapper default threshold: got %d, want 3", w.threshold)
 	}
 
 	// anthropic is a legal explicit name.

@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
 	"noumena/internal/billing"
 	"noumena/internal/db"
+	"noumena/internal/telemetry"
 )
 
 // Processor is the always-on batch worker that drives every classified
@@ -29,9 +31,15 @@ type Processor struct {
 	Q                   db.DBQuery
 	TickInterval        time.Duration
 	BatchSize           int
+	MaxConcurrency      int
 	BatchTimeout        time.Duration
+	MaxAttempts         int
+	RetryBackoff        []time.Duration
 	ShutdownGrace       time.Duration
 	ConfidenceThreshold float64
+
+	// now is the clock used for backoff timestamps; injectable for tests.
+	now func() time.Time
 
 	// inflight tracks Tx2 work-in-progress so graceful shutdown can wait.
 	inflight sync.WaitGroup
@@ -43,16 +51,24 @@ func NewProcessor(client LLMClient, q db.DBQuery) *Processor {
 		Client:              client,
 		Q:                   q,
 		TickInterval:        10 * time.Second,
-		BatchSize:           50,
+		BatchSize:           15,
+		MaxConcurrency:      4,
 		BatchTimeout:        30 * time.Second,
+		MaxAttempts:         3,
+		RetryBackoff:        []time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute},
 		ShutdownGrace:       30 * time.Second,
 		ConfidenceThreshold: 0.7,
+		now:                 time.Now,
 	}
 }
 
-// Run blocks until ctx is cancelled, ticking on TickInterval. On shutdown it
-// waits for any in-flight Tx2 to finish (bounded by ShutdownGrace) before
-// returning.
+// Run blocks until ctx is cancelled, running a continuous pool of
+// MaxConcurrency workers. A freed worker is handed the next already-claimed
+// channel batch immediately, so a fast channel never waits behind a slow one;
+// claims are durable (llm_processing_jobs pending/processing rows are excluded
+// by the claim query) which makes concurrent/rapid reclaiming safe. On
+// cancellation workers finish their in-flight batch (bounded by ShutdownGrace)
+// before Run returns.
 func (p *Processor) Run(ctx context.Context) {
 	if p.Client == nil || p.Q == nil {
 		log.Println("LLM Processor: missing client or db, exiting")
@@ -62,23 +78,177 @@ func (p *Processor) Run(ctx context.Context) {
 	// dedupe forever (event=batch_deduped). Single processor instance, so
 	// olderThan=0 is safe — no live batch can exist before Run starts.
 	p.sweepOrphanedLLMJobs(ctx, 0)
-	ticker := time.NewTicker(p.TickInterval)
-	defer ticker.Stop()
 
-	log.Printf("LLM Processor: started provider=%s model=%s tick=%s batch_size=%d threshold=%.2f",
-		p.Client.ProviderName(), p.Client.ModelName(), p.TickInterval, p.BatchSize, p.ConfidenceThreshold)
+	limit := p.MaxConcurrency
+	if limit < 1 {
+		limit = 1
+	}
+	log.Printf("LLM Processor: started provider=%s model=%s max_concurrency=%d batch_size=%d threshold=%.2f",
+		p.Client.ProviderName(), p.Client.ModelName(), limit, p.BatchSize, p.ConfidenceThreshold)
 
-	for {
-		select {
-		case <-ctx.Done():
-			p.shutdown()
-			return
-		case <-ticker.C:
-			// Sweep orphans older than the LLM batch age bound before
-			// claiming, so a corpse can never dedupe-shadow a live batch.
-			p.sweepOrphanedLLMJobs(ctx, 10*time.Minute)
-			p.tickOnce(ctx)
+	jobs := make(chan claimedBatch, limit)
+	permits := make(chan struct{}, limit)
+	for i := 0; i < limit; i++ {
+		permits <- struct{}{}
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < limit; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p.worker(ctx, jobs, permits)
+		}()
+	}
+	p.claimLoop(ctx, jobs, permits)
+	close(jobs)
+	p.shutdown()
+	wg.Wait()
+}
+
+// claimedBatch is a per-channel batch that has been durably reserved via an
+// llm_processing_jobs row. The primary holder is resolved at claim time so the
+// worker does no extra lookup and a skipped channel never reserves a job.
+type claimedBatch struct {
+	channelID string
+	batch     []*db.Comment
+	primary   *db.User
+	jobID     string
+}
+
+// worker drains claimed batches until jobs is closed. Each processed batch
+// returns one permit, unblocking the claimer to reserve the next batch.
+func (p *Processor) worker(ctx context.Context, jobs <-chan claimedBatch, permits chan struct{}) {
+	for cb := range jobs {
+		p.runBatchGuarded(ctx, cb)
+		permits <- struct{}{}
+	}
+}
+
+// runBatchGuarded runs one claimed batch with panic isolation and in-flight
+// accounting so graceful shutdown waits for it.
+func (p *Processor) runBatchGuarded(ctx context.Context, cb claimedBatch) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("LLM Processor: PANIC recovered in batch channel=%s: %v", cb.channelID, r)
+			recordLLMRequest(ctx, "unknown", "unknown", time.Now(), errors.New("panic"))
 		}
+	}()
+	p.inflight.Add(1)
+	defer p.inflight.Done()
+	recordLLMBatchInFlight(ctx, 1)
+	defer recordLLMBatchInFlight(ctx, -1)
+	p.processClaimedBatch(ctx, cb)
+}
+
+// claimLoop keeps the worker pool fed. It reserves at most MaxConcurrency
+// batches at a time: a permit is consumed per reserved batch and returned by
+// the worker once that batch finishes, so `batch_started` logs and
+// llm_processing_jobs rows never exceed the configured concurrency. It sleeps
+// only when there is nothing claimable.
+func (p *Processor) claimLoop(ctx context.Context, jobs chan<- claimedBatch, permits chan struct{}) {
+	sweep := time.NewTicker(10 * time.Minute)
+	defer sweep.Stop()
+	acquire := func() bool {
+		select {
+		case <-permits:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+	release := func() { permits <- struct{}{} }
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		select {
+		case <-sweep.C:
+			p.sweepOrphanedLLMJobs(ctx, 10*time.Minute)
+		default:
+		}
+		grouped, err := p.Q.GetUnprocessedCommentsByChannel(ctx, p.BatchSize, p.MaxAttempts)
+		if err != nil {
+			log.Printf("LLM Processor: claim failed: %v", err)
+		}
+		p.sampleParkedComments(ctx)
+		if len(grouped) == 0 {
+			if !sleepCtx(ctx, p.TickInterval) {
+				return
+			}
+			continue
+		}
+		for channelID, batch := range grouped {
+			if ctx.Err() != nil {
+				return
+			}
+			if !acquire() {
+				return
+			}
+			cb, ok := p.reserveBatch(ctx, channelID, batch)
+			if !ok {
+				release()
+				continue
+			}
+			select {
+			case jobs <- cb:
+			case <-ctx.Done():
+				release()
+				return
+			}
+		}
+	}
+}
+
+// reserveBatch resolves the primary token holder and durably reserves one
+// channel batch (job row + processing mark). false means the batch was skipped
+// (no primary / paused / quota) or deduped, so the caller keeps no permit.
+func (p *Processor) reserveBatch(ctx context.Context, channelID string, batch []*db.Comment) (claimedBatch, bool) {
+	primary, ok := p.requireActivePrimary(ctx, channelID, batch)
+	if !ok {
+		return claimedBatch{}, false
+	}
+	jobID, ok := p.startJob(ctx, channelID, batch)
+	if !ok {
+		return claimedBatch{}, false
+	}
+	return claimedBatch{channelID: channelID, batch: batch, primary: primary, jobID: jobID}, true
+}
+
+// claimBatches selects and reserves every currently claimable channel batch
+// (used by the deterministic tickOnce seam; production streams via claimLoop).
+func (p *Processor) claimBatches(ctx context.Context) ([]claimedBatch, error) {
+	grouped, err := p.Q.GetUnprocessedCommentsByChannel(ctx, p.BatchSize, p.MaxAttempts)
+	if err != nil {
+		return nil, err
+	}
+	p.sampleParkedComments(ctx)
+	if len(grouped) == 0 {
+		return nil, nil
+	}
+	out := make([]claimedBatch, 0, len(grouped))
+	for channelID, batch := range grouped {
+		if ctx.Err() != nil {
+			break
+		}
+		if cb, ok := p.reserveBatch(ctx, channelID, batch); ok {
+			out = append(out, cb)
+		}
+	}
+	return out, nil
+}
+
+// sleepCtx sleeps for d unless ctx is cancelled; false means cancelled.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		d = time.Second
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
 	}
 }
 
@@ -130,10 +300,9 @@ func (p *Processor) shutdown() {
 	}
 }
 
-// tickOnce claims and processes batches for one tick. Each per-channel batch
-// is processed serially within the tick to keep transaction churn predictable;
-// horizontal scaling comes from running multiple processor instances (the
-// FOR UPDATE SKIP LOCKED claim guarantees disjoint subsets).
+// tickOnce reserves and processes one round of claimable batches with a
+// barrier: it is retained as a deterministic seam for tests. Production uses
+// Run's continuous pool, which does not wait for the slowest batch.
 func (p *Processor) tickOnce(ctx context.Context) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -141,47 +310,208 @@ func (p *Processor) tickOnce(ctx context.Context) {
 			recordLLMRequest(ctx, "unknown", "unknown", time.Now(), errors.New("panic"))
 		}
 	}()
-	grouped, err := p.Q.GetUnprocessedCommentsByChannel(ctx, p.BatchSize)
+	claimed, err := p.claimBatches(ctx)
 	if err != nil {
 		log.Printf("LLM Processor: claim failed: %v", err)
 		return
 	}
-	if len(grouped) == 0 {
+	if len(claimed) == 0 {
 		return
 	}
 
-	for channelID, batch := range grouped {
-		if ctx.Err() != nil {
-			return
-		}
-		p.processChannelBatch(ctx, channelID, batch)
+	limit := p.MaxConcurrency
+	if limit < 1 {
+		limit = 1
 	}
+	sem := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+	for _, cb := range claimed {
+		if ctx.Err() != nil {
+			break
+		}
+		wg.Add(1)
+		go func(cb claimedBatch) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
+			p.runBatchGuarded(ctx, cb)
+		}(cb)
+	}
+	wg.Wait()
 }
 
-// processChannelBatch runs the full lifecycle for a single per-channel batch.
-func (p *Processor) processChannelBatch(ctx context.Context, channelID string, batch []*db.Comment) {
-	primary, ok := p.requireActivePrimary(ctx, channelID, batch)
-	if !ok {
-		return
-	}
-	jobID, ok := p.startJob(ctx, channelID, batch)
-	if !ok {
-		return
-	}
-	results, err := p.classify(ctx, p.buildPrompts(ctx, channelID, primary, batch))
+// processClaimedBatch runs the full lifecycle for a single reserved batch.
+func (p *Processor) processClaimedBatch(ctx context.Context, cb claimedBatch) {
+	channelID, batch, primary, jobID := cb.channelID, cb.batch, cb.primary, cb.jobID
+	results, missingIndexes, err := p.classify(ctx, p.buildPrompts(ctx, channelID, primary, batch))
 	if err != nil {
 		p.failBatch(ctx, channelID, jobID, "", err)
+		terminal := IsTerminal(err)
+		parked := p.recordRetryState(ctx, channelID, jobID, commentIDs(batch), terminal)
+		recordLLMJobAttempt(ctx, p.Client.ProviderName(), failureOutcome(terminal, parked))
 		return
 	}
 	// Apply confidence-threshold downgrade.
 	results = ApplyConfidenceThreshold(results, p.ConfidenceThreshold)
-	// Persist results, increment quota, mark job complete.
-	if err := p.persistBatch(ctx, batch, results, primary, jobID); err != nil {
+	// Persist valid results, increment quota by persisted count, mark job.
+	persisted, missing, err := p.persistBatch(ctx, batch, results, missingIndexes, primary, jobID)
+	if err != nil {
 		p.failBatch(ctx, channelID, jobID, "persist", err)
+		parked := p.recordRetryState(ctx, channelID, jobID, commentIDs(batch), IsTerminal(err))
+		recordLLMJobAttempt(ctx, p.Client.ProviderName(), failureOutcome(IsTerminal(err), parked))
 		return
 	}
+	if len(missing) > 0 {
+		log.Printf("event=batch_partial channel_id=%s job_id=%s persisted=%d missing_indexes=%v",
+			channelID, jobID, persisted, missing)
+		// Only the missing/invalid comments retry; a parse miss is transient.
+		parked := p.recordRetryState(ctx, channelID, jobID, commentIDsAt(batch, missing), false)
+		recordLLMJobAttempt(ctx, p.Client.ProviderName(), failureOutcome(false, parked))
+		return
+	}
+	recordLLMJobAttempt(ctx, p.Client.ProviderName(), telemetry.OutcomeCompleted)
 	log.Printf("event=batch_completed channel_id=%s job_id=%s batch_size=%d primary_user_id=%s",
 		channelID, jobID, len(batch), primary.ID)
+}
+
+// failureOutcome maps a failure's class onto the job-attempt outcome enum.
+// Exactly one increment per job attempt: terminal → failed_terminal, cap
+// reached → parked, otherwise failed_transient.
+func failureOutcome(terminal, parked bool) string {
+	switch {
+	case terminal:
+		return telemetry.OutcomeFailedTerminal
+	case parked:
+		return telemetry.OutcomeParked
+	default:
+		return telemetry.OutcomeFailedTransient
+	}
+}
+
+// sampleParkedComments records the current dead-letter depth. Optional DB
+// method: embedded-nil test doubles have no CountParkedComments and stay
+// no-ops.
+func (p *Processor) sampleParkedComments(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+		}
+	}()
+	if c, ok := p.Q.(interface {
+		CountParkedComments(context.Context, int) (int64, error)
+	}); ok {
+		if n, err := c.CountParkedComments(ctx, p.MaxAttempts); err == nil {
+			recordLLMParkedComments(n)
+		}
+	}
+}
+
+// commentIDs returns the ids for a comment slice.
+func commentIDs(batch []*db.Comment) []string {
+	out := make([]string, 0, len(batch))
+	for _, c := range batch {
+		out = append(out, c.ID)
+	}
+	return out
+}
+
+// commentIDsAt returns the ids at the given batch indexes.
+func commentIDsAt(batch []*db.Comment, indexes []int) []string {
+	out := make([]string, 0, len(indexes))
+	for _, i := range indexes {
+		if i >= 0 && i < len(batch) {
+			out = append(out, batch[i].ID)
+		}
+	}
+	return out
+}
+
+// recordRetryState bumps the per-comment retry state for a failed (or
+// partially failed) batch and reports whether the comments are now parked.
+// Terminal errors park immediately (attempts at cap, no backoff); transient
+// errors increment and schedule the next backoff slot. Logs event=batch_parked
+// when comments cross the cap. Optional DB methods are reached by type
+// assertion so embedded-nil test doubles stay no-ops.
+func (p *Processor) recordRetryState(ctx context.Context, channelID, jobID string, ids []string, terminal bool) (parked bool) {
+	if len(ids) == 0 {
+		return false
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			// Nil-embedded db.DBQuery test double: treat as no retry store.
+			parked = false
+		}
+	}()
+	inc, ok := p.Q.(interface {
+		IncrementLLMAttempts(context.Context, []string, *time.Time, bool, int) error
+	})
+	if !ok {
+		return false
+	}
+	if terminal {
+		if err := inc.IncrementLLMAttempts(ctx, ids, nil, true, p.MaxAttempts); err != nil {
+			log.Printf("LLM Processor: park attempts failed channel=%s: %v", channelID, err)
+			return false
+		}
+		log.Printf("event=batch_parked channel_id=%s job_id=%s comment_ids=%v reason=terminal", channelID, jobID, ids)
+		return true
+	}
+	cur := p.maxPendingAttempts(ctx, ids)
+	next := p.clock().UTC().Add(p.backoffFor(cur))
+	if err := inc.IncrementLLMAttempts(ctx, ids, &next, false, p.MaxAttempts); err != nil {
+		log.Printf("LLM Processor: increment attempts failed channel=%s: %v", channelID, err)
+		return false
+	}
+	if cur+1 >= p.MaxAttempts {
+		log.Printf("event=batch_parked channel_id=%s job_id=%s comment_ids=%v reason=attempt_cap", channelID, jobID, ids)
+		return true
+	}
+	return false
+}
+
+// maxPendingAttempts returns the highest llm_attempts among ids, or 0 when the
+// query is unavailable (test double).
+func (p *Processor) maxPendingAttempts(ctx context.Context, ids []string) int {
+	defer func() {
+		if r := recover(); r != nil {
+		}
+	}()
+	if m, ok := p.Q.(interface {
+		MaxLLMAttempts(context.Context, []string) (int, error)
+	}); ok {
+		n, err := m.MaxLLMAttempts(ctx, ids)
+		if err == nil {
+			return n
+		}
+	}
+	return 0
+}
+
+// clock returns the processor's clock, defaulting to time.Now.
+func (p *Processor) clock() time.Time {
+	if p.now != nil {
+		return p.now()
+	}
+	return time.Now()
+}
+
+// backoffFor returns the backoff slot for a comment whose *new* attempt count
+// is cur+1 (0-indexed by the prior count), clamped to the schedule length.
+func (p *Processor) backoffFor(cur int) time.Duration {
+	if len(p.RetryBackoff) == 0 {
+		return time.Minute
+	}
+	i := cur
+	if i >= len(p.RetryBackoff) {
+		i = len(p.RetryBackoff) - 1
+	}
+	if i < 0 {
+		i = 0
+	}
+	return p.RetryBackoff[i]
 }
 
 // requireActivePrimary resolves the primary token holder (no primary => skip,
@@ -264,11 +594,9 @@ func (p *Processor) parentContext(ctx context.Context, c *db.Comment) string {
 	return parent
 }
 
-// classify runs the LLM call under the batch timeout. The inflight counter
-// covers the call so graceful shutdown waits for it.
-func (p *Processor) classify(ctx context.Context, prompts []PromptComment) ([]LLMResult, error) {
-	p.inflight.Add(1)
-	defer p.inflight.Done()
+// classify runs the LLM call under the batch timeout. The caller holds the
+// inflight counter for the whole batch so graceful shutdown waits for it.
+func (p *Processor) classify(ctx context.Context, prompts []PromptComment) ([]LLMResult, []int, error) {
 	llmCtx, cancel := context.WithTimeout(ctx, p.BatchTimeout)
 	defer cancel()
 	// otel-instrumentation: wrap each LLM call in a tracer span and
@@ -281,9 +609,9 @@ func (p *Processor) classify(ctx context.Context, prompts []PromptComment) ([]LL
 	traced, span := llmTracer.Start(llmCtx, "llm.classify_batch", traceWithAttrs(provider, model, len(prompts)))
 	defer span.End()
 	llmStart := time.Now()
-	results, err := p.Client.ClassifyBatch(traced, prompts)
+	results, missingIndexes, err := p.Client.ClassifyBatch(traced, prompts)
 	recordLLMRequest(llmCtx, provider, model, llmStart, err)
-	return results, err
+	return results, missingIndexes, err
 }
 
 // failBatch records the truncated error on the job row and logs the
@@ -316,46 +644,74 @@ func enqueueLLMJobDeduped(ctx context.Context, q db.DBQuery, commentIDs []string
 	return id, true, err
 }
 
-// persistBatch writes every classification result, increments the primary
-// token holder's usage by len(batch), logs overage rows when the batch
-// crosses the quota boundary for an overage-tracked plan, and marks the job
-// row completed. The DBQuery interface does not expose explicit
-// transactions; each underlying method is its own short statement. For
-// strict atomicity a future iteration can wrap these in a Tx accessor —
-// accepted in design.md as MVP behavior.
-func (p *Processor) persistBatch(ctx context.Context, batch []*db.Comment, results []LLMResult, primary *db.User, jobID string) error {
-	// Map results by comment_index defensively in case the LLM emitted them
-	// out of order.
+// persistBatch writes valid classification results (partial acceptance: a
+// single invalid/omitted index no longer discards the whole batch), increments
+// the quota by the persisted count, and marks the job. When any indexes are
+// missing/invalid the job is marked failed naming them and the returned
+// missing list drives the bounded-retry state. A zero-valid response leaves
+// missing = all indexes and persists nothing (full failure).
+func (p *Processor) persistBatch(ctx context.Context, batch []*db.Comment, results []LLMResult, missingIndexes []int, primary *db.User, jobID string) (int, []int, error) {
 	byIdx := make(map[int]LLMResult, len(results))
 	for _, r := range results {
 		byIdx[r.CommentIndex] = r
 	}
+	missingSet := make(map[int]struct{}, len(missingIndexes))
+	for _, idx := range missingIndexes {
+		missingSet[idx] = struct{}{}
+	}
+
+	persisted := 0
 	for i, c := range batch {
 		r, ok := byIdx[i]
 		if !ok {
-			return fmt.Errorf("missing result for comment_index=%d id=%s", i, c.ID)
+			missingSet[i] = struct{}{}
+			continue
 		}
 		if err := p.Q.UpdateCommentLLMData(ctx, c.ID, r.Category, r.Topic, p.Client.ProviderName(), p.Client.ModelName(), mustMarshalInsights(r.ActionableInsights), r.Confidence); err != nil {
-			return fmt.Errorf("update comment %s: %w", c.ID, err)
+			return persisted, nil, fmt.Errorf("update comment %s: %w", c.ID, err)
 		}
 		if err := p.updateCommentSentiment(ctx, c.ID, SentimentScore(r.Sentiment)); err != nil {
-			return fmt.Errorf("update comment %s sentiment: %w", c.ID, err)
+			return persisted, nil, fmt.Errorf("update comment %s sentiment: %w", c.ID, err)
 		}
-	}
-	if err := p.Q.IncrementCommentsUsed(ctx, primary.ID, len(batch)); err != nil {
-		return fmt.Errorf("increment quota: %w", err)
+		persisted++
 	}
 
-	// Overage logging (billing change, task 7.5). When this batch crosses
-	// the user's quota boundary AND their plan tracks overage (creator,
-	// studio), insert a comment_usage_logs row with the delta beyond the
-	// quota.
-	p.logOverage(ctx, primary, len(batch))
+	missing := sortedInts(missingSet)
+
+	// Charge only what was persisted; partial batches bill exactly once.
+	if persisted > 0 {
+		if err := p.Q.IncrementCommentsUsed(ctx, primary.ID, persisted); err != nil {
+			return persisted, missing, fmt.Errorf("increment quota: %w", err)
+		}
+		// Overage logging (billing change, task 7.5). When this batch crosses
+		// the user's quota boundary AND their plan tracks overage (creator,
+		// studio), insert a comment_usage_logs row with the delta beyond the
+		// quota.
+		p.logOverage(ctx, primary, persisted)
+	}
+
+	if len(missing) > 0 {
+		msg := fmt.Sprintf("partial classification: missing/invalid comment indexes %v", missing)
+		if err := p.Q.MarkLLMJobFailed(ctx, jobID, msg); err != nil {
+			return persisted, missing, fmt.Errorf("mark job failed: %w", err)
+		}
+		return persisted, missing, nil
+	}
 
 	if err := p.Q.MarkLLMJobCompleted(ctx, jobID); err != nil {
-		return fmt.Errorf("mark job completed: %w", err)
+		return persisted, missing, fmt.Errorf("mark job completed: %w", err)
 	}
-	return nil
+	return persisted, missing, nil
+}
+
+// sortedInts returns the map's keys in ascending order for stable logs/tests.
+func sortedInts(set map[int]struct{}) []int {
+	out := make([]int, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Ints(out)
+	return out
 }
 
 // logOverage records usage beyond quota when the plan tracks overage.

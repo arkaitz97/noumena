@@ -179,7 +179,7 @@ func (m *MockQuery) GetUnprocessedComments(ctx context.Context, limit int) ([]*d
 	return nil, nil
 }
 
-func (m *MockQuery) GetUnprocessedCommentsByChannel(ctx context.Context, limit int) (map[string][]*db.Comment, error) {
+func (m *MockQuery) GetUnprocessedCommentsByChannel(ctx context.Context, limit int, maxAttempts int) (map[string][]*db.Comment, error) {
 	return nil, nil
 }
 

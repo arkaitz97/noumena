@@ -245,43 +245,45 @@ func extractFirstJSONArray(s string) (string, bool) {
 // ParseClassificationResponse strips fences, extracts the first balanced JSON
 // array, validates each entry against the closed category set and the
 // actionable_insights format, rounds confidence to 2 decimals, and truncates
-// topic to 10 whitespace-separated words. The returned slice is in the same
-// order the model emitted; callers use CommentIndex to align with input.
-func ParseClassificationResponse(raw string, expectedCount int) ([]LLMResult, error) {
+// topic to 10 whitespace-separated words. Returns valid results and indexes
+// of missing/invalid entries (instead of aborting on one bad entry).
+func ParseClassificationResponse(raw string, expectedCount int) ([]LLMResult, []int, error) {
 	s := stripMarkdownFences(raw)
 	jsonStr, ok := extractFirstJSONArray(s)
 	if !ok {
-		// Last-resort regex fallback (greedy, takes the widest [...] span).
 		m := jsonArrayRe.FindString(s)
 		if m == "" {
-			return nil, fmt.Errorf("no JSON array found in response")
+			return nil, nil, fmt.Errorf("no JSON array found in response")
 		}
 		jsonStr = m
 	}
 
 	var rawResults []LLMResult
 	if err := json.Unmarshal([]byte(jsonStr), &rawResults); err != nil {
-		return nil, fmt.Errorf("unmarshal results: %w", err)
+		return nil, nil, fmt.Errorf("unmarshal results: %w", err)
 	}
 
 	if len(rawResults) != expectedCount {
-		return nil, fmt.Errorf("expected %d results, got %d", expectedCount, len(rawResults))
+		missing := make([]int, expectedCount)
+		for i := range missing {
+			missing[i] = i
+		}
+		return nil, missing, fmt.Errorf("expected %d results, got %d", expectedCount, len(rawResults))
 	}
 
 	validated := make([]LLMResult, 0, len(rawResults))
+	missingIndexes := make([]int, 0)
 	for _, r := range rawResults {
 		if _, ok := ValidCategories[r.Category]; !ok {
-			return nil, fmt.Errorf("invalid category %q at index %d", r.Category, r.CommentIndex)
+			missingIndexes = append(missingIndexes, r.CommentIndex)
+			continue
 		}
-		// Round confidence to 2 decimals.
 		r.Confidence = math.Round(r.Confidence*100) / 100
-		// Truncate topic to first 10 whitespace-separated words.
 		r.Topic = truncateWords(r.Topic, 10)
-		// Validate and filter actionable_insights.
 		r.ActionableInsights = validateInsights(r.ActionableInsights)
 		validated = append(validated, r)
 	}
-	return validated, nil
+	return validated, missingIndexes, nil
 }
 
 // validateInsights filters and validates the actionable_insights array:

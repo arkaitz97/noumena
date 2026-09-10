@@ -3,6 +3,8 @@ package llm
 import (
 	"context"
 	"errors"
+	"strconv"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -25,6 +27,10 @@ var (
 	llmTokensTotal         metric.Int64Counter
 	llmRequestDurationSecs metric.Float64Histogram
 	llmFailoverTotal       metric.Int64Counter
+	llmProviderCallsTotal  metric.Int64Counter
+	llmJobAttemptsTotal    metric.Int64Counter
+	llmParkedComments      atomic.Int64
+	llmBatchesInFlight     atomic.Int64
 )
 
 func init() {
@@ -53,6 +59,38 @@ func init() {
 		metric.WithDescription("Provider failover events, by from/to provider pair"),
 	); err != nil {
 		panic("noumena_llm_failover_total: " + err.Error())
+	}
+	if llmProviderCallsTotal, err = llmMeter.Int64Counter(
+		"noumena_llm_provider_calls_total",
+		metric.WithDescription("HTTP attempts against a provider, including in-retry attempts (duplicate-work canary)"),
+	); err != nil {
+		panic("noumena_llm_provider_calls_total: " + err.Error())
+	}
+	if llmJobAttemptsTotal, err = llmMeter.Int64Counter(
+		"noumena_llm_job_attempts_total",
+		metric.WithDescription("Classification job terminal states, by outcome"),
+	); err != nil {
+		panic("noumena_llm_job_attempts_total: " + err.Error())
+	}
+	if _, err := llmMeter.Int64ObservableGauge(
+		"noumena_llm_parked_comments",
+		metric.WithDescription("Unprocessed comments excluded from claiming at the attempt cap"),
+		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+			o.Observe(llmParkedComments.Load())
+			return nil
+		}),
+	); err != nil {
+		panic("noumena_llm_parked_comments: " + err.Error())
+	}
+	if _, err := llmMeter.Int64ObservableGauge(
+		"noumena_llm_batches_in_flight",
+		metric.WithDescription("Channel batches currently being processed (effective concurrency)"),
+		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+			o.Observe(llmBatchesInFlight.Load())
+			return nil
+		}),
+	); err != nil {
+		panic("noumena_llm_batches_in_flight: " + err.Error())
 	}
 }
 
@@ -116,4 +154,36 @@ func recordLLMFailover(ctx context.Context, fromProvider, toProvider string) {
 		attribute.String(telemetry.AttrFromProvider, fromProvider),
 		attribute.String(telemetry.AttrToProvider, toProvider),
 	))
+}
+
+// recordLLMProviderCall increments noumena_llm_provider_calls_total for one
+// HTTP attempt (including in-retry attempts). The ratio to distinct jobs is
+// the duplicate-work canary.
+func recordLLMProviderCall(ctx context.Context, provider string, retryable bool) {
+	llmProviderCallsTotal.Add(ctx, 1, metric.WithAttributes(
+		attribute.String(telemetry.AttrProvider, provider),
+		attribute.String(telemetry.AttrRetryable, strconv.FormatBool(retryable)),
+	))
+}
+
+// recordLLMJobAttempt increments noumena_llm_job_attempts_total with the
+// closed outcome enum: completed|failed_transient|failed_terminal|parked.
+func recordLLMJobAttempt(ctx context.Context, provider, outcome string) {
+	llmJobAttemptsTotal.Add(ctx, 1, metric.WithAttributes(
+		attribute.String(telemetry.AttrProvider, provider),
+		telemetry.Outcome(outcome),
+	))
+}
+
+// recordLLMParkedComments stores the sampled dead-letter depth; the
+// observable gauge reads it on scrape.
+func recordLLMParkedComments(n int64) {
+	llmParkedComments.Store(n)
+}
+
+// recordLLMBatchInFlight tracks how many channel batches are actively being
+// processed. Call with +1 on acquire and -1 on release; the observable gauge
+// reads the running total on scrape.
+func recordLLMBatchInFlight(_ context.Context, delta int64) {
+	llmBatchesInFlight.Add(delta)
 }

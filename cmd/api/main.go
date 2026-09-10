@@ -694,6 +694,9 @@ func startLLMProcessor(queries db.DBQuery, runWorker func(func(context.Context))
 	proc.TickInterval = config.Default.LLMProcessorTickInterval
 	proc.BatchTimeout = config.Default.LLMProcessorBatchTimeout
 	proc.BatchSize = config.Default.LLMBatchSize
+	proc.MaxAttempts = config.Default.LLMMaxAttempts
+	proc.MaxConcurrency = config.Default.LLMMaxConcurrency
+	proc.RetryBackoff = config.Default.LLMRetryBackoff
 	proc.ConfidenceThreshold = config.Default.LLMConfidenceThreshold
 	proc.ShutdownGrace = config.Default.LLMProcessorShutdownGrace
 	log.Printf("LLM processor: enabled=true provider=%s batch_size=%d threshold=%.2f",

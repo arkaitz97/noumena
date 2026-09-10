@@ -55,7 +55,7 @@ func NewOpenAIClient(apiKey, baseURL, model string) LLMClient {
 // *http.Client (typically backed by httptest.NewServer).
 func newOpenAIClientWithHTTP(client *http.Client, baseURL, apiKey, model string) *openaiClient {
 	if client == nil {
-		client = &http.Client{Timeout: 60 * time.Second}
+		client = &http.Client{} // no timeout; processor ctx owns budget
 	}
 	if baseURL == "" {
 		baseURL = openaiDefaultBaseURL
@@ -77,9 +77,9 @@ func (c *openaiClient) ModelName() string    { return c.model }
 // ClassifyBatch mirrors opencodeClient.ClassifyBatch: build the shared
 // classification prompt, POST one request to /chat/completions, retry with
 // the shared transient schedule, parse via ParseClassificationResponse.
-func (c *openaiClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, error) {
+func (c *openaiClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, error) {
 	if len(comments) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	system, user := BuildClassificationPrompt(comments)
@@ -93,30 +93,31 @@ func (c *openaiClient) ClassifyBatch(ctx context.Context, comments []PromptComme
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("openai: marshal request: %w", err)
+		return nil, nil, fmt.Errorf("openai: marshal request: %w", err)
 	}
 
 	endpoint := c.baseURL + "/chat/completions"
-	return retryTransient(ctx, "openai: all retries exhausted", func() ([]LLMResult, time.Duration, bool, error) {
-		return httpClassifyOnce(ctx, c.httpClient, endpoint, body, "openai",
+	out, err := retryTransient(ctx, "openai", "openai: all retries exhausted", func(attemptCtx context.Context) (classifyOutcome, time.Duration, bool, error) {
+		return httpClassifyOnce(attemptCtx, c.httpClient, endpoint, body, "openai",
 			func(h http.Header) {
 				if c.apiKey != "" {
 					h.Set("Authorization", "Bearer "+c.apiKey)
 				}
 			},
-			func(r io.Reader) ([]LLMResult, error) {
+			func(r io.Reader) (classifyOutcome, error) {
 				var parsed openAIChatResponse
 				if err := json.NewDecoder(r).Decode(&parsed); err != nil {
-					return nil, fmt.Errorf("openai: decode response: %w", err)
+					return classifyOutcome{}, fmt.Errorf("openai: decode response: %w", err)
 				}
 				if len(parsed.Choices) == 0 {
-					return nil, fmt.Errorf("openai: empty response choices")
+					return classifyOutcome{}, fmt.Errorf("openai: empty response choices")
 				}
-				results, perr := ParseClassificationResponse(parsed.Choices[0].Message.Content, len(comments))
+				results, missingIndexes, perr := ParseClassificationResponse(parsed.Choices[0].Message.Content, len(comments))
 				if perr != nil {
-					return nil, fmt.Errorf("openai: parse: %w", perr)
+					return classifyOutcome{}, terminal(fmt.Errorf("openai: parse: %w", perr))
 				}
-				return results, nil
+				return classifyOutcome{results: results, missingIndexes: missingIndexes}, nil
 			})
 	})
+	return out.results, out.missingIndexes, err
 }

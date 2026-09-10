@@ -74,7 +74,7 @@ func NewAnthropicClient(apiKey, baseURL, model string) LLMClient {
 // *http.Client (typically backed by httptest.NewServer).
 func newAnthropicClientWithHTTP(client *http.Client, baseURL, apiKey, model string) *anthropicClient {
 	if client == nil {
-		client = &http.Client{Timeout: 60 * time.Second}
+		client = &http.Client{} // no timeout; processor ctx owns budget
 	}
 	if baseURL == "" {
 		baseURL = anthropicDefaultBaseURL
@@ -97,9 +97,9 @@ func (c *anthropicClient) ModelName() string    { return c.model }
 // ClassifyBatch mirrors opencodeClient.ClassifyBatch: build the shared
 // classification prompt, POST one Messages API request, retry with the
 // shared transient schedule, parse via ParseClassificationResponse.
-func (c *anthropicClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, error) {
+func (c *anthropicClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, error) {
 	if len(comments) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	system, user := BuildClassificationPrompt(comments)
@@ -114,22 +114,22 @@ func (c *anthropicClient) ClassifyBatch(ctx context.Context, comments []PromptCo
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("anthropic: marshal request: %w", err)
+		return nil, nil, fmt.Errorf("anthropic: marshal request: %w", err)
 	}
 
 	endpoint := c.baseURL + "/v1/messages"
-	return retryTransient(ctx, "anthropic: all retries exhausted", func() ([]LLMResult, time.Duration, bool, error) {
-		return httpClassifyOnce(ctx, c.httpClient, endpoint, body, "anthropic",
+	out, err := retryTransient(ctx, "anthropic", "anthropic: all retries exhausted", func(attemptCtx context.Context) (classifyOutcome, time.Duration, bool, error) {
+		return httpClassifyOnce(attemptCtx, c.httpClient, endpoint, body, "anthropic",
 			func(h http.Header) {
 				h.Set(anthropicVersionHeader, anthropicVersion)
 				if c.apiKey != "" {
 					h.Set(anthropicAPIKeyHeader, c.apiKey)
 				}
 			},
-			func(r io.Reader) ([]LLMResult, error) {
+			func(r io.Reader) (classifyOutcome, error) {
 				var parsed anthropicMessagesResponse
 				if err := json.NewDecoder(r).Decode(&parsed); err != nil {
-					return nil, fmt.Errorf("anthropic: decode response: %w", err)
+					return classifyOutcome{}, fmt.Errorf("anthropic: decode response: %w", err)
 				}
 				var text string
 				for _, block := range parsed.Content {
@@ -139,13 +139,14 @@ func (c *anthropicClient) ClassifyBatch(ctx context.Context, comments []PromptCo
 					}
 				}
 				if text == "" {
-					return nil, fmt.Errorf("anthropic: empty response content")
+					return classifyOutcome{}, fmt.Errorf("anthropic: empty response content")
 				}
-				results, perr := ParseClassificationResponse(text, len(comments))
+				results, missingIndexes, perr := ParseClassificationResponse(text, len(comments))
 				if perr != nil {
-					return nil, fmt.Errorf("anthropic: parse: %w", perr)
+					return classifyOutcome{}, terminal(fmt.Errorf("anthropic: parse: %w", perr))
 				}
-				return results, nil
+				return classifyOutcome{results: results, missingIndexes: missingIndexes}, nil
 			})
 	})
+	return out.results, out.missingIndexes, err
 }

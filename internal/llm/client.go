@@ -13,11 +13,20 @@ import (
 // behind the same interface and is the only place where provider-switching
 // policy lives.
 type LLMClient interface {
-	ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, error)
+	ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, error)
 	// ProviderName returns a stable identifier (e.g. "openai", "anthropic")
 	// used for attribution in comments.llm_provider.
 	ProviderName() string
 	// ModelName returns the configured model identifier persisted alongside
 	// the classification (e.g. "gpt-4o", "claude-3-5-sonnet").
 	ModelName() string
+}
+
+// classifyOutcome carries a batch's partial classification: valid results
+// plus the indexes the model omitted or returned invalid. It is the generic
+// payload retryTransient and httpClassifyOnce shuttle through their loops so
+// partial success survives in-job retries.
+type classifyOutcome struct {
+	results        []LLMResult
+	missingIndexes []int
 }

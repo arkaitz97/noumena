@@ -42,7 +42,7 @@ func NewOpenCodeClient(apiKey, baseURL, model string) *opencodeClient {
 		model = "opencode/default"
 	}
 	return &opencodeClient{
-		httpClient: &http.Client{Timeout: 60 * time.Second},
+		httpClient: &http.Client{}, // no timeout; processor ctx owns budget
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		apiKey:     apiKey,
 		model:      model,
@@ -55,7 +55,7 @@ func NewOpenCodeClient(apiKey, baseURL, model string) *opencodeClient {
 // without reaching the network.
 func newOpenCodeClientWithHTTP(client *http.Client, baseURL, apiKey, model string) *opencodeClient {
 	if client == nil {
-		client = &http.Client{Timeout: 60 * time.Second}
+		client = &http.Client{} // no timeout; processor ctx owns budget
 	}
 	if baseURL == "" {
 		baseURL = "https://api.opencode.local/v1"
@@ -92,8 +92,8 @@ func (c *opencodeClient) GenerateDigestRaw(ctx context.Context, prompt string) (
 	}
 
 	endpoint := c.baseURL + "/chat/completions"
-	return retryTransient(ctx, "opencode: digest", func() (string, time.Duration, bool, error) {
-		return c.doOnceDigest(ctx, endpoint, bodyBytes)
+	return retryTransient(ctx, "opencode", "opencode: digest", func(attemptCtx context.Context) (string, time.Duration, bool, error) {
+		return c.doOnceDigest(attemptCtx, endpoint, bodyBytes)
 	})
 }
 
@@ -159,9 +159,9 @@ type opencodeChatResponse struct {
 // ClassifyBatch builds the classification prompt, POSTs it to the OpenCode
 // chat-completions endpoint, and returns the parsed []LLMResult. Retries are
 // handled by retryTransient (shared with OpenAI/Anthropic clients).
-func (c *opencodeClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, error) {
+func (c *opencodeClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, error) {
 	if len(comments) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	system, user := BuildClassificationPrompt(comments)
@@ -175,23 +175,24 @@ func (c *opencodeClient) ClassifyBatch(ctx context.Context, comments []PromptCom
 	}
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("opencode: marshal request: %w", err)
+		return nil, nil, fmt.Errorf("opencode: marshal request: %w", err)
 	}
 
 	endpoint := c.baseURL + "/chat/completions"
-	return retryTransient(ctx, "opencode", func() ([]LLMResult, time.Duration, bool, error) {
-		return c.doOnce(ctx, endpoint, bodyBytes, len(comments))
+	out, err := retryTransient(ctx, "opencode", "opencode", func(attemptCtx context.Context) (classifyOutcome, time.Duration, bool, error) {
+		return c.doOnce(attemptCtx, endpoint, bodyBytes, len(comments))
 	})
+	return out.results, out.missingIndexes, err
 }
 
 // doOnce performs a single HTTP attempt. It returns:
-//   - results+nil err on success
-//   - (nil, retryAfter, true, err) on 429/5xx (caller should retry)
-//   - (nil, 0, false, err) on non-retryable error (caller should abort)
-func (c *opencodeClient) doOnce(ctx context.Context, endpoint string, body []byte, expected int) ([]LLMResult, time.Duration, bool, error) {
+//   - (outcome, 0, false, nil) on success (outcome may carry missing indexes)
+//   - (zero, retryAfter, true, err) on 429/5xx (caller should retry)
+//   - (zero, 0, false, err) on non-retryable error (caller should abort)
+func (c *opencodeClient) doOnce(ctx context.Context, endpoint string, body []byte, expected int) (classifyOutcome, time.Duration, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return nil, 0, false, fmt.Errorf("opencode: build request: %w", err)
+		return classifyOutcome{}, 0, false, fmt.Errorf("opencode: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -205,7 +206,7 @@ func (c *opencodeClient) doOnce(ctx context.Context, endpoint string, body []byt
 		// Transport-level errors (DNS, connection, TLS, timeout) are treated
 		// as retryable; the failover wrapper still gets the same signal if
 		// they persist past our retry budget.
-		return nil, 0, true, fmt.Errorf("opencode: transport: %w", err)
+		return classifyOutcome{}, 0, true, fmt.Errorf("opencode: transport: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -213,24 +214,24 @@ func (c *opencodeClient) doOnce(ctx context.Context, endpoint string, body []byt
 		retryAfter := parseRetryAfterSeconds(resp.Header.Get("Retry-After"))
 		// Drain so the connection can be reused.
 		_, _ = io.Copy(io.Discard, resp.Body)
-		return nil, retryAfter, true, fmt.Errorf("opencode: HTTP %d", resp.StatusCode)
+		return classifyOutcome{}, retryAfter, true, fmt.Errorf("opencode: HTTP %d", resp.StatusCode)
 	}
 	if resp.StatusCode >= 400 {
 		// 4xx other than 429 → non-retryable (auth, malformed request, etc.).
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, 0, false, fmt.Errorf("opencode: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet)))
+		return classifyOutcome{}, 0, false, terminal(fmt.Errorf("opencode: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet))))
 	}
 
 	var parsed opencodeChatResponse
 	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
-		return nil, 0, false, fmt.Errorf("opencode: decode response: %w", err)
+		return classifyOutcome{}, 0, false, terminal(fmt.Errorf("opencode: decode response: %w", err))
 	}
 	if len(parsed.Choices) == 0 {
-		return nil, 0, false, fmt.Errorf("opencode: empty response choices")
+		return classifyOutcome{}, 0, false, terminal(fmt.Errorf("opencode: empty response choices"))
 	}
-	results, perr := ParseClassificationResponse(parsed.Choices[0].Message.Content, expected)
+	results, missingIndexes, perr := ParseClassificationResponse(parsed.Choices[0].Message.Content, expected)
 	if perr != nil {
-		return nil, 0, false, fmt.Errorf("opencode: parse: %w", perr)
+		return classifyOutcome{}, 0, false, terminal(fmt.Errorf("opencode: parse: %w", perr))
 	}
-	return results, 0, false, nil
+	return classifyOutcome{results: results, missingIndexes: missingIndexes}, 0, false, nil
 }

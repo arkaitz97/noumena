@@ -57,7 +57,7 @@ func TestOpenAIClient_SuccessfulClassification(t *testing.T) {
 	defer srv.Close()
 
 	c := newOpenAIClientWithHTTP(srv.Client(), srv.URL, "sk-test-123", "gpt-test")
-	results, err := c.ClassifyBatch(context.Background(), []PromptComment{
+	results, _, err := c.ClassifyBatch(context.Background(), []PromptComment{
 		{Body: "great"}, {Body: "ok"}, {Body: "meh"},
 	})
 	if err != nil {
@@ -113,7 +113,7 @@ func TestOpenAIClient_429RetryAfterHonored(t *testing.T) {
 
 	c := newOpenAIClientWithHTTP(srv.Client(), srv.URL, "k", "")
 	start := time.Now()
-	results, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "hi"}})
+	results, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "hi"}})
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("ClassifyBatch: %v", err)
@@ -142,7 +142,7 @@ func TestOpenAIClient_Persistent5xxReturnsError(t *testing.T) {
 	}
 
 	c := newOpenAIClientWithHTTP(srv.Client(), srv.URL, "k", "")
-	_, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
+	_, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
 	if err == nil {
 		t.Fatalf("expected error after exhausted retries")
 	}
@@ -164,7 +164,7 @@ func TestOpenAIClient_400NonRetryable(t *testing.T) {
 	defer srv.Close()
 
 	c := newOpenAIClientWithHTTP(srv.Client(), srv.URL, "k", "")
-	_, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
+	_, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
 	if err == nil {
 		t.Fatalf("expected error on 400")
 	}
@@ -176,7 +176,7 @@ func TestOpenAIClient_400NonRetryable(t *testing.T) {
 	}
 }
 
-func TestOpenAIClient_ParseErrorIsNonRetryable(t *testing.T) {
+func TestOpenAIClient_InvalidCategoryIsPartialNotRetryable(t *testing.T) {
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&calls, 1)
@@ -187,14 +187,81 @@ func TestOpenAIClient_ParseErrorIsNonRetryable(t *testing.T) {
 	defer srv.Close()
 
 	c := newOpenAIClientWithHTTP(srv.Client(), srv.URL, "k", "")
-	_, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
-	if err == nil {
-		t.Fatalf("expected parse error")
+	results, missing, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
+	if err != nil {
+		t.Fatalf("partial parse must not abort: %v", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("invalid category must be excluded, got %d valid", len(results))
+	}
+	if len(missing) != 1 || missing[0] != 0 {
+		t.Errorf("missing indexes = %v, want [0]", missing)
 	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Errorf("calls: got %d, want 1 (no retry on parse failure)", got)
+		t.Errorf("calls: got %d, want 1 (no retry on partial parse)", got)
 	}
-	if !strings.Contains(err.Error(), "invalid category") {
-		t.Errorf("error should mention the bad category: %v", err)
+}
+
+// TestOpenAIClient_Regression_SlowResponseUnderBudget verifies that a slow
+// provider response completes when the caller ctx budget exceeds the response
+// time, and that no hidden client timeout aborts it. Scaled to 500ms/5s for CI.
+func TestOpenAIClient_Regression_SlowResponseUnderBudget(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping under -short: wall-clock heavy")
+	}
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		time.Sleep(500 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, chatCompletionResponseBody(`[{"comment_index":0,"category":"praise","confidence":0.9,"topic":"test","actionable_insights":[],"sentiment":"positive"}]`))
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	c := newOpenAIClientWithHTTP(srv.Client(), srv.URL, "k", "")
+	_, _, err := c.ClassifyBatch(ctx, []PromptComment{{Body: "x"}})
+	if err != nil {
+		t.Fatalf("expected success with 5s budget for 500ms response: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("calls: got %d, want 1 (single attempt succeeds)", got)
+	}
+}
+
+// TestOpenAIClient_Regression_BudgetAbortsAtOnce verifies that with a ctx
+// budget shorter than the response time, the call is aborted after exactly
+// one provider call (proving no hidden client timeout that would allow retries).
+// Scaled to 500ms budget vs 2s response.
+func TestOpenAIClient_Regression_BudgetAbortsAtOnce(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping under -short: wall-clock heavy")
+	}
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		time.Sleep(2 * time.Second)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, chatCompletionResponseBody(`[{"comment_index":0,"category":"praise","confidence":0.9,"topic":"test","actionable_insights":[],"sentiment":"positive"}]`))
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	c := newOpenAIClientWithHTTP(srv.Client(), srv.URL, "k", "")
+	_, _, err := c.ClassifyBatch(ctx, []PromptComment{{Body: "x"}})
+	if err == nil {
+		t.Fatalf("expected deadline exceeded error with 500ms budget for 2s response")
+	}
+	if !strings.Contains(err.Error(), "context deadline exceeded") && !strings.Contains(err.Error(), "deadline exceeded") {
+		t.Errorf("error should be deadline exceeded: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("calls: got %d, want 1 (aborted on first attempt, no hidden client timeout allowing retries)", got)
 	}
 }

@@ -314,16 +314,31 @@ func (q *SQLiteQuery) ResumeTracking(ctx context.Context, userID, platformChanne
 		return tx.Commit()
 	}
 
-	var maxPrio sql.NullInt64
+	// Keep the channel's primary invariant: exactly one active tracker should
+	// hold token_priority 0. Pausing the primary demotes it to 9999, so a
+	// resume that merely appends MAX+1 could leave the channel with no
+	// priority-0 tracker — and the LLM claim query requires one. When no active
+	// primary remains, the resumed tracker becomes the primary; otherwise it
+	// joins after the highest active priority.
+	var hasPrimary int
 	if err := tx.QueryRowContext(ctx,
-		`SELECT MAX(token_priority) FROM user_channel_tracking
-		 WHERE platform_channel_id = ? AND tracking_status = 'active'`,
-		platformChannelID).Scan(&maxPrio); err != nil {
+		`SELECT COUNT(*) FROM user_channel_tracking
+		 WHERE platform_channel_id = ? AND tracking_status = 'active' AND token_priority = 0`,
+		platformChannelID).Scan(&hasPrimary); err != nil {
 		return err
 	}
 	newPrio := 0
-	if maxPrio.Valid {
-		newPrio = int(maxPrio.Int64) + 1
+	if hasPrimary > 0 {
+		var maxPrio sql.NullInt64
+		if err := tx.QueryRowContext(ctx,
+			`SELECT MAX(token_priority) FROM user_channel_tracking
+			 WHERE platform_channel_id = ? AND tracking_status = 'active'`,
+			platformChannelID).Scan(&maxPrio); err != nil {
+			return err
+		}
+		if maxPrio.Valid {
+			newPrio = int(maxPrio.Int64) + 1
+		}
 	}
 
 	if _, err := tx.ExecContext(ctx,

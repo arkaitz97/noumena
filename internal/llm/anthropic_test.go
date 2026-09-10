@@ -78,7 +78,7 @@ func TestAnthropicClient_SuccessfulClassification(t *testing.T) {
 	defer srv.Close()
 
 	c := newAnthropicClientWithHTTP(srv.Client(), srv.URL, "sk-ant-test", "claude-test")
-	results, err := c.ClassifyBatch(context.Background(), []PromptComment{
+	results, _, err := c.ClassifyBatch(context.Background(), []PromptComment{
 		{Body: "great"}, {Body: "ok"},
 	})
 	if err != nil {
@@ -137,7 +137,7 @@ func TestAnthropicClient_429RetryAfterHonored(t *testing.T) {
 
 	c := newAnthropicClientWithHTTP(srv.Client(), srv.URL, "sk-ant-test", "")
 	start := time.Now()
-	results, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "hi"}})
+	results, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "hi"}})
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("ClassifyBatch: %v", err)
@@ -166,7 +166,7 @@ func TestAnthropicClient_Persistent5xxReturnsError(t *testing.T) {
 	}
 
 	c := newAnthropicClientWithHTTP(srv.Client(), srv.URL, "k", "")
-	_, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
+	_, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
 	if err == nil {
 		t.Fatalf("expected error after exhausted retries")
 	}
@@ -185,7 +185,7 @@ func TestAnthropicClient_400NonRetryable(t *testing.T) {
 	defer srv.Close()
 
 	c := newAnthropicClientWithHTTP(srv.Client(), srv.URL, "k", "")
-	_, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
+	_, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
 	if err == nil {
 		t.Fatalf("expected error on 400")
 	}

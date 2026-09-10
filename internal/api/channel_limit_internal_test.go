@@ -81,7 +81,7 @@ func (g *guardMockQuery) InsertComment(context.Context, *db.Comment) error { pan
 func (g *guardMockQuery) GetUnprocessedComments(context.Context, int) ([]*db.Comment, error) {
 	panic("not implemented")
 }
-func (g *guardMockQuery) GetUnprocessedCommentsByChannel(context.Context, int) (map[string][]*db.Comment, error) {
+func (g *guardMockQuery) GetUnprocessedCommentsByChannel(context.Context, int, int) (map[string][]*db.Comment, error) {
 	panic("not implemented")
 }
 func (g *guardMockQuery) UpdateCommentLLMData(context.Context, string, string, string, string, string, []byte, float64) error {

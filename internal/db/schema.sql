@@ -226,6 +226,8 @@ CREATE TABLE IF NOT EXISTS comments (
     processed_at TEXT,
     llm_provider TEXT,
     llm_model TEXT,
+    llm_attempts INTEGER NOT NULL DEFAULT 0,
+    llm_next_retry_at TEXT,
     reply_depth INT NOT NULL DEFAULT 0,
     actionable_insights TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
@@ -508,4 +510,3 @@ CREATE TABLE IF NOT EXISTS user_profiles (
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
-

@@ -90,8 +90,8 @@ func TestMigrate_Idempotent(t *testing.T) {
 		versions = append(versions, v)
 	}
 	rows.Close()
-	if len(versions) != 17 {
-		t.Fatalf("ledger has %d versions, want 17: %v", len(versions), versions)
+	if len(versions) != 18 {
+		t.Fatalf("ledger has %d versions, want 18: %v", len(versions), versions)
 	}
 
 	// Second run: no-op, ledger unchanged.
@@ -102,8 +102,8 @@ func TestMigrate_Idempotent(t *testing.T) {
 	if err := database.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if n != 17 {
-		t.Fatalf("ledger rows after re-run = %d, want 17", n)
+	if n != 18 {
+		t.Fatalf("ledger rows after re-run = %d, want 18", n)
 	}
 }
 
@@ -416,7 +416,7 @@ func TestInitDB_AndApplyMigrations_FileDB(t *testing.T) {
 	if err := DB.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if n != 17 {
-		t.Fatalf("ledger rows = %d, want 17", n)
+	if n != 18 {
+		t.Fatalf("ledger rows = %d, want 18", n)
 	}
 }

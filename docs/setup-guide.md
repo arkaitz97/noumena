@@ -318,11 +318,28 @@ ANTHROPIC_MODEL=claude-3-5-sonnet-latest
 
 ### 6.3 Fallback provider (optional)
 
-When `LLM_FAILOVER_ERROR_THRESHOLD` errors occur within
-`LLM_FAILOVER_WINDOW_SECONDS`, the processor switches to
-`LLM_FALLBACK_PROVIDER`. Set its credentials too.
+When `LLM_FAILOVER_ERROR_THRESHOLD` consecutive failures occur
+(default 3), the processor permanently switches to the fallback
+provider. Set its credentials too.
 
-### 6.4 Enable
+The deprecated `LLM_FAILOVER_WINDOW_SECONDS` (sliding window) is
+ignored; if set, a boot-time warning is logged.
+
+### 6.4 Retry and batch tuning (optional)
+
+```
+LLM_BATCH_SIZE=15                           # default 15 comments per batch
+LLM_MAX_ATTEMPTS=3                          # default 3 attempts per comment set
+LLM_RETRY_BACKOFF=1m,5m,15m                 # default backoff schedule
+LLM_PROCESSOR_BATCH_TIMEOUT=300s            # total budget across all attempts
+```
+
+`LLM_PROCESSOR_BATCH_TIMEOUT` is the **total** timeout budget for a
+batch across all retry attempts — not per attempt. Each attempt receives
+a share of the remaining budget (server `Retry-After` honored when
+shorter).
+
+### 6.5 Enable
 
 ```
 LLM_PROCESSOR_ENABLED=true

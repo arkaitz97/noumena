@@ -104,16 +104,27 @@ func (q *SQLiteQuery) GetUnprocessedComments(ctx context.Context, limit int) ([]
 	return comments, nil
 }
 
-func (q *SQLiteQuery) GetUnprocessedCommentsByChannel(ctx context.Context, limit int) (map[string][]*Comment, error) {
+func (q *SQLiteQuery) GetUnprocessedCommentsByChannel(ctx context.Context, limit int, maxAttempts int) (map[string][]*Comment, error) {
 	// Channels without an active primary (token_priority=0) tracker are
 	// excluded at claim time: the LLM processor skips them anyway, and
 	// claiming them every tick re-scans the same batch forever (log spam +
 	// churn). Comments stay unprocessed and get picked up once a primary
-	// exists.
+	// exists. Retry state (llm_attempts / llm_next_retry_at) excludes
+	// dead-lettered and backing-off comments.
+	now := time.Now().UTC().Format(time.RFC3339)
 	query := `
 		SELECT c.id, c.platform_channel_id, c.platform_comment_id, c.parent_comment_id, c.reply_depth, c.author_handle, c.body, c.posted_at, c.category, c.actionable_insights, c.topic, c.confidence, c.processed_at, c.created_at
 		FROM comments c
 		WHERE (c.processed_at IS NULL OR c.sentiment_score IS NULL) AND c.body != ''
+		  AND c.llm_attempts < ?
+		  AND (c.llm_next_retry_at IS NULL OR c.llm_next_retry_at <= ?)
+		  AND NOT EXISTS (
+		       SELECT 1
+		         FROM llm_processing_jobs j,
+		              json_each(CASE WHEN json_valid(j.comment_ids) THEN j.comment_ids ELSE '[]' END) je
+		        WHERE j.status IN ('pending', 'processing')
+		          AND je.value = c.id
+		  )
 		  AND EXISTS (
 		       SELECT 1 FROM user_channel_tracking uct
 		        WHERE uct.platform_channel_id = c.platform_channel_id
@@ -123,7 +134,7 @@ func (q *SQLiteQuery) GetUnprocessedCommentsByChannel(ctx context.Context, limit
 		ORDER BY c.posted_at ASC
 		LIMIT ?
 	`
-	rows, err := q.db.QueryContext(ctx, query, limit)
+	rows, err := q.db.QueryContext(ctx, query, maxAttempts, now, limit)
 	if err != nil {
 		return nil, err
 	}

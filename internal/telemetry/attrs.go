@@ -22,6 +22,7 @@ const (
 	AttrMethod       = "method"
 	AttrRoute        = "route"
 	AttrStatus       = "status"
+	AttrRetryable    = "retryable"
 )
 
 // Reason enum (ingestion errors). The full spec list is mirrored here so
@@ -49,6 +50,11 @@ const (
 	OutcomeHandlerError      = "handler_error"
 	OutcomeIgnored           = "ignored"
 	OutcomeIdempotentDedupe  = "idempotent_dedupe"
+	// LLM job-attempt outcomes (fix-llm-duplicate-processing).
+	OutcomeCompleted       = "completed"
+	OutcomeFailedTransient = "failed_transient"
+	OutcomeFailedTerminal  = "failed_terminal"
+	OutcomeParked          = "parked"
 )
 
 // Platform enum (ingestion). Only "youtube" today; reserved as an enum
@@ -76,6 +82,10 @@ var validOutcomes = map[string]struct{}{
 	OutcomeHandlerError:      {},
 	OutcomeIgnored:           {},
 	OutcomeIdempotentDedupe:  {},
+	OutcomeCompleted:         {},
+	OutcomeFailedTransient:   {},
+	OutcomeFailedTerminal:    {},
+	OutcomeParked:            {},
 }
 
 // Reason returns an attribute.KeyValue with a validated reason. In
