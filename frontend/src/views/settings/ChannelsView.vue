@@ -14,6 +14,7 @@ import { useBillingStore } from '../../stores/billing'
 import type { Channel } from '../../services/types'
 import ChannelCard from '../../components/ChannelCard.vue'
 import ConfirmModal from '../../components/ConfirmModal.vue'
+import PageHeader from '../../components/PageHeader.vue'
 
 const channels = useChannelsStore()
 const billing = useBillingStore()
@@ -102,16 +103,12 @@ onMounted(async () => {
 
 <template>
   <div class="max-w-5xl mx-auto py-8 px-4 sm:px-6 lg:px-8 space-y-8">
-    <!-- Header + connect button -->
-    <div class="sm:flex sm:items-center sm:justify-between">
-      <div>
-        <p class="eyebrow mb-2">Sources</p>
-        <h1 class="text-display-sm font-bold text-zinc-900 dark:text-white">Connected channels</h1>
-        <p class="mt-2 text-sm text-zinc-500 dark:text-zinc-400">
-          Manage your tracked channels, pause processing, or remove channels you no longer need.
-        </p>
-      </div>
-      <div class="mt-5 sm:mt-0 flex-shrink-0">
+    <PageHeader
+      eyebrow="Sources"
+      title="Connected channels"
+      subtitle="Manage your tracked channels, pause processing, or remove channels you no longer need."
+    >
+      <template #actions>
         <button
           type="button"
           :disabled="atChannelLimit"
@@ -129,8 +126,8 @@ onMounted(async () => {
           </RouterLink>
           to add more.
         </p>
-      </div>
-    </div>
+      </template>
+    </PageHeader>
 
     <!-- Loading skeleton -->
     <div v-if="channels.loading && channels.channels.length === 0" class="space-y-3">

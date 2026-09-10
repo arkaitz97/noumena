@@ -1,7 +1,8 @@
 // PlanComparison.spec.ts — disabled current plan + update:interval emit.
 import { describe, it, expect } from 'vitest'
 import { mount } from '@vue/test-utils'
-import PlanComparison, { type PlanOption } from '../PlanComparison.vue'
+import PlanComparison from '../PlanComparison.vue'
+import type { PlanOption } from '../../lib/plans'
 
 const plans: PlanOption[] = [
   { id: 'free', name: 'Free', monthlyUsd: 0, annualUsd: 0, features: ['Free tier'] },

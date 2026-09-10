@@ -1,16 +1,8 @@
 <script setup lang="ts">
 import { Check } from 'lucide-vue-next'
 import type { BillingInterval, Plan } from '../services/types'
+import type { PlanOption } from '../lib/plans'
 import SegmentedControl from './SegmentedControl.vue'
-
-export interface PlanOption {
-  id: Plan | string
-  name: string
-  monthlyUsd: number
-  annualUsd: number
-  features: string[]
-  highlight?: boolean
-}
 
 const props = defineProps<{
   plans: PlanOption[]

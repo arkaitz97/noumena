@@ -15,6 +15,7 @@ import UsageBar from '../../components/UsageBar.vue'
 import { shortDate } from '../../lib/relativeTime'
 import { PLANS } from '../../lib/plans'
 import Card from '../../components/Card.vue'
+import PageHeader from '../../components/PageHeader.vue'
 
 const billing = useBillingStore()
 
@@ -101,11 +102,11 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="max-w-5xl mx-auto py-8 px-4 sm:px-6 lg:px-8 space-y-8">
-    <div>
-      <p class="eyebrow mb-2">Plan</p>
-      <h1 class="text-display-sm font-bold text-zinc-900 dark:text-white">Billing & subscription</h1>
-      <p class="mt-2 text-sm text-zinc-500 dark:text-zinc-400">Manage your plan, payment method, and invoices.</p>
-    </div>
+    <PageHeader
+      eyebrow="Plan"
+      title="Billing & subscription"
+      subtitle="Manage your plan, payment method, and invoices."
+    />
 
     <!-- Loading skeleton -->
     <div v-if="billing.loading && !billing.status" class="space-y-3">

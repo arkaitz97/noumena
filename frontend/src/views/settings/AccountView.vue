@@ -21,6 +21,7 @@ import ConfirmModal from '../../components/ConfirmModal.vue'
 import TextInput from '../../components/forms/TextInput.vue'
 import PasswordInput from '../../components/forms/PasswordInput.vue'
 import PrimaryButton from '../../components/forms/PrimaryButton.vue'
+import PageHeader from '../../components/PageHeader.vue'
 
 const auth = useAuthStore()
 const account = useAccountStore()
@@ -355,11 +356,11 @@ function downloadRecent(j: ExportJob): void {
 
 <template>
   <div class="max-w-5xl mx-auto py-8 px-4 sm:px-6 lg:px-8 space-y-8">
-    <div>
-      <p class="eyebrow mb-2">Profile</p>
-      <h1 class="text-display-sm font-bold text-zinc-900 dark:text-white">Account</h1>
-      <p class="mt-2 text-sm text-zinc-500 dark:text-zinc-400">Manage your profile, preferences, and account lifecycle.</p>
-    </div>
+    <PageHeader
+      eyebrow="Profile"
+      title="Account"
+      subtitle="Manage your profile, preferences, and account lifecycle."
+    />
 
     <!-- Profile / email -->
     <section class="@container bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-6 sm:p-8">

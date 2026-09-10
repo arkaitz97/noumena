@@ -30,6 +30,7 @@ import SentimentChart from '../../components/SentimentChart.vue'
 import ToxicityShield from '../../components/ToxicityShield.vue'
 import WeeklyDigestCard from '../../components/WeeklyDigestCard.vue'
 import KeyboardHelpModal from '../../components/KeyboardHelpModal.vue'
+import PageHeader from '../../components/PageHeader.vue'
 
 const feed = useFeedStore()
 const insights = useInsightsStore()
@@ -257,25 +258,23 @@ usePolling(async () => {
 
 <template>
   <div class="max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8">
-    <div class="md:flex md:items-end md:justify-between mb-8">
-      <div class="flex-1 min-w-0">
-        <p class="eyebrow rise mb-2">Signals</p>
-        <h1 class="rise d2 text-display-sm font-bold text-zinc-900 dark:text-white">
-          Insights feed
-        </h1>
-        <p class="rise d3 mt-2 text-sm text-zinc-500 dark:text-zinc-400">
-          Real-time signals across your channels.
-        </p>
-      </div>
-      <button
-        type="button"
-        @click="helpVisible = true"
-        class="rise d3 mt-4 md:mt-0 inline-flex items-center gap-2 text-xs font-semibold text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white px-3 py-2 rounded-lg hover:bg-zinc-100/80 dark:hover:bg-white/5 transition-all duration-200 active:scale-95"
-      >
-        <kbd class="inline-flex items-center justify-center min-w-[1.4rem] h-5 px-1 py-0.5 text-[10px] font-mono font-semibold bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-white/10 rounded-md shadow-card dark:shadow-none">?</kbd>
-        Keyboard shortcuts
-      </button>
-    </div>
+    <PageHeader
+      class="mb-8"
+      eyebrow="Signals"
+      title="Insights feed"
+      subtitle="Real-time signals across your channels."
+    >
+      <template #actions>
+        <button
+          type="button"
+          @click="helpVisible = true"
+          class="inline-flex items-center gap-2 text-xs font-semibold text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white px-3 py-2 rounded-lg hover:bg-zinc-100/80 dark:hover:bg-white/5 transition-all duration-200 active:scale-95"
+        >
+          <kbd class="inline-flex items-center justify-center min-w-[1.4rem] h-5 px-1 py-0.5 text-[10px] font-mono font-semibold bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-white/10 rounded-md shadow-card dark:shadow-none">?</kbd>
+          Keyboard shortcuts
+        </button>
+      </template>
+    </PageHeader>
 
     <div class="mb-8">
       <FilterBar
@@ -293,7 +292,7 @@ usePolling(async () => {
 
     <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
       <aside class="order-1 lg:order-2 lg:col-span-1 space-y-4">
-        <Card class="rise d3 flex items-center gap-4">
+        <Card class="flex items-center gap-4">
           <ToxicityShield :data="insights.toxicity" :window-key="toxicityWindow" compact />
           <div>
             <p class="eyebrow">Toxicity shield</p>

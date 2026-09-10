@@ -23,6 +23,7 @@ import {
   type WorkspaceMember,
   type WorkspaceSummary,
 } from '../../services/workspaces'
+import PageHeader from '../../components/PageHeader.vue'
 
 const auth = useAuthStore()
 const { isAdmin } = useWorkspaceRole()
@@ -144,14 +145,12 @@ async function onRemove(m: WorkspaceMember): Promise<void> {
 
 <template>
   <div class="max-w-5xl mx-auto py-8 px-4 sm:px-6 lg:px-8 space-y-8">
-    <div>
-      <p class="eyebrow mb-2">Team</p>
-      <h1 class="text-display-sm font-bold text-zinc-900 dark:text-white">Members</h1>
-      <p class="mt-2 text-sm text-zinc-500 dark:text-zinc-400">
+    <PageHeader eyebrow="Team" title="Members">
+      <template #subtitle>
         Manage who can access
         <strong class="font-medium text-zinc-700 dark:text-zinc-300">{{ activeWorkspace?.name ?? 'this workspace' }}</strong>.
-      </p>
-    </div>
+      </template>
+    </PageHeader>
 
     <div v-if="!isAdmin" class="bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-8 text-center">
       <Users class="mx-auto h-10 w-10 text-zinc-300 mb-3" />

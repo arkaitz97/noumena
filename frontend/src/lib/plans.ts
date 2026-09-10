@@ -3,7 +3,7 @@
 // this drives the Billing picker and marketing copy so names never drift
 // between Billing, Landing, and FAQ.
 
-import type { BillingInterval, Plan } from '../services/types'
+import type { Plan } from '../services/types'
 
 export interface PlanOption {
   id: Plan | string
@@ -45,15 +45,3 @@ export const PLANS: PlanOption[] = [
     features: ['Unlimited channels', '1M comments / mo', 'Team seats', 'Dedicated CSM'],
   },
 ]
-
-export function planName(plan: Plan | string | null | undefined): string {
-  if (!plan) return 'Free'
-  const found = PLANS.find((p) => p.id === plan)
-  return found?.name ?? plan
-}
-
-export function planPrice(plan: Plan | string | null | undefined, interval: BillingInterval): number | null {
-  const found = PLANS.find((p) => p.id === plan)
-  if (!found || found.monthlyUsd === 0) return null
-  return interval === 'annual' ? Math.round(found.annualUsd / 12) : found.monthlyUsd
-}

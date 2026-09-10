@@ -12,6 +12,7 @@ import { CATEGORIES, type Category } from '../../lib/categories'
 import type { FeedFilters } from '../../services/types'
 import CommentCard from '../../components/CommentCard.vue'
 import FilterBar from '../../components/FilterBar.vue'
+import PageHeader from '../../components/PageHeader.vue'
 
 const feed = useFeedStore()
 const channels = useChannelsStore()
@@ -102,15 +103,12 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="max-w-5xl mx-auto py-8 px-4 sm:px-6 lg:px-8">
-    <div class="mb-7">
-      <p class="eyebrow rise mb-2">Bookmarks</p>
-      <h1 class="rise d2 text-display-sm font-bold text-zinc-900 dark:text-white">
-        Saved comments
-      </h1>
-      <p class="rise d3 mt-2 text-sm text-zinc-500 dark:text-zinc-400">
-        The signals you've explicitly starred for follow-up.
-      </p>
-    </div>
+    <PageHeader
+      class="mb-7"
+      eyebrow="Bookmarks"
+      title="Saved comments"
+      subtitle="The signals you've explicitly starred for follow-up."
+    />
 
     <FilterBar
       :filters="feed.filters"
