@@ -680,14 +680,18 @@ func (p *Processor) persistBatch(ctx context.Context, batch []*db.Comment, resul
 
 	// Charge only what was persisted; partial batches bill exactly once.
 	if persisted > 0 {
-		if err := p.Q.IncrementCommentsUsed(ctx, primary.ID, persisted); err != nil {
+		// Use the true post-batch total for overage so concurrent batches for
+		// the same user (two channels, same owner) cannot bill from a stale
+		// snapshot; fall back explicitly when the concrete method is absent.
+		postUsed, err := p.incrementCommentsUsed(ctx, primary, persisted)
+		if err != nil {
 			return persisted, missing, fmt.Errorf("increment quota: %w", err)
 		}
 		// Overage logging (billing change, task 7.5). When this batch crosses
 		// the user's quota boundary AND their plan tracks overage (creator,
 		// studio), insert a comment_usage_logs row with the delta beyond the
 		// quota.
-		p.logOverage(ctx, primary, persisted)
+		p.logOverage(ctx, primary, persisted, postUsed)
 	}
 
 	if len(missing) > 0 {
@@ -715,22 +719,41 @@ func sortedInts(set map[int]struct{}) []int {
 }
 
 // logOverage records usage beyond quota when the plan tracks overage.
-// Non-fatal: usage was already incremented; we log and continue so the job
-// can complete.
-func (p *Processor) logOverage(ctx context.Context, primary *db.User, batchLen int) {
+// postUsed is the DB-authoritative post-batch total (see
+// incrementCommentsUsed). Non-fatal: usage was already incremented; we log
+// and continue so the job can complete.
+func (p *Processor) logOverage(ctx context.Context, primary *db.User, batchLen, postUsed int) {
 	if !billing.TracksOverage(primary.SubscriptionPlan) || primary.CommentQuotaMonthly <= 0 {
 		return
 	}
-	preUsed := primary.CommentsUsedThisPeriod
-	postUsed := preUsed + batchLen
+	preUsed := postUsed - batchLen
 	delta := postUsed - max(primary.CommentQuotaMonthly, preUsed)
 	if delta > 0 {
 		p.recordOverageDelta(ctx, primary, delta, preUsed, postUsed)
 	}
 }
 
+// incrementCommentsUsed adds n to the user's current-period usage and returns
+// the true post-batch total. The DBQuery interface does not declare an
+// increment-and-return method, so we type-assert the concrete SQLiteQuery
+// (mirroring updateCommentSentiment). Mocks/test fakes that only implement
+// DBQuery take the explicit fallback: increment, then derive the total from
+// the caller's snapshot. That fallback is best-effort and only used when the
+// atomic method is unavailable.
+func (p *Processor) incrementCommentsUsed(ctx context.Context, primary *db.User, n int) (int, error) {
+	if inc, ok := p.Q.(interface {
+		IncrementCommentsUsedReturning(context.Context, string, int) (int, error)
+	}); ok {
+		return inc.IncrementCommentsUsedReturning(ctx, primary.ID, n)
+	}
+	if err := p.Q.IncrementCommentsUsed(ctx, primary.ID, n); err != nil {
+		return 0, err
+	}
+	return primary.CommentsUsedThisPeriod + n, nil
+}
+
 func (p *Processor) recordOverageDelta(ctx context.Context, primary *db.User, delta, preUsed, postUsed int) {
-	periodStart, periodEnd := overagePeriod(primary.CurrentPeriodEnd)
+	periodStart, periodEnd := overagePeriod(primary, p.clock())
 	if err := p.Q.InsertCommentUsageLog(ctx, nil, primary.ID, delta, periodStart, periodEnd); err != nil {
 		log.Printf("event=overage_log_failed user=%s delta=%d err=%v", primary.ID, delta, err)
 		return
@@ -739,14 +762,24 @@ func (p *Processor) recordOverageDelta(ctx context.Context, primary *db.User, de
 		primary.ID, primary.SubscriptionPlan, preUsed, postUsed, primary.CommentQuotaMonthly, delta)
 }
 
-// overagePeriod bounds the usage log: prefer current_period_end if known,
-// otherwise approximate a month window ending now.
-func overagePeriod(currentPeriodEnd *time.Time) (time.Time, time.Time) {
-	periodEnd := time.Now().UTC().Add(31 * 24 * time.Hour)
-	if currentPeriodEnd != nil {
-		periodEnd = *currentPeriodEnd
+// overagePeriod bounds the usage log deterministically. It prefers the durable
+// current_period_end anchor, then quota_reset_at; when neither is known it
+// falls back to the current UTC calendar-month window derived from now, never
+// from now itself. Two batches in the same period therefore always produce the
+// same period_start/period_end, so ListOverageGroups cannot fragment a user's
+// overage into separate rounded-up tiny groups.
+func overagePeriod(primary *db.User, now time.Time) (time.Time, time.Time) {
+	if primary != nil && primary.CurrentPeriodEnd != nil {
+		periodEnd := primary.CurrentPeriodEnd.UTC()
+		return periodEnd.AddDate(0, -1, 0), periodEnd
 	}
-	return periodEnd.Add(-31 * 24 * time.Hour), periodEnd
+	if primary != nil && primary.QuotaResetAt != nil {
+		periodEnd := primary.QuotaResetAt.UTC()
+		return periodEnd.AddDate(0, -1, 0), periodEnd
+	}
+	y, m, _ := now.UTC().Date()
+	monthStart := time.Date(y, m, 1, 0, 0, 0, 0, time.UTC)
+	return monthStart.Add(-time.Nanosecond), monthStart.AddDate(0, 1, 0).Add(-time.Nanosecond)
 }
 
 // updateCommentSentiment persists the LLM sentiment score. The DBQuery

@@ -86,16 +86,16 @@ func (q *SQLiteQuery) ApplySubscriptionUpdate(ctx context.Context, tx *sql.Tx, u
 		add("subscription_status", *u.SubscriptionStatus)
 	}
 	if u.CurrentPeriodEnd != nil {
-		add("current_period_end", u.CurrentPeriodEnd.Format(time.RFC3339))
+		add("current_period_end", u.CurrentPeriodEnd.UTC().Format(time.RFC3339))
 	}
 	if u.QuotaResetAt != nil {
-		add("quota_reset_at", u.QuotaResetAt.Format(time.RFC3339))
+		add("quota_reset_at", u.QuotaResetAt.UTC().Format(time.RFC3339))
 	}
 	if u.PastDueSinceClear {
 		sets = append(sets, "past_due_since = NULL")
 	}
 	if !u.PastDueSinceClear && u.PastDueSince != nil {
-		add("past_due_since", u.PastDueSince.Format(time.RFC3339))
+		add("past_due_since", u.PastDueSince.UTC().Format(time.RFC3339))
 	}
 	if u.StripeSubscriptionIDClear {
 		sets = append(sets, "stripe_subscription_id = NULL")
@@ -144,7 +144,7 @@ func (q *SQLiteQuery) GetOverageCostForCurrentPeriod(ctx context.Context, userID
 	err := q.db.QueryRowContext(ctx,
 		`SELECT COALESCE(SUM(count), 0) FROM comment_usage_logs
 		 WHERE user_id = ? AND period_start >= ? AND period_start < ?`,
-		userID, periodStart.Format(time.RFC3339), periodEnd.Format(time.RFC3339)).Scan(&total)
+		userID, periodStart.UTC().Format(time.RFC3339), periodEnd.UTC().Format(time.RFC3339)).Scan(&total)
 	if err != nil {
 		return 0, err
 	}
@@ -159,10 +159,10 @@ func (q *SQLiteQuery) InsertCommentUsageLog(ctx context.Context, tx *sql.Tx, use
 	sqlStr := `INSERT INTO comment_usage_logs (id, user_id, count, period_start, period_end)
 	        VALUES (?, ?, ?, ?, ?)`
 	if tx != nil {
-		_, err := tx.ExecContext(ctx, sqlStr, generateUUID(), userID, count, periodStart.Format(time.RFC3339), periodEnd.Format(time.RFC3339))
+		_, err := tx.ExecContext(ctx, sqlStr, generateUUID(), userID, count, periodStart.UTC().Format(time.RFC3339), periodEnd.UTC().Format(time.RFC3339))
 		return err
 	}
-	_, err := q.db.ExecContext(ctx, sqlStr, generateUUID(), userID, count, periodStart.Format(time.RFC3339), periodEnd.Format(time.RFC3339))
+	_, err := q.db.ExecContext(ctx, sqlStr, generateUUID(), userID, count, periodStart.UTC().Format(time.RFC3339), periodEnd.UTC().Format(time.RFC3339))
 	return err
 }
 
@@ -188,6 +188,22 @@ func (q *SQLiteQuery) PauseChannelsAlphabetically(ctx context.Context, tx *sql.T
 	}
 	_, err := q.db.ExecContext(ctx, sqlStr, userID, keepCount)
 	return err
+}
+
+// IncrementCommentsUsedReturning atomically increments the user's
+// current-period comment usage and returns the post-increment total. It
+// exists so callers can bill overage from the true post-batch value even
+// when several batches for the same user run concurrently, rather than
+// from a snapshot read before the increment.
+func (q *SQLiteQuery) IncrementCommentsUsedReturning(ctx context.Context, userID string, n int) (int, error) {
+	var used int
+	err := q.db.QueryRowContext(ctx,
+		`UPDATE users
+		    SET comments_used_this_period = comments_used_this_period + ?
+		  WHERE id = ?
+		 RETURNING comments_used_this_period`,
+		n, userID).Scan(&used)
+	return used, err
 }
 
 func (q *SQLiteQuery) IncrementCommentsUsedTx(ctx context.Context, tx *sql.Tx, userID string, count int) (int, error) {
@@ -219,19 +235,11 @@ func (q *SQLiteQuery) ResetFreeTierQuotas(ctx context.Context) (int64, error) {
 }
 
 func (q *SQLiteQuery) ExpirePastDueGrace(ctx context.Context, graceHours int) (int64, error) {
-	cutoff := time.Now().UTC().Add(-time.Duration(graceHours) * time.Hour).Format(time.RFC3339)
-	result, err := q.db.ExecContext(ctx,
-		`UPDATE users
-		    SET subscription_status = 'paused',
-		        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-		  WHERE subscription_status = 'past_due'
-		    AND past_due_since IS NOT NULL
-		    AND past_due_since <= ?`,
-		cutoff)
+	users, err := q.ExpirePastDueGraceWithUsers(ctx, graceHours)
 	if err != nil {
 		return 0, err
 	}
-	return result.RowsAffected()
+	return int64(len(users)), nil
 }
 
 type ExpiredGraceUser struct {
@@ -242,11 +250,13 @@ type ExpiredGraceUser struct {
 func (q *SQLiteQuery) ExpirePastDueGraceWithUsers(ctx context.Context, graceHours int) ([]ExpiredGraceUser, error) {
 	cutoff := time.Now().UTC().Add(-time.Duration(graceHours) * time.Hour).Format(time.RFC3339)
 	rows, err := q.db.QueryContext(ctx,
-		`SELECT id, email
-		   FROM users
+		`UPDATE users
+		    SET subscription_status = 'paused',
+		        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
 		  WHERE subscription_status = 'past_due'
 		    AND past_due_since IS NOT NULL
-		    AND past_due_since <= ?`,
+		    AND past_due_since <= ?
+		 RETURNING id, email`,
 		cutoff)
 	if err != nil {
 		return nil, err
@@ -289,8 +299,8 @@ func (q *SQLiteQuery) UpsertBillingUsage(ctx context.Context, u BillingUsage) er
 		     period_end = excluded.period_end,
 		     comments_used = excluded.comments_used,
 		     quota = excluded.quota`,
-		generateUUID(), u.UserID, u.PeriodStart.Format(time.RFC3339),
-		u.PeriodEnd.Format(time.RFC3339), u.CommentsUsed, u.Quota)
+		generateUUID(), u.UserID, u.PeriodStart.UTC().Format(time.RFC3339),
+		u.PeriodEnd.UTC().Format(time.RFC3339), u.CommentsUsed, u.Quota)
 	return err
 }
 
@@ -456,7 +466,7 @@ func (q *SQLiteQuery) ListUsersForTrialExpiryReminder(ctx context.Context, lo, h
 		    AND trial_ends_at >  ?
 		    AND trial_ends_at <= ?
 		    AND deletion_requested_at IS NULL`,
-		lo.Format(time.RFC3339), hi.Format(time.RFC3339))
+		lo.UTC().Format(time.RFC3339), hi.UTC().Format(time.RFC3339))
 	if err != nil {
 		return nil, err
 	}

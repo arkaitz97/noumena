@@ -478,3 +478,65 @@ func TestCheckChannelLimitMissingUserPermitsConnect(t *testing.T) {
 		t.Error("guard must permissively allow when user lookup fails")
 	}
 }
+
+// pausedSubscriptionBlocksConnect pins the delinquency guard: once the
+// past-due grace expires the user is paused, and a paused user must not be
+// able to connect new channels (and thus trigger ingestion/LLM backfills)
+// even when under their plan's channel limit.
+func TestCheckChannelLimitFreePausedBlocked(t *testing.T) {
+	q := &guardMockQuery{
+		user:       &db.User{ID: "u", SubscriptionPlan: billing.PlanFree, SubscriptionStatus: "paused"},
+		channelCnt: 0,
+	}
+	blocked, err := checkChannelLimit(context.Background(), q, "u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !blocked {
+		t.Error("free user with paused subscription must be blocked at 0 channels")
+	}
+}
+
+func TestCheckChannelLimitCreatorPausedBlocked(t *testing.T) {
+	q := &guardMockQuery{
+		user:       &db.User{ID: "u", SubscriptionPlan: billing.PlanCreator, SubscriptionStatus: "paused"},
+		channelCnt: 0,
+	}
+	blocked, err := checkChannelLimit(context.Background(), q, "u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !blocked {
+		t.Error("creator with paused subscription must be blocked at 0 channels")
+	}
+}
+
+func TestCheckChannelLimitCreatorActiveBoundaryPreserved(t *testing.T) {
+	q := &guardMockQuery{
+		user:       &db.User{ID: "u", SubscriptionPlan: billing.PlanCreator, SubscriptionStatus: "active"},
+		channelCnt: 2,
+	}
+	if blocked, _ := checkChannelLimit(context.Background(), q, "u"); blocked {
+		t.Error("active creator under the limit must be allowed to connect")
+	}
+	q.channelCnt = 3
+	if blocked, _ := checkChannelLimit(context.Background(), q, "u"); !blocked {
+		t.Error("active creator at the limit must be blocked")
+	}
+}
+
+func TestCheckChannelLimitPausedOverridesUnlimited(t *testing.T) {
+	// Agency is the ChannelsUnlimited plan; paused must still take precedence
+	// so a delinquent user cannot connect unbounded channels.
+	q := &guardMockQuery{
+		user:       &db.User{ID: "u", SubscriptionPlan: billing.PlanAgency, SubscriptionStatus: "paused"},
+		channelCnt: 0,
+	}
+	blocked, err := checkChannelLimit(context.Background(), q, "u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !blocked {
+		t.Error("paused subscription must block connect even with an unlimited plan")
+	}
+}

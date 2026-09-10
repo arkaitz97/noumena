@@ -27,6 +27,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"noumena/internal/config"
@@ -44,15 +45,15 @@ var (
 )
 
 // digestRetrySchedule is the cumulative (from t0) wait list for the
-// retry-chained LLM attempts: attempt 1 immediate, attempt 2 at +5m,
-// attempt 3 at +20m. Total budget ≈ 25 minutes (well under the 2-hour
-// resilience target documented in design.md D5; the longer 50m alternative
-// from D5 is rejected here in favour of a tighter budget that fits inside
-// the same dispatch tick).
+// retry-chained LLM attempts: attempt 1 immediate, attempt 2 at +10s,
+// attempt 3 at +30s. The whole chain must fit inside dispatchDeadline
+// (60s, with an absolute ceiling of ~90s) so all three synchronous calls
+// actually fire when the provider fails fast. Longer outage windows are
+// covered by the async deferred-redispatch path, not this loop.
 var digestRetrySchedule = []time.Duration{
 	0,
-	5 * time.Minute,
-	15 * time.Minute, // delta from previous = 15m → cumulative 20m
+	10 * time.Second,
+	30 * time.Second, // deltas 10s/20s → cumulative 30s, inside the 60s tick
 }
 
 // digestSkipThreshold is the eligible-comment cutoff below which we skip
@@ -94,6 +95,11 @@ type Worker struct {
 	// TickInterval defaults to 1 minute. Tests may shrink it.
 	TickInterval time.Duration
 
+	// tickCh is an optional tick source. When non-nil the run loop consumes
+	// from it instead of a real time.Ticker, letting tests drive every tick
+	// explicitly and deterministically. Production leaves it nil.
+	tickCh <-chan time.Time
+
 	// dispatchedWeeks tracks (userID, weekStart) tuples already dispatched
 	// in the current process to suppress repeats inside the same trigger
 	// minute. The DB unique index is the durable enforcement mechanism;
@@ -106,6 +112,11 @@ type Worker struct {
 	// context handed to Start; wg waits for all in-flight goroutines.
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	// deferredBusy guards the off-loop deferred sweep so at most one runs
+	// at a time. Ticks arriving while a sweep is in flight are coalesced
+	// rather than piling up goroutines.
+	deferredBusy atomic.Bool
 }
 
 // Start spawns the worker's main loop. Returns immediately. Stop blocks
@@ -135,7 +146,9 @@ func (w *Worker) Start(parent context.Context) {
 	// first trigger after a restart sees a clean table.
 	w.recoverStalePending(ctx)
 	w.catchUpMissedWeeks(ctx)
-	w.redispatchDeferred(ctx)
+	// Deferred re-dispatch is deliberately off-loop too: a long sweep must
+	// never delay the first trigger evaluation after a restart either.
+	w.redispatchDeferredAsync(ctx)
 
 	w.wg.Add(1)
 	go func() {
@@ -160,26 +173,38 @@ func digestEnabled() bool {
 	return v == "true" || v == "1" || v == "yes"
 }
 
-// run is the minute-granularity ticker. shouldTrigger gates dispatch on the
-// Mon-08:00-UTC window; deferred re-dispatch runs every tick (due filter is cheap).
+// run is the minute-granularity ticker. Each tick evaluates the
+// Mon-08:00-UTC trigger first, then schedules the deferred re-dispatch
+// off-loop so retry work cannot starve the trigger window.
 func (w *Worker) run(ctx context.Context) {
-	t := time.NewTicker(w.TickInterval)
-	defer t.Stop()
+	var ticks <-chan time.Time
+	if w.tickCh != nil {
+		ticks = w.tickCh
+	} else {
+		t := time.NewTicker(w.TickInterval)
+		defer t.Stop()
+		ticks = t.C
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			w.Logger.Println("digest worker: stopping")
 			return
-		case <-t.C:
-			w.redispatchDeferred(ctx)
+		case <-ticks:
+			// Trigger evaluation MUST precede deferred retry work: a slow
+			// (or stalled) redispatch sweep would otherwise consume the
+			// once-per-week Mon-08:00 UTC window and the digest for the
+			// week would never be dispatched.
 			now := w.Now()
-			if !shouldTrigger(now) {
-				continue
+			if shouldTrigger(now) {
+				weekStart := computeWeekStart(now)
+				w.Logger.Printf("digest worker: trigger fired at %s, week_start=%s",
+					now.Format(time.RFC3339), weekStart.Format("2006-01-02"))
+				w.dispatch(ctx, weekStart)
 			}
-			weekStart := computeWeekStart(now)
-			w.Logger.Printf("digest worker: trigger fired at %s, week_start=%s",
-				now.Format(time.RFC3339), weekStart.Format("2006-01-02"))
-			w.dispatch(ctx, weekStart)
+			// Deferred re-dispatch runs off the run loop, tracked by
+			// w.wg/ctx, so it cannot starve the next trigger tick.
+			w.redispatchDeferredAsync(ctx)
 		}
 	}
 }
@@ -567,6 +592,23 @@ func (w *Worker) catchUpMissedWeeks(ctx context.Context) {
 		w.Logger.Printf("digest worker: catch-up week_start=%s", ws.Format("2006-01-02"))
 		w.dispatch(ctx, ws)
 	}
+}
+
+// redispatchDeferredAsync runs the deferred-retry sweep on its own goroutine
+// so it can never starve the once-per-week trigger evaluation. The sweep is
+// tracked by w.wg and honors ctx, so Stop waits for it and cancellation aborts
+// an in-flight retry chain. At most one sweep runs at a time; ticks that land
+// while a sweep is in flight are coalesced (the next tick retries it).
+func (w *Worker) redispatchDeferredAsync(ctx context.Context) {
+	if !w.deferredBusy.CompareAndSwap(false, true) {
+		return
+	}
+	w.wg.Add(1)
+	go func() {
+		defer w.wg.Done()
+		defer w.deferredBusy.Store(false)
+		w.redispatchDeferred(ctx)
+	}()
 }
 
 // redispatchDeferred retries deferred rows due per backoff schedule.

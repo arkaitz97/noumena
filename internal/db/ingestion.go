@@ -198,14 +198,14 @@ func (q *SQLiteQuery) ResetIngestionError(ctx context.Context, platformChannelID
 func (q *SQLiteQuery) MarkChannelBackoff(ctx context.Context, platformChannelID string, until time.Time) error {
 	_, err := q.db.ExecContext(ctx,
 		`UPDATE platform_channels SET ingestion_backoff_until = ? WHERE id = ?`,
-		until.Format(time.RFC3339), platformChannelID)
+		until.UTC().Format(time.RFC3339), platformChannelID)
 	return err
 }
 
 func (q *SQLiteQuery) UpdateLastSyncedAt(ctx context.Context, platformChannelID string, t time.Time) error {
 	_, err := q.db.ExecContext(ctx,
 		`UPDATE platform_channels SET last_synced_at = ? WHERE id = ?`,
-		t.Format(time.RFC3339), platformChannelID)
+		t.UTC().Format(time.RFC3339), platformChannelID)
 	return err
 }
 
@@ -242,6 +242,11 @@ func scanIngestionJob(row *sql.Row) (*IngestionJob, error) {
 	return j, nil
 }
 
+// EnqueueIngestionJob inserts a pending job unless ANY job for the channel is
+// already pending or running, regardless of job_type. Deduping across types is
+// the SQLite substitute for AcquireChannelLock (a no-op under SQLite): without
+// it a backfill and a poll for the same channel could both be in flight,
+// double-spending YouTube quota and racing UpsertVideoSyncState.
 func (q *SQLiteQuery) EnqueueIngestionJob(ctx context.Context, platformChannelID, jobType string) (string, error) {
 	var id string
 	err := q.db.QueryRowContext(ctx,
@@ -250,11 +255,10 @@ func (q *SQLiteQuery) EnqueueIngestionJob(ctx context.Context, platformChannelID
 		  WHERE NOT EXISTS (
 		     SELECT 1 FROM ingestion_jobs
 		      WHERE platform_channel_id = ?
-		        AND job_type = ?
 		        AND status IN ('pending', 'running')
 		 )
 		 RETURNING id`,
-		generateUUID(), platformChannelID, jobType, platformChannelID, jobType).Scan(&id)
+		generateUUID(), platformChannelID, jobType, platformChannelID).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}

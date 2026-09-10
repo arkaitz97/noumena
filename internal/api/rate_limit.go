@@ -136,8 +136,11 @@ func extractRateLimitKey(r *http.Request, cfg *config.Config) string {
 // entry is the peer the proxy observed, and it must parse as a valid IP.
 // Client-supplied X-Forwarded-For / X-Real-IP are ignored entirely unless
 // explicitly configured. With no trusted header configured, RemoteAddr is
-// used. Returns "" when no trustworthy source can be resolved (the caller
-// treats that as "do not rate limit").
+// used. When the trusted header is present but its candidate is not a valid
+// IP, it is not trusted and RemoteAddr is used instead. When no trustworthy
+// source can be resolved to a valid IP, a stable synthetic key ("unknown")
+// is returned so the limiter still applies (fail closed) rather than
+// bypassing entirely.
 func trustedClientIP(r *http.Request, headerName string) string {
 	if headerName != "" {
 		if v := r.Header.Get(headerName); v != "" {
@@ -146,7 +149,6 @@ func trustedClientIP(r *http.Request, headerName string) string {
 			if net.ParseIP(candidate) != nil {
 				return candidate
 			}
-			return ""
 		}
 	}
 
@@ -155,7 +157,7 @@ func trustedClientIP(r *http.Request, headerName string) string {
 		host = r.RemoteAddr
 	}
 	if net.ParseIP(host) == nil {
-		return ""
+		return "unknown"
 	}
 	return host
 }

@@ -323,7 +323,7 @@ func (q *SQLiteQuery) IncrementFailedLoginAttempts(ctx context.Context, userID s
 func (q *SQLiteQuery) LockUser(ctx context.Context, userID string, until time.Time) error {
 	_, err := q.db.ExecContext(ctx,
 		`UPDATE users SET locked_until = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?`,
-		until.Format(time.RFC3339), userID)
+		until.UTC().Format(time.RFC3339), userID)
 	return err
 }
 
@@ -442,7 +442,7 @@ func (q *SQLiteQuery) DeleteStaleUnverifiedUsers(ctx context.Context, olderThan 
 func (q *SQLiteQuery) InsertEmailVerificationToken(ctx context.Context, userID, tokenHash string, expiresAt time.Time) error {
 	_, err := q.db.ExecContext(ctx,
 		`INSERT INTO email_verification_tokens (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)`,
-		generateUUID(), userID, tokenHash, expiresAt.Format(time.RFC3339))
+		generateUUID(), userID, tokenHash, expiresAt.UTC().Format(time.RFC3339))
 	return err
 }
 
@@ -473,7 +473,19 @@ func (q *SQLiteQuery) CountVerificationResendsInWindow(ctx context.Context, user
 	var n int
 	err := q.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM email_verification_tokens
-		 WHERE user_id = ? AND created_at >= ?`, userID, since.Format(time.RFC3339)).Scan(&n)
+		 WHERE user_id = ? AND created_at >= ?`, userID, since.UTC().Format(time.RFC3339)).Scan(&n)
+	return n, err
+}
+
+// CountEmailChangeResendsInWindow counts the verification emails sent to the
+// pending (new) address for an in-flight email change. The ResendVerification
+// email-change branch writes email_change_tokens, so it must consult this
+// counter rather than CountVerificationResendsInWindow.
+func (q *SQLiteQuery) CountEmailChangeResendsInWindow(ctx context.Context, userID string, since time.Time) (int, error) {
+	var n int
+	err := q.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM email_change_tokens
+		 WHERE user_id = ? AND created_at >= ?`, userID, since.UTC().Format(time.RFC3339)).Scan(&n)
 	return n, err
 }
 
@@ -482,7 +494,7 @@ func (q *SQLiteQuery) CountVerificationResendsInWindow(ctx context.Context, user
 func (q *SQLiteQuery) InsertEmailChangeToken(ctx context.Context, userID, pendingEmail, tokenHash string, expiresAt time.Time) error {
 	_, err := q.db.ExecContext(ctx,
 		`INSERT INTO email_change_tokens (id, user_id, pending_email, token_hash, expires_at) VALUES (?, ?, ?, ?, ?)`,
-		generateUUID(), userID, pendingEmail, tokenHash, expiresAt.Format(time.RFC3339))
+		generateUUID(), userID, pendingEmail, tokenHash, expiresAt.UTC().Format(time.RFC3339))
 	return err
 }
 
@@ -546,7 +558,7 @@ func (q *SQLiteQuery) ApplyEmailChange(ctx context.Context, userID, newEmail str
 func (q *SQLiteQuery) InsertPasswordResetToken(ctx context.Context, userID, tokenHash string, expiresAt time.Time) error {
 	_, err := q.db.ExecContext(ctx,
 		`INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)`,
-		generateUUID(), userID, tokenHash, expiresAt.Format(time.RFC3339))
+		generateUUID(), userID, tokenHash, expiresAt.UTC().Format(time.RFC3339))
 	return err
 }
 
@@ -574,19 +586,22 @@ func (q *SQLiteQuery) InvalidatePasswordResetTokensForUser(ctx context.Context, 
 }
 
 func (q *SQLiteQuery) CountForgotPasswordEmailsInWindow(ctx context.Context, email string, since time.Time) (int, error) {
+	// Count actual send attempts for this address, not issued tokens: the
+	// Google-only branch (no token) writes an email_send_log row but no
+	// password_reset_tokens row, so token-counting let it bypass the cap.
+	// The template literal must match email.TemplatePasswordReset.
 	var n int
 	err := q.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM password_reset_tokens t
-		 JOIN users u ON u.id = t.user_id
-		 WHERE u.email = ? AND t.created_at >= ?`,
-		email, since.Format(time.RFC3339)).Scan(&n)
+		`SELECT COUNT(*) FROM email_send_log
+		 WHERE to_address = ? AND template = 'password_reset' AND created_at >= ?`,
+		email, since.UTC().Format(time.RFC3339)).Scan(&n)
 	return n, err
 }
 
 func (q *SQLiteQuery) InsertRefreshToken(ctx context.Context, userID, tokenHash string, expiresAt time.Time) error {
 	_, err := q.db.ExecContext(ctx,
 		`INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)`,
-		generateUUID(), userID, tokenHash, expiresAt.Format(time.RFC3339))
+		generateUUID(), userID, tokenHash, expiresAt.UTC().Format(time.RFC3339))
 	return err
 }
 

@@ -412,11 +412,17 @@ func (h *AccountHandler) emailTakenByOther(ctx context.Context, email, userID st
 }
 
 // revokeSessionsAndUnverify bumps token_version (all sessions, including
-// this one, are revoked) and clears email_verified_at: the account is
-// unverified until the new address confirms, and the user re-authenticates
-// with the old email (consistent with password reset).
+// this one, are revoked), deletes every refresh-token row so a stolen cookie
+// cannot be rotated into a fresh access token carrying the new version, and
+// clears email_verified_at: the account is unverified until the new address
+// confirms, and the user re-authenticates with the old email (consistent
+// with password reset).
 func (h *AccountHandler) revokeSessionsAndUnverify(w http.ResponseWriter, r *http.Request, userID string) bool {
 	if err := h.Queries.IncrementTokenVersion(r.Context(), userID); err != nil {
+		http.Error(w, "failed to invalidate sessions", http.StatusInternalServerError)
+		return false
+	}
+	if err := h.Queries.DeleteAllRefreshTokensForUser(r.Context(), userID); err != nil {
 		http.Error(w, "failed to invalidate sessions", http.StatusInternalServerError)
 		return false
 	}

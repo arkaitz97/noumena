@@ -26,7 +26,16 @@ import (
 // SignURL returns "?sig=<hex>&exp=<unix>" for the given (userID, jobID, exp).
 // The caller is responsible for prefixing the path; this helper only
 // produces the query-string suffix so it can be appended to any base.
+//
+// secret MUST be non-empty: SignURL cannot report an error, so an empty
+// secret would otherwise mint a signature under a publicly-known key.
+// As defence-in-depth it fails closed by returning "" (no signature),
+// which VerifyURL will reject, and VerifyURL independently rejects an
+// empty secret before doing any HMAC work.
 func SignURL(secret, userID, jobID string, exp time.Time) string {
+	if secret == "" {
+		return ""
+	}
 	expUnix := exp.UTC().Unix()
 	mac := hmac.New(sha256.New, []byte(secret))
 	fmt.Fprintf(mac, "%s:%s:%d", userID, jobID, expUnix)
@@ -38,6 +47,9 @@ func SignURL(secret, userID, jobID string, exp time.Time) string {
 // terse — callers should not surface the distinction to end users (any
 // failure is a 403 to avoid leaking which leg of the check failed).
 func VerifyURL(secret, userID, jobID string, expUnix int64, sigHex string) error {
+	if secret == "" {
+		return errors.New("invalid secret")
+	}
 	if expUnix <= 0 {
 		return errors.New("invalid exp")
 	}

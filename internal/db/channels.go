@@ -57,7 +57,7 @@ func (q *SQLiteQuery) ConnectChannelTx(ctx context.Context, userID, platform, pl
 
 	var expiresAtStr string
 	if tokenExpiresAt != nil {
-		expiresAtStr = tokenExpiresAt.Format(time.RFC3339)
+		expiresAtStr = tokenExpiresAt.UTC().Format(time.RFC3339)
 	}
 	var activeWorkspaceID sql.NullString
 	_ = tx.QueryRowContext(ctx, `SELECT active_workspace_id FROM users WHERE id = ?`, userID).Scan(&activeWorkspaceID)

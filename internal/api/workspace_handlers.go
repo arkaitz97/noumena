@@ -22,6 +22,19 @@ type WorkspaceHandler struct {
 	Cfg     *config.Config
 }
 
+// channelAccessChecker is the concrete store's channel-tracking probe.
+// UserTracksChannel lives on db.InsightsQuery rather than the broad DBQuery
+// surface, so the handler asserts it locally and fails closed when absent.
+type channelAccessChecker interface {
+	UserTracksChannel(ctx context.Context, userID, channelID string) (bool, error)
+}
+
+// seatAdmitter is the concrete store's atomic, seat-guarded admission. It is
+// deliberately not part of db.DBQuery so the broad mock surface is unchanged.
+type seatAdmitter interface {
+	AddWorkspaceMemberAtomic(ctx context.Context, workspaceID, userID, role string, limit int) error
+}
+
 func (h *WorkspaceHandler) CreateDefaultWorkspace(userID string) error {
 	w, err := h.Queries.CreateWorkspace(context.Background(), "My Workspace", userID)
 	if err != nil {
@@ -373,16 +386,28 @@ func (h *WorkspaceHandler) AcceptInvite(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if err := h.checkSeatCapacity(r.Context(), invite.WorkspaceID); err != nil {
-		if errors.Is(err, errSeatLimit) {
-			writeError(w, http.StatusConflict, "seat limit reached, upgrade your plan")
-			return
-		}
+	if err := h.checkSeatCapacity(r.Context(), invite.WorkspaceID); err != nil && !errors.Is(err, errSeatLimit) {
 		writeError(w, http.StatusInternalServerError, "failed to check seat capacity")
 		return
 	}
 
-	if err := h.Queries.AddWorkspaceMember(r.Context(), invite.WorkspaceID, userID, invite.Role); err != nil {
+	seats, err := h.seatUsageFor(r.Context(), invite.WorkspaceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load seat usage")
+		return
+	}
+
+	admitter, ok := h.Queries.(seatAdmitter)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "failed to join workspace")
+		return
+	}
+	if err := admitter.AddWorkspaceMemberAtomic(r.Context(), invite.WorkspaceID, userID, invite.Role, seats.Limit); err != nil {
+		if errors.Is(err, db.ErrSeatLimit) {
+			writeError(w, http.StatusConflict, "seat limit reached, upgrade your plan")
+			return
+		}
+		log.Printf("workspace: atomic member admission failed: %v", err)
 		writeError(w, http.StatusInternalServerError, "failed to join workspace")
 		return
 	}
@@ -427,6 +452,16 @@ func (h *WorkspaceHandler) RemoveMember(w http.ResponseWriter, r *http.Request) 
 	targetMember, err := h.Queries.GetWorkspaceMember(r.Context(), workspaceID, targetUserID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "member not found")
+		return
+	}
+
+	isOwner, err := h.Queries.IsWorkspaceOwner(r.Context(), workspaceID, targetUserID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to check workspace owner")
+		return
+	}
+	if isOwner {
+		writeError(w, http.StatusBadRequest, "cannot remove the workspace owner")
 		return
 	}
 
@@ -477,13 +512,33 @@ func (h *WorkspaceHandler) ChangeMemberRole(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	if err := h.checkSeatCapacity(r.Context(), workspaceID); err != nil {
-		if errors.Is(err, errSeatLimit) {
-			writeError(w, http.StatusConflict, "seat limit reached, upgrade your plan")
+	targetMember, err := h.Queries.GetWorkspaceMember(r.Context(), workspaceID, targetUserID)
+	if err != nil {
+		writeWorkspaceError(w, err, http.StatusNotFound, "member not found", "failed to get workspace member")
+		return
+	}
+
+	if req.Role != "admin" {
+		isOwner, err := h.Queries.IsWorkspaceOwner(r.Context(), workspaceID, targetUserID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to check workspace owner")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "failed to check seat capacity")
-		return
+		if isOwner {
+			writeError(w, http.StatusBadRequest, "cannot change the workspace owner's role")
+			return
+		}
+		if targetMember.Role == "admin" {
+			adminCount, err := h.Queries.CountWorkspaceAdmins(r.Context(), workspaceID)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to check admin count")
+				return
+			}
+			if adminCount <= 1 {
+				writeError(w, http.StatusBadRequest, "cannot demote the last admin")
+				return
+			}
+		}
 	}
 
 	if err := h.Queries.UpdateWorkspaceMemberRole(r.Context(), workspaceID, targetUserID, req.Role); err != nil {
@@ -514,6 +569,21 @@ func (h *WorkspaceHandler) GrantChannel(w http.ResponseWriter, r *http.Request) 
 	}
 	if member.Role == "viewer" {
 		writeError(w, http.StatusForbidden, "analyst role required")
+		return
+	}
+
+	checker, ok := h.Queries.(channelAccessChecker)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "failed to verify channel access")
+		return
+	}
+	tracked, err := checker.UserTracksChannel(r.Context(), userID, channelID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to verify channel access")
+		return
+	}
+	if !tracked {
+		writeError(w, http.StatusForbidden, "channel is not tracked by you")
 		return
 	}
 

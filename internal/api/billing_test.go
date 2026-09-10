@@ -869,6 +869,128 @@ func TestStripeWebhookSubscriptionUpdatedUpgradeAppliesStudioLimits(t *testing.T
 	}
 }
 
+// ============================================================================
+// Stripe status narrowing must never treat an unmapped status as active.
+// ============================================================================
+
+// TestMapStripeStatus pins the Stripe→local status mapping. `incomplete`
+// (payment not completed / SCA pending) and any unknown/empty value must map
+// to a non-active state so no paid entitlement is granted before a charge
+// succeeds. The mapping is exercised through the real webhook handler because
+// mapStripeStatus is unexported.
+func TestMapStripeStatus(t *testing.T) {
+	cases := []struct {
+		name   string
+		stripe stripe.SubscriptionStatus
+		want   string
+	}{
+		{"active", stripe.SubscriptionStatusActive, "active"},
+		{"trialing", stripe.SubscriptionStatusTrialing, "active"},
+		{"past_due", stripe.SubscriptionStatusPastDue, "past_due"},
+		{"unpaid", stripe.SubscriptionStatusUnpaid, "past_due"},
+		{"canceled", stripe.SubscriptionStatusCanceled, "canceled"},
+		{"incomplete_expired", stripe.SubscriptionStatusIncompleteExpired, "canceled"},
+		{"paused", stripe.SubscriptionStatusPaused, "paused"},
+		{"incomplete", stripe.SubscriptionStatusIncomplete, "past_due"},
+		{"unknown", stripe.SubscriptionStatus("some_future_status"), "past_due"},
+		{"empty", stripe.SubscriptionStatus(""), "past_due"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			queries := &MockQuery{}
+			uid := "user-map-" + tc.name
+			u := seedTestUser(queries, uid, billing.PlanFree)
+
+			mc := billing.NewMockClient()
+			mc.Prices = billing.PriceMap{CreatorMonthly: "price_cm"}
+			mc.Subscriptions = map[string]*stripe.Subscription{
+				"sub_map": {
+					ID:     "sub_map",
+					Status: tc.stripe,
+					Items: &stripe.SubscriptionItemList{
+						Data: []*stripe.SubscriptionItem{{Price: &stripe.Price{ID: "price_cm"}}},
+					},
+				},
+			}
+			mc.NextEvent = &stripe.Event{
+				ID:   "evt_map_" + tc.name,
+				Type: "customer.subscription.updated",
+				Data: &stripe.EventData{Raw: []byte(`{"id":"sub_map","metadata":{"user_id":"` + uid + `"}}`)},
+			}
+
+			r := setupBillingRouter(queries, mc)
+			req, _ := http.NewRequest("POST", "/webhooks/stripe", bytes.NewBufferString(`{}`))
+			req.Header.Set("Stripe-Signature", "ok")
+			rr := httptest.NewRecorder()
+			r.ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("want 200 got %d body=%s", rr.Code, rr.Body.String())
+			}
+			if u.SubscriptionStatus != tc.want {
+				t.Errorf("status: want %q got %q", tc.want, u.SubscriptionStatus)
+			}
+			if tc.want != "active" && u.SubscriptionStatus == "active" {
+				t.Errorf("stripe status %q must not be treated as active", string(tc.stripe))
+			}
+		})
+	}
+}
+
+// TestStripeWebhookSubscriptionIncompleteDoesNotUpgrade proves the billing
+// bug: customer.subscription.created with status=incomplete must not upgrade
+// the plan or grant the paid comment quota before a charge succeeds.
+func TestStripeWebhookSubscriptionIncompleteDoesNotUpgrade(t *testing.T) {
+	queries := &MockQuery{}
+	cust := "cus_incomplete"
+	u := seedTestUser(queries, "user-incomplete", billing.PlanFree)
+	u.StripeCustomerID = &cust
+	queries.usersByStripeCustomer = map[string]*db.User{cust: u}
+
+	freeQuota := billing.LimitsFor(billing.PlanFree).CommentQuotaMonthly
+	periodEnd := time.Now().Add(30 * 24 * time.Hour).Unix()
+	mc := billing.NewMockClient()
+	mc.Prices = billing.PriceMap{CreatorMonthly: "price_cm"}
+	mc.Subscriptions = map[string]*stripe.Subscription{
+		"sub_incomplete": {
+			ID:               "sub_incomplete",
+			Status:           stripe.SubscriptionStatusIncomplete,
+			CurrentPeriodEnd: periodEnd,
+			Items: &stripe.SubscriptionItemList{
+				Data: []*stripe.SubscriptionItem{{Price: &stripe.Price{ID: "price_cm"}}},
+			},
+		},
+	}
+	mc.NextEvent = &stripe.Event{
+		ID:   "evt_incomplete",
+		Type: "customer.subscription.created",
+		Data: &stripe.EventData{Raw: []byte(`{"id":"sub_incomplete","customer":"cus_incomplete","status":"incomplete"}`)},
+	}
+
+	r := setupBillingRouter(queries, mc)
+	req, _ := http.NewRequest("POST", "/webhooks/stripe", bytes.NewBufferString(`{}`))
+	req.Header.Set("Stripe-Signature", "ok")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200 got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if u.SubscriptionStatus != "past_due" {
+		t.Errorf("status: want past_due got %s", u.SubscriptionStatus)
+	}
+	if u.SubscriptionPlan != billing.PlanFree {
+		t.Errorf("plan must not upgrade on incomplete: want %s got %s", billing.PlanFree, u.SubscriptionPlan)
+	}
+	if u.CommentQuotaMonthly != freeQuota {
+		t.Errorf("comment quota must be unchanged on incomplete: want %d got %d", freeQuota, u.CommentQuotaMonthly)
+	}
+	if len(queries.pauseAlphaCalls) != 0 {
+		t.Errorf("incomplete must not enforce an active plan: pause-alpha calls=%d", len(queries.pauseAlphaCalls))
+	}
+}
+
 // TestPlanDowngradeTemplateExists verifies the plan_downgrade template is
 // registered and renders with the expected variables.
 func TestPlanDowngradeTemplateExists(t *testing.T) {

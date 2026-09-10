@@ -876,6 +876,173 @@ func TestRateLimit_UnauthenticatedUsesUnauthLimit(t *testing.T) {
 	}
 }
 
+// TestRateLimit_MalformedTrustedHeaderNotBypassed — regression for the
+// fail-open bug: a trusted header present with a non-IP value must NOT
+// disable the limiter. It falls back to RemoteAddr, so the bucket is keyed
+// by the real peer and the limit still trips.
+func TestRateLimit_MalformedTrustedHeaderNotBypassed(t *testing.T) {
+	cfg := &config.Config{
+		RateLimitEnabled:         true,
+		RateLimitAuthMaxPerMin:   100,
+		RateLimitUnauthMaxPerMin: 3,
+		TrustProxyHeader:         "X-Real-IP",
+	}
+	q := &rlMockQuery{}
+	mw := api.AuthRateLimitMiddleware(q, cfg)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	for i := 1; i <= 3; i++ {
+		req := httptest.NewRequest("GET", "/auth/login", nil)
+		req.RemoteAddr = "203.0.113.7:41234"
+		req.Header.Set("X-Real-IP", "not-an-ip")
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("request %d: expected 200, got %d", i, rr.Code)
+		}
+	}
+
+	expHash := sha256.Sum256([]byte("203.0.113.7"))
+	if q.lastKey != "ip:"+hex.EncodeToString(expHash[:]) {
+		t.Fatalf("malformed header must fall back to RemoteAddr key, got %q", q.lastKey)
+	}
+
+	req := httptest.NewRequest("GET", "/auth/login", nil)
+	req.RemoteAddr = "203.0.113.7:9999"
+	req.Header.Set("X-Real-IP", "not-an-ip")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusTooManyRequests {
+		t.Errorf("malformed trusted header bypassed the limiter: got %d, want 429", rr.Code)
+	}
+}
+
+// TestRateLimit_TrustedHeaderValidStillKeyed — a parseable trusted header
+// continues to be the bucket key and is limiter-enforced.
+func TestRateLimit_TrustedHeaderValidStillKeyed(t *testing.T) {
+	cfg := &config.Config{
+		RateLimitEnabled:         true,
+		RateLimitAuthMaxPerMin:   100,
+		RateLimitUnauthMaxPerMin: 2,
+		TrustProxyHeader:         "X-Real-IP",
+	}
+	q := &rlMockQuery{}
+	mw := api.AuthRateLimitMiddleware(q, cfg)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	expHash := sha256.Sum256([]byte("198.51.100.9"))
+	wantKey := "ip:" + hex.EncodeToString(expHash[:])
+
+	for i := 1; i <= 2; i++ {
+		req := httptest.NewRequest("GET", "/auth/login", nil)
+		req.RemoteAddr = "10.0.0.1:41234"
+		req.Header.Set("X-Real-IP", "198.51.100.9")
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("request %d: expected 200, got %d", i, rr.Code)
+		}
+		if q.lastKey != wantKey {
+			t.Fatalf("request %d: expected trusted-header key %q, got %q", i, wantKey, q.lastKey)
+		}
+	}
+
+	req := httptest.NewRequest("GET", "/auth/login", nil)
+	req.RemoteAddr = "10.0.0.1:41234"
+	req.Header.Set("X-Real-IP", "198.51.100.9")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusTooManyRequests {
+		t.Errorf("expected 429 keyed by trusted header, got %d", rr.Code)
+	}
+}
+
+// TestRateLimit_NoHeaderUsesRemoteAddrLimited — with no trusted header
+// configured, RemoteAddr is the key and the limiter applies.
+func TestRateLimit_NoHeaderUsesRemoteAddrLimited(t *testing.T) {
+	cfg := &config.Config{
+		RateLimitEnabled:         true,
+		RateLimitAuthMaxPerMin:   100,
+		RateLimitUnauthMaxPerMin: 2,
+	}
+	q := &rlMockQuery{}
+	mw := api.AuthRateLimitMiddleware(q, cfg)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	expHash := sha256.Sum256([]byte("192.0.2.55"))
+	wantKey := "ip:" + hex.EncodeToString(expHash[:])
+
+	for i := 1; i <= 2; i++ {
+		req := httptest.NewRequest("GET", "/auth/login", nil)
+		req.RemoteAddr = "192.0.2.55:4444"
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("request %d: expected 200, got %d", i, rr.Code)
+		}
+		if q.lastKey != wantKey {
+			t.Fatalf("request %d: expected RemoteAddr key %q, got %q", i, wantKey, q.lastKey)
+		}
+	}
+
+	req := httptest.NewRequest("GET", "/auth/login", nil)
+	req.RemoteAddr = "192.0.2.55:4444"
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusTooManyRequests {
+		t.Errorf("expected 429 keyed by RemoteAddr, got %d", rr.Code)
+	}
+}
+
+// TestRateLimit_UnparseableRemoteAddrFailClosed — when neither the trusted
+// header nor RemoteAddr yields a valid IP, requests must still be limited
+// under a stable synthetic shared bucket, never passed through.
+func TestRateLimit_UnparseableRemoteAddrFailClosed(t *testing.T) {
+	cfg := &config.Config{
+		RateLimitEnabled:         true,
+		RateLimitAuthMaxPerMin:   100,
+		RateLimitUnauthMaxPerMin: 2,
+		TrustProxyHeader:         "X-Real-IP",
+	}
+	q := &rlMockQuery{}
+	mw := api.AuthRateLimitMiddleware(q, cfg)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	expHash := sha256.Sum256([]byte("unknown"))
+	wantKey := "ip:" + hex.EncodeToString(expHash[:])
+
+	for i := 1; i <= 2; i++ {
+		req := httptest.NewRequest("GET", "/auth/login", nil)
+		req.RemoteAddr = "not-a-host"
+		req.Header.Set("X-Real-IP", "also-not-an-ip")
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("request %d: expected 200, got %d", i, rr.Code)
+		}
+		if q.lastKey != wantKey {
+			t.Fatalf("request %d: expected synthetic shared key %q, got %q", i, wantKey, q.lastKey)
+		}
+	}
+
+	req := httptest.NewRequest("GET", "/auth/login", nil)
+	req.RemoteAddr = "not-a-host"
+	req.Header.Set("X-Real-IP", "also-not-an-ip")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusTooManyRequests {
+		t.Errorf("unparseable RemoteAddr bypassed the limiter: got %d, want 429", rr.Code)
+	}
+}
+
 func TestRateLimitCleaner_StartStop(t *testing.T) {
 	q := &rlMockQuery{}
 	cleaner := &api.RateLimitCleaner{

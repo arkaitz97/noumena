@@ -782,11 +782,16 @@ func (h *BillingHandler) resolveUserBySubEvent(ctx context.Context, s stripeSubs
 // applySubscriptionState persists the mapped Stripe state, then enforces the
 // new plan when the subscription is active.
 func (h *BillingHandler) applySubscriptionState(ctx context.Context, tx *sql.Tx, user *db.User, subID string, sub *stripe.Subscription) error {
-	plan, interval := "", ""
-	if p, i, ok := priceOfItem(sub, h.BillingClient.PriceMap()); ok {
-		plan, interval = p, i
-	}
 	status := mapStripeStatus(string(sub.Status))
+	plan, interval := "", ""
+	// Only an active (or trialing) subscription carries paid entitlements.
+	// Non-active states such as incomplete/past_due must not upgrade the plan
+	// or quota; a later `active` event applies them.
+	if status == "active" {
+		if p, i, ok := priceOfItem(sub, h.BillingClient.PriceMap()); ok {
+			plan, interval = p, i
+		}
+	}
 	upd := subscriptionStateUpdate(user.ID, subID, status, plan, interval, sub.CurrentPeriodEnd)
 	if err := h.Queries.ApplySubscriptionUpdate(ctx, tx, upd); err != nil {
 		return err
@@ -939,16 +944,19 @@ var stripeStatusMap = map[string]string{
 	"active": "active", "trialing": "active",
 	"past_due": "past_due", "unpaid": "past_due",
 	"canceled": "canceled", "incomplete_expired": "canceled",
-	"paused": "paused",
+	"paused": "paused", "incomplete": "past_due",
 }
 
 // mapStripeStatus narrows the Stripe subscription status set onto the
-// 4-value local state machine.
+// 4-value local state machine. Unknown/empty values must never be treated
+// as active: they fall back to the conservative past_due state and are
+// logged so the unmapped value is visible in production.
 func mapStripeStatus(s string) string {
 	if mapped, ok := stripeStatusMap[s]; ok {
 		return mapped
 	}
-	return "active"
+	log.Printf("billing webhook: unmapped stripe subscription status %q; defaulting to past_due", s)
+	return "past_due"
 }
 
 // (writeJSON is defined in auth_handlers.go and reused here.)

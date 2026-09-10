@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -112,6 +114,39 @@ func HashRefreshToken(raw string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// refreshTokenVersionSep separates the random secret from the token_version
+// bound into a raw refresh token. The version is public (it already travels in
+// the access JWT); binding it into the refresh token lets RotateRefreshToken
+// reject a token minted before a token_version bump even when the bumping code
+// path forgot to sweep the corresponding row.
+const refreshTokenVersionSep = "."
+
+// generateVersionedRefreshToken mints a random refresh token bound to the
+// supplied token_version. The raw form is "<64-hex-secret>.<version>".
+func generateVersionedRefreshToken(tokenVersion int) (raw, hash string, err error) {
+	secret, _, err := GenerateRefreshToken()
+	if err != nil {
+		return "", "", err
+	}
+	raw = secret + refreshTokenVersionSep + strconv.Itoa(tokenVersion)
+	return raw, HashRefreshToken(raw), nil
+}
+
+// parseRefreshTokenVersion extracts the token_version bound into a raw refresh
+// token. ok is false for legacy tokens minted before version binding existed
+// (plain 64-hex, no separator).
+func parseRefreshTokenVersion(raw string) (version int, ok bool) {
+	i := strings.LastIndex(raw, refreshTokenVersionSep)
+	if i < 0 {
+		return 0, false
+	}
+	v, err := strconv.Atoi(raw[i+len(refreshTokenVersionSep):])
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
 // RefreshTokenStore is the minimum DB surface required by the refresh-token
 // helpers. internal/db.PostgresQuery satisfies it.
 type RefreshTokenStore interface {
@@ -122,10 +157,15 @@ type RefreshTokenStore interface {
 	GetUserTokenVersion(ctx context.Context, userID string) (int, error)
 }
 
-// IssueRefreshToken creates a new refresh token, persists its hash, and
-// returns the raw token (to be set as a cookie) and its expiry.
+// IssueRefreshToken creates a new refresh token bound to the user's current
+// token_version, persists its hash, and returns the raw token (to be set as a
+// cookie) and its expiry.
 func IssueRefreshToken(ctx context.Context, store RefreshTokenStore, userID string) (raw string, expiresAt time.Time, err error) {
-	raw, hash, err := GenerateRefreshToken()
+	tokenVersion, err := store.GetUserTokenVersion(ctx, userID)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	raw, hash, err := generateVersionedRefreshToken(tokenVersion)
 	if err != nil {
 		return "", time.Time{}, err
 	}
@@ -145,10 +185,18 @@ var ErrInvalidRefreshToken = errors.New("invalid or expired refresh token")
 // returns the new raw token, its expiry, and the user_id it belongs to.
 //
 // Validation: the token hash must exist; expires_at must be in the future;
-// the user's current token_version is fetched but token-version equivalence
-// is enforced at the access-token layer (the refresh row is deleted on
-// logout-all and password-reset, so any existing row already represents a
-// valid session).
+// and the token_version bound into the raw token must equal the user's
+// current token_version. The version check closes the gap where a bumping
+// code path bumps token_version but fails to delete the refresh row: a token
+// minted before the bump carries the old version and is rejected (and its
+// stale row swept) here, so a stolen pre-bump cookie cannot mint a fresh
+// access token carrying the new version.
+//
+// Legacy tokens minted before version binding (plain 64-hex, no separator)
+// are treated as version 0; a bumped user is still rejected by the compare.
+// Residual risk: the store interface exposes no compare-and-delete primitive,
+// so two concurrent rotations of the same row can both succeed before either
+// delete is observed.
 func RotateRefreshToken(ctx context.Context, store RefreshTokenStore, oldRaw string) (newRaw string, newExpiry time.Time, userID string, err error) {
 	oldHash := HashRefreshToken(oldRaw)
 	uid, exp, err := store.GetRefreshTokenByHash(ctx, oldHash)
@@ -157,6 +205,21 @@ func RotateRefreshToken(ctx context.Context, store RefreshTokenStore, oldRaw str
 	}
 	if uid == "" || time.Now().After(exp) {
 		// Best-effort cleanup of expired row.
+		_ = store.DeleteRefreshTokenByHash(ctx, oldHash)
+		return "", time.Time{}, "", ErrInvalidRefreshToken
+	}
+	// Enforce token-version equivalence: the version bound into the raw token
+	// must match the user's current version.
+	tokenVersion, ok := parseRefreshTokenVersion(oldRaw)
+	if !ok {
+		tokenVersion = 0
+	}
+	currentVersion, err := store.GetUserTokenVersion(ctx, uid)
+	if err != nil {
+		_ = store.DeleteRefreshTokenByHash(ctx, oldHash)
+		return "", time.Time{}, "", ErrInvalidRefreshToken
+	}
+	if tokenVersion != currentVersion {
 		_ = store.DeleteRefreshTokenByHash(ctx, oldHash)
 		return "", time.Time{}, "", ErrInvalidRefreshToken
 	}

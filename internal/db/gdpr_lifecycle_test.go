@@ -37,6 +37,8 @@ func seedGDPRUser(t *testing.T, ctx context.Context, q DBQuery, userID, wsCreate
 	mustExec(`INSERT INTO oauth_states (state_hash, user_id, expires_at) VALUES ('st1', ?, '2099-01-01T00:00:00Z')`, userID)
 	mustExec(`INSERT INTO comment_usage_logs (id, user_id, count, period_start, period_end) VALUES ('ul1', ?, 10, '2026-09-01T00:00:00Z', '2026-10-01T00:00:00Z')`, userID)
 	mustExec(`INSERT INTO comment_exports (id, user_id, format, filters, status) VALUES ('ce1', ?, 'csv', '{}', 'completed')`, userID)
+	mustExec(`INSERT INTO email_send_log (id, user_id, template, idempotency_key, to_address) VALUES ('esl1', ?, 'digest', 'gdpr-k1', 'gdpr@example.com')`, userID)
+	mustExec(`INSERT INTO audit_log (id, user_id, action, details) VALUES ('al1', ?, 'login', '{"user_id":"`+userID+`"}')`, userID)
 	mustExec(`INSERT INTO rate_limit_buckets (id, user_key, window_start) VALUES ('rl1', ?, '2026-09-01T00:00:00Z')`, "u:"+userID)
 	mustExec(`INSERT INTO weekly_digests (id, user_id, week_start_date) VALUES ('wd1', ?, '2026-08-31')`, userID)
 	mustExec(`INSERT INTO data_export_jobs (id, user_id, status) VALUES ('de1', ?, 'completed')`, userID)
@@ -70,6 +72,8 @@ var gdprUserTables = []string{
 	"user_comment_stars",
 	"comment_usage_logs",
 	"comment_exports",
+	"email_send_log",
+	"audit_log",
 	"workspace_members",
 	"rate_limit_buckets",
 	"user_channel_tracking",

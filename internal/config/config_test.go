@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -413,5 +414,84 @@ func TestLoadHTTPHardeningDefaults(t *testing.T) {
 	t.Setenv("MAX_BODY_BYTES", "-5")
 	if _, err := Load(false); err == nil {
 		t.Fatal("Load: expected error for non-positive MAX_BODY_BYTES")
+	}
+}
+
+// TestLoadSignedURLSecretRequirement asserts that the signed-URL signing
+// secret is mandatory whenever the signed-URL endpoints can be reached, i.e.
+// when either the lifecycle workers or the account lifecycle API is enabled.
+// Regression for the API-enabled/workers-disabled gap that allowed forging
+// HMAC("", userID:jobID:exp) downloads.
+func TestLoadSignedURLSecretRequirement(t *testing.T) {
+	setValidJWTSecret(t)
+
+	tests := []struct {
+		name            string
+		apiEnabled      bool
+		workersEnabled  bool
+		secret          string
+		wantErr         bool
+		wantErrContains string
+	}{
+		{
+			name:            "account API enabled without secret fails",
+			apiEnabled:      true,
+			secret:          "",
+			wantErr:         true,
+			wantErrContains: "EXPORT_SIGNED_URL_SECRET",
+		},
+		{
+			name:       "account API enabled with secret succeeds",
+			apiEnabled: true,
+			secret:     "signed-url-secret",
+			wantErr:    false,
+		},
+		{
+			name:            "workers enabled without secret still fails",
+			workersEnabled:  true,
+			secret:          "",
+			wantErr:         true,
+			wantErrContains: "EXPORT_SIGNED_URL_SECRET",
+		},
+		{
+			name:    "all disabled without secret succeeds",
+			secret:  "",
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			api, workers := "false", "false"
+			if tc.apiEnabled {
+				api = "true"
+			}
+			if tc.workersEnabled {
+				workers = "true"
+			}
+			t.Setenv("ACCOUNT_LIFECYCLE_API_ENABLED", api)
+			t.Setenv("LIFECYCLE_WORKERS_ENABLED", workers)
+			t.Setenv("EXPORT_SIGNED_URL_SECRET", tc.secret)
+
+			c, err := Load(false)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("Load: expected error, got nil")
+				}
+				if !strings.Contains(err.Error(), tc.wantErrContains) {
+					t.Fatalf("Load error %q: want it to name %q", err.Error(), tc.wantErrContains)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: unexpected error: %v", err)
+			}
+			if tc.apiEnabled && !c.AccountLifecycleAPIEnabled {
+				t.Error("AccountLifecycleAPIEnabled: want true")
+			}
+			if tc.secret != "" && c.ExportSignedURLSecret != tc.secret {
+				t.Errorf("ExportSignedURLSecret: got %q, want %q", c.ExportSignedURLSecret, tc.secret)
+			}
+		})
 	}
 }

@@ -387,6 +387,13 @@ func (h *AuthHandler) VerifyEmail(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"message": "email verified"})
 }
 
+// emailChangeResendCounter is satisfied by the production AuthStore. It is
+// declared locally so the narrow db.AuthStore surface stays unchanged while
+// still giving the handler a compile-time-checked way to reach the counter.
+type emailChangeResendCounter interface {
+	CountEmailChangeResendsInWindow(ctx context.Context, userID string, since time.Time) (int, error)
+}
+
 func (h *AuthHandler) ResendVerification(w http.ResponseWriter, r *http.Request) {
 	userID, ok := r.Context().Value(UserIDKey).(string)
 	if !ok || userID == "" {
@@ -404,16 +411,23 @@ func (h *AuthHandler) ResendVerification(w http.ResponseWriter, r *http.Request)
 	}
 
 	since := time.Now().Add(-1 * time.Hour)
-	count, _ := h.Queries.CountVerificationResendsInWindow(r.Context(), userID, since)
-	if count >= 3 {
-		writeError(w, http.StatusTooManyRequests, "too many requests; try again later")
-		return
-	}
 
 	// Email-change pending (fix-frontend-plumbing): the user asked to switch
 	// addresses; the verification link lives in the NEW inbox. The old email
-	// stays live until the new one verifies.
+	// stays live until the new one verifies. Branch selection MUST happen
+	// before enforcing a cap: this branch writes email_change_tokens, so the
+	// email_verification_tokens counter would leave it uncapped.
 	if ec, err := h.Queries.GetActiveEmailChange(r.Context(), userID); err == nil && ec != nil && ec.PendingEmail != "" {
+		counter, ok := h.Queries.(emailChangeResendCounter)
+		if !ok {
+			writeError(w, http.StatusInternalServerError, "failed to issue token")
+			return
+		}
+		count, _ := counter.CountEmailChangeResendsInWindow(r.Context(), userID, since)
+		if count >= 3 {
+			writeError(w, http.StatusTooManyRequests, "too many requests; try again later")
+			return
+		}
 		_ = h.Queries.InvalidateEmailChangeTokensForUser(r.Context(), userID)
 		vRaw, vHash, err := auth.GenerateRefreshToken()
 		if err != nil {
@@ -434,6 +448,12 @@ func (h *AuthHandler) ResendVerification(w http.ResponseWriter, r *http.Request)
 			})
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"message": "verification email sent"})
+		return
+	}
+
+	count, _ := h.Queries.CountVerificationResendsInWindow(r.Context(), userID, since)
+	if count >= 3 {
+		writeError(w, http.StatusTooManyRequests, "too many requests; try again later")
 		return
 	}
 
@@ -496,10 +516,19 @@ func (h *AuthHandler) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 	// Google-only account: send the SSO notice instead of issuing a reset token.
 	if user.PasswordHash == nil && user.GoogleSub != nil {
 		if h.EmailSender != nil {
+			// A per-send nonce keeps the idempotency key unique even when
+			// the same address is requested twice within the same minute;
+			// otherwise the pipeline would dedupe the send (and its
+			// email_send_log row) and the hourly cap would never fill.
+			nonce, _, err := auth.GenerateRefreshToken()
+			if err != nil {
+				respond()
+				return
+			}
 			_ = h.sendEmail(r.Context(), email.Message{
 				Template:       email.TemplatePasswordReset,
 				ToAddress:      user.Email,
-				IdempotencyKey: email.IdempotencyKey("google_only_reset", user.Email, time.Now().UTC().Format("2006-01-02T15:04")),
+				IdempotencyKey: email.IdempotencyKey("google_only_reset", user.Email, nonce),
 				Variables:      map[string]any{"ResetURL": config.Default.AppBaseURL + "/login"},
 			})
 		}

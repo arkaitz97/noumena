@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"noumena/internal/cronutil"
+	"noumena/internal/db"
+	"noumena/internal/email"
 )
 
 // Tests for the daily quota-reset cron (billing change, task 10.2).
@@ -16,16 +18,19 @@ import (
 // computes the correct delay until the next 08:00 UTC anchor.
 
 type fakeQuotaStore struct {
-	recordCalls  int
-	resetCalls   int
-	expireCalls  int
-	resetErr     error
-	expireErr    error
-	recordErr    error
-	resetRows    int64
-	expireRows   int64
-	recordRows   int64
-	lastGraceHrs int
+	recordCalls          int
+	resetCalls           int
+	expireCalls          int
+	expireWithUsersCalls int
+	resetErr             error
+	expireErr            error
+	recordErr            error
+	expireWithUsersErr   error
+	resetRows            int64
+	expireRows           int64
+	recordRows           int64
+	lastGraceHrs         int
+	expireWithUsers      []db.ExpiredGraceUser
 }
 
 func (f *fakeQuotaStore) RecordCurrentPeriodUsage(ctx context.Context) (int64, error) {
@@ -42,6 +47,26 @@ func (f *fakeQuotaStore) ExpirePastDueGrace(ctx context.Context, graceHours int)
 	f.expireCalls++
 	f.lastGraceHrs = graceHours
 	return f.expireRows, f.expireErr
+}
+
+func (f *fakeQuotaStore) ExpirePastDueGraceWithUsers(ctx context.Context, graceHours int) ([]db.ExpiredGraceUser, error) {
+	f.expireWithUsersCalls++
+	f.lastGraceHrs = graceHours
+	return f.expireWithUsers, f.expireWithUsersErr
+}
+
+func TestRunQuotaCronOnceUsesEmailPathWhenPipelineSet(t *testing.T) {
+	store := &fakeQuotaStore{expireWithUsers: []db.ExpiredGraceUser{{ID: "u1", Email: "u1@example.com"}}}
+	runQuotaCronOnce(context.Background(), store, 72, &email.Pipeline{})
+	if store.expireWithUsersCalls != 1 {
+		t.Errorf("ExpirePastDueGraceWithUsers calls: want 1 got %d", store.expireWithUsersCalls)
+	}
+	if store.expireCalls != 0 {
+		t.Errorf("ExpirePastDueGrace must not be called when pipeline set; calls=%d", store.expireCalls)
+	}
+	if store.lastGraceHrs != 72 {
+		t.Errorf("graceHours: want 72 got %d", store.lastGraceHrs)
+	}
 }
 
 func TestRunQuotaCronOnceCallsBothPrimitives(t *testing.T) {

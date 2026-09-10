@@ -7,6 +7,10 @@ import (
 	"time"
 )
 
+// ErrSeatLimit is returned by AddWorkspaceMemberAtomic when the workspace is
+// already at its plan seat capacity, so no row was inserted.
+var ErrSeatLimit = errors.New("seat limit reached")
+
 func (q *SQLiteQuery) CreateWorkspace(ctx context.Context, name, createdBy string) (*Workspace, error) {
 	w := &Workspace{}
 	var createdAt string
@@ -159,6 +163,30 @@ func (q *SQLiteQuery) AddWorkspaceMember(ctx context.Context, workspaceID, userI
 	return err
 }
 
+// AddWorkspaceMemberAtomic admits a member only while the workspace is below
+// its plan seat limit. The count check and the insert happen in a single
+// statement, so concurrent invite accepts cannot both pass a check-then-act
+// race and exceed the cap. It returns ErrSeatLimit when the workspace already
+// holds `limit` members (no row inserted).
+func (q *SQLiteQuery) AddWorkspaceMemberAtomic(ctx context.Context, workspaceID, userID, role string, limit int) error {
+	res, err := q.db.ExecContext(ctx,
+		`INSERT INTO workspace_members (workspace_id, user_id, role)
+		 SELECT ?, ?, ?
+		 WHERE (SELECT COUNT(*) FROM workspace_members WHERE workspace_id = ?) < ?`,
+		workspaceID, userID, role, workspaceID, limit)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrSeatLimit
+	}
+	return nil
+}
+
 func (q *SQLiteQuery) RemoveWorkspaceMember(ctx context.Context, workspaceID, userID string) error {
 	_, err := q.db.ExecContext(ctx,
 		`DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?`,
@@ -191,24 +219,26 @@ func (q *SQLiteQuery) CountWorkspaceAdmins(ctx context.Context, workspaceID stri
 
 func (q *SQLiteQuery) CreateWorkspaceInvite(ctx context.Context, workspaceID, email, role, tokenHash string, expiresAt time.Time) (*WorkspaceInvite, error) {
 	inv := &WorkspaceInvite{}
-	var expiresAtStr, consumedAtStr, createdAtStr string
+	var expiresAtStr, createdAtStr string
+	var consumedAtStr sql.NullString
 	err := q.db.QueryRowContext(ctx,
 		`INSERT INTO workspace_invites (id, workspace_id, email, role, token_hash, expires_at)
 		 VALUES (?, ?, ?, ?, ?, ?) RETURNING id, workspace_id, email, role, token_hash, expires_at, consumed_at, created_at`,
-		generateUUID(), workspaceID, email, role, tokenHash, expiresAt.Format(time.RFC3339)).Scan(
+		generateUUID(), workspaceID, email, role, tokenHash, expiresAt.UTC().Format(time.RFC3339)).Scan(
 		&inv.ID, &inv.WorkspaceID, &inv.Email, &inv.Role, &inv.TokenHash, &expiresAtStr, &consumedAtStr, &createdAtStr)
 	if err != nil {
 		return nil, err
 	}
 	inv.ExpiresAt = parseTime(expiresAtStr)
-	inv.ConsumedAt = parseTimePtr(parseNullString(consumedAtStr))
+	inv.ConsumedAt = parseTimePtr(consumedAtStr)
 	inv.CreatedAt = parseTime(createdAtStr)
 	return inv, nil
 }
 
 func (q *SQLiteQuery) GetWorkspaceInviteByToken(ctx context.Context, tokenHash string) (*WorkspaceInvite, error) {
 	inv := &WorkspaceInvite{}
-	var expiresAtStr, consumedAtStr, createdAtStr string
+	var expiresAtStr, createdAtStr string
+	var consumedAtStr sql.NullString
 	err := q.db.QueryRowContext(ctx,
 		`SELECT id, workspace_id, email, role, token_hash, expires_at, consumed_at, created_at
 		 FROM workspace_invites WHERE token_hash = ?`,
@@ -220,7 +250,7 @@ func (q *SQLiteQuery) GetWorkspaceInviteByToken(ctx context.Context, tokenHash s
 		return nil, err
 	}
 	inv.ExpiresAt = parseTime(expiresAtStr)
-	inv.ConsumedAt = parseTimePtr(parseNullString(consumedAtStr))
+	inv.ConsumedAt = parseTimePtr(consumedAtStr)
 	inv.CreatedAt = parseTime(createdAtStr)
 	return inv, err
 }
@@ -233,7 +263,8 @@ func (q *SQLiteQuery) ConsumeWorkspaceInvite(ctx context.Context, inviteID strin
 
 func (q *SQLiteQuery) GetWorkspaceInviteByEmail(ctx context.Context, workspaceID, email string) (*WorkspaceInvite, error) {
 	inv := &WorkspaceInvite{}
-	var expiresAtStr, consumedAtStr, createdAtStr string
+	var expiresAtStr, createdAtStr string
+	var consumedAtStr sql.NullString
 	err := q.db.QueryRowContext(ctx,
 		`SELECT id, workspace_id, email, role, token_hash, expires_at, consumed_at, created_at
 		 FROM workspace_invites WHERE workspace_id = ? AND email = ? AND consumed_at IS NULL AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
@@ -246,7 +277,7 @@ func (q *SQLiteQuery) GetWorkspaceInviteByEmail(ctx context.Context, workspaceID
 		return nil, err
 	}
 	inv.ExpiresAt = parseTime(expiresAtStr)
-	inv.ConsumedAt = parseTimePtr(parseNullString(consumedAtStr))
+	inv.ConsumedAt = parseTimePtr(consumedAtStr)
 	inv.CreatedAt = parseTime(createdAtStr)
 	return inv, err
 }
@@ -293,7 +324,7 @@ func (q *SQLiteQuery) IncrementRateLimit(ctx context.Context, userKey string, wi
 		 ON CONFLICT (user_key, window_start)
 		 DO UPDATE SET count = rate_limit_buckets.count + 1
 		 RETURNING count`,
-		generateUUID(), userKey, windowStart.Format(time.RFC3339)).Scan(&count)
+		generateUUID(), userKey, windowStart.UTC().Format(time.RFC3339)).Scan(&count)
 	return count, err
 }
 
@@ -301,7 +332,7 @@ func (q *SQLiteQuery) GetRateLimitStatus(ctx context.Context, userKey string, wi
 	var count int
 	err := q.db.QueryRowContext(ctx,
 		`SELECT count FROM rate_limit_buckets WHERE user_key = ? AND window_start = ?`,
-		userKey, windowStart.Format(time.RFC3339)).Scan(&count)
+		userKey, windowStart.UTC().Format(time.RFC3339)).Scan(&count)
 	if errors.Is(err, sql.ErrNoRows) {
 		// No bucket yet for this window: full budget available.
 		count = 0
@@ -326,7 +357,7 @@ func (q *SQLiteQuery) GetRateLimitStatus(ctx context.Context, userKey string, wi
 
 func (q *SQLiteQuery) CleanupExpiredRateLimitBuckets(ctx context.Context, before time.Time) (int64, error) {
 	result, err := q.db.ExecContext(ctx,
-		`DELETE FROM rate_limit_buckets WHERE window_start < ?`, before.Format(time.RFC3339))
+		`DELETE FROM rate_limit_buckets WHERE window_start < ?`, before.UTC().Format(time.RFC3339))
 	if err != nil {
 		return 0, err
 	}

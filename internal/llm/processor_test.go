@@ -12,6 +12,7 @@ import (
 	"database/sql"
 
 	"noumena/internal/db"
+	"noumena/internal/dbtest"
 )
 
 // fakeClient is a deterministic LLMClient used across processor tests.
@@ -562,6 +563,126 @@ func TestProcessor_NoOverageRowForFreePlan(t *testing.T) {
 
 // guard: prove fakeQueryBilling still embeds the original fakeQuery.
 var _ = errors.New
+
+// TestLogOverage_ConcurrentBatchesUseFreshTotal drives two batches for the
+// same primary user (two channels, same owner) through persistBatch against a
+// shared real SQLite database. The first crosses the quota (95 -> 105) and the
+// second pushes further past it (105 -> 115); the true overage is 15. The old
+// stale-snapshot path used primary.CommentsUsedThisPeriod for both batches and
+// logged 5+5=10. The fresh-total path logs 5+10=15. Run with -race.
+func TestLogOverage_ConcurrentBatchesUseFreshTotal(t *testing.T) {
+	database := dbtest.SetupTestDB(t)
+	q := db.NewSQLiteQuery(database).(*db.SQLiteQuery)
+	ctx := context.Background()
+
+	u, err := q.CreateUser(ctx, fmt.Sprintf("concurrent-overage-%d@example.com", time.Now().UnixNano()), "h")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	plan, status := "creator", "active"
+	used, quota := 95, 100
+	if err := q.ApplySubscriptionUpdate(ctx, nil, db.SubscriptionUpdate{
+		UserID:                 u.ID,
+		SubscriptionPlan:       &plan,
+		SubscriptionStatus:     &status,
+		CommentsUsedThisPeriod: &used,
+		CommentQuotaMonthly:    &quota,
+	}); err != nil {
+		t.Fatalf("ApplySubscriptionUpdate: %v", err)
+	}
+
+	// Shared, read-only snapshot; the fresh total comes from the DB.
+	primary := &db.User{
+		ID:                     u.ID,
+		SubscriptionPlan:       plan,
+		SubscriptionStatus:     status,
+		CommentQuotaMonthly:    quota,
+		CommentsUsedThisPeriod: used,
+	}
+
+	p := NewProcessor(&fakeClient{provider: "openai", model: "gpt-4o"}, q)
+
+	makeResults := func(n int) []LLMResult {
+		out := make([]LLMResult, n)
+		for i := range out {
+			out[i] = LLMResult{CommentIndex: i, Category: "praise", Confidence: 0.9, Topic: "t", ActionableInsights: []Insight{}}
+		}
+		return out
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for _, ch := range []string{"chA", "chB"} {
+		batch := makeBatch(ch, 10)
+		results := makeResults(len(batch))
+		wg.Add(1)
+		go func(ch string, batch []*db.Comment, results []LLMResult) {
+			defer wg.Done()
+			if _, _, err := p.persistBatch(ctx, batch, results, nil, primary, "job-"+ch); err != nil {
+				errs <- err
+			}
+		}(ch, batch, results)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("persistBatch: %v", err)
+	}
+
+	var overage int
+	if err := q.DB().QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(count), 0) FROM comment_usage_logs WHERE user_id = ?`, u.ID).Scan(&overage); err != nil {
+		t.Fatalf("sum overage logs: %v", err)
+	}
+	if overage != 15 {
+		t.Errorf("logged overage: want 15 (true excess 95+20-100), got %d", overage)
+	}
+
+	var stored int
+	if err := q.DB().QueryRowContext(ctx,
+		`SELECT comments_used_this_period FROM users WHERE id = ?`, u.ID).Scan(&stored); err != nil {
+		t.Fatalf("select stored count: %v", err)
+	}
+	if stored != 115 {
+		t.Errorf("stored comments_used_this_period: want 115 got %d", stored)
+	}
+}
+
+// TestOveragePeriod_NilPeriodEndIsStable: with no durable anchor the fallback
+// must be derived from the calendar period, not from now itself, so two
+// batches in the same period share one period_start/period_end (otherwise
+// ListOverageGroups fragments and rounds each tiny group up).
+func TestOveragePeriod_NilPeriodEndIsStable(t *testing.T) {
+	t1 := time.Date(2026, 5, 3, 1, 2, 3, 0, time.UTC)
+	t2 := time.Date(2026, 5, 28, 23, 59, 59, 0, time.UTC)
+
+	start1, end1 := overagePeriod(nil, t1)
+	start2, end2 := overagePeriod(nil, t2)
+	if !start1.Equal(start2) || !end1.Equal(end2) {
+		t.Fatalf("nil CurrentPeriodEnd unstable across one period: (%v..%v) vs (%v..%v)", start1, end1, start2, end2)
+	}
+	if end1.Year() != 2026 || end1.Month() != time.May {
+		t.Errorf("fallback window should end in May 2026, got %v", end1)
+	}
+
+	// A different calendar month must yield a different window.
+	start3, _ := overagePeriod(nil, time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC))
+	if start3.Equal(start1) {
+		t.Errorf("fallback window must change across calendar months, stayed %v", start1)
+	}
+
+	// A durable quota_reset_at anchor takes precedence and is stable.
+	anchor := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	u := &db.User{QuotaResetAt: &anchor}
+	as, ae := overagePeriod(u, t1)
+	bs, be := overagePeriod(u, t2)
+	if !as.Equal(bs) || !ae.Equal(be) {
+		t.Errorf("QuotaResetAt anchor unstable: (%v..%v) vs (%v..%v)", as, ae, bs, be)
+	}
+	if !ae.Equal(anchor) {
+		t.Errorf("QuotaResetAt anchor: want period_end %v got %v", anchor, ae)
+	}
+}
 
 // Sentiment labels map to -1/0/1 and are persisted for every comment.
 func TestProcessor_PersistsSentimentScores(t *testing.T) {

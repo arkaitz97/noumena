@@ -2,10 +2,16 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,6 +46,18 @@ type fakeDigestQuery struct {
 	contentUpdateErr   error
 	statusUpdateErr    error
 	stableInsertCalled int
+
+	// userLookupStarted, when non-nil, receives a signal on every
+	// GetUserByID call. userLookupGate, when non-nil, blocks GetUserByID
+	// until the gate closes or the context is cancelled — used to hold a
+	// deferred sweep in flight while the run loop keeps ticking.
+	userLookupStarted chan struct{}
+	userLookupGate    chan struct{}
+
+	// insertPendingSignal, when non-nil, receives a signal after every
+	// InsertWeeklyDigestPending call so tests can synchronize on the weekly
+	// dispatch instead of polling or sleeping.
+	insertPendingSignal chan struct{}
 }
 
 type contentUpdate struct {
@@ -72,6 +90,12 @@ func (f *fakeDigestQuery) InsertWeeklyDigestPending(ctx context.Context, userID 
 	f.stableInsertCalled++
 	id := "digest-" + userID
 	f.insertedPending = append(f.insertedPending, id)
+	if f.insertPendingSignal != nil {
+		select {
+		case f.insertPendingSignal <- struct{}{}:
+		default:
+		}
+	}
 	return id, f.pendingInserted, nil
 }
 
@@ -113,12 +137,33 @@ func (f *fakeDigestQuery) GetDeferredDigestsDue(ctx context.Context, now time.Ti
 }
 
 func (f *fakeDigestQuery) GetUserByID(ctx context.Context, id string) (*db.User, error) {
+	if f.userLookupStarted != nil {
+		select {
+		case f.userLookupStarted <- struct{}{}:
+		default:
+		}
+	}
+	if f.userLookupGate != nil {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-f.userLookupGate:
+		}
+	}
 	for _, u := range f.users {
 		if u.ID == id {
 			return u, nil
 		}
 	}
 	return nil, nil
+}
+
+// insertedCount returns the number of InsertWeeklyDigestPending calls
+// (i.e. weekly-trigger dispatches) observed so far.
+func (f *fakeDigestQuery) insertedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.stableInsertCalled
 }
 
 func (f *fakeDigestQuery) GetWeeklyDigestByID(ctx context.Context, digestID string) (*db.WeeklyDigest, error) {
@@ -543,5 +588,356 @@ func TestRedispatchDeferredCompletes(t *testing.T) {
 	w.redispatchDeferred(context.Background())
 	if len(q.contentUpdates) != 1 || q.contentUpdates[0].Status != "completed" {
 		t.Fatalf("deferred should complete, got %+v", q.contentUpdates)
+	}
+}
+
+// --- run-loop trigger starvation regression tests ---------------------------
+
+// fakeDigestClock is a manually-advanced wall clock for driving the run loop.
+// reads, when non-nil, receives every value returned by now() so a test can
+// prove the loop actually observed a given instant instead of racing a timer.
+type fakeDigestClock struct {
+	mu    sync.Mutex
+	t     time.Time
+	reads chan time.Time
+}
+
+func (c *fakeDigestClock) now() time.Time {
+	c.mu.Lock()
+	t := c.t
+	c.mu.Unlock()
+	if c.reads != nil {
+		select {
+		case c.reads <- t:
+		default:
+		}
+	}
+	return t
+}
+
+func (c *fakeDigestClock) set(t time.Time) {
+	c.mu.Lock()
+	c.t = t
+	c.mu.Unlock()
+}
+
+// waitForClockRead blocks until the run loop has read the clock at want (or
+// fails the test after a generous safety timeout). Earlier reads are drained.
+func waitForClockRead(t *testing.T, reads <-chan time.Time, want time.Time) {
+	t.Helper()
+	timeout := time.After(5 * time.Second)
+	for {
+		select {
+		case got := <-reads:
+			if got.Equal(want) {
+				return
+			}
+		case <-timeout:
+			t.Fatalf("run loop never read the clock at %s", want.Format(time.RFC3339))
+		}
+	}
+}
+
+func monday2024(hour, min int) time.Time {
+	return time.Date(2024, 1, 8, hour, min, 0, 0, time.UTC) // 2024-01-08 is a Monday
+}
+
+func twelveComments() []*db.Comment {
+	cs := make([]*db.Comment, 12)
+	for i := range cs {
+		topic := "t"
+		cat := "praise"
+		cs[i] = &db.Comment{Body: "x", Topic: &topic, Category: &cat}
+	}
+	return cs
+}
+
+// TestRun_TriggerNotStarvedByDeferredRetries reproduces the Confirmed Bug:
+// 50 deferred rows are due and their retry work stalls in flight. The clock is
+// advanced 07:59:30 → 08:00 → 08:50 (the stall window). The weekly trigger for
+// the current week must still have dispatched exactly once.
+//
+// The test drives the loop through an injected tick channel and synchronizes on
+// explicit channels (the deferred-sweep gate, the weekly-insert signal, and the
+// clock reads), so it is independent of wall-clock scheduling.
+func TestRun_TriggerNotStarvedByDeferredRetries(t *testing.T) {
+	const deferredRows = deferredRedispatchLimit // 50
+
+	deferred := make([]*db.WeeklyDigest, deferredRows)
+	for i := range deferred {
+		deferred[i] = &db.WeeklyDigest{
+			ID:            fmt.Sprintf("d%02d", i),
+			UserID:        "du",
+			WeekStartDate: "2024-01-01",
+			Status:        "deferred",
+		}
+	}
+	started := make(chan struct{}, 1)
+	gate := make(chan struct{}) // never closed: sweep stays in flight until cancel
+	weeklyDispatched := make(chan struct{}, 1)
+
+	q := &fakeDigestQuery{
+		users:               []*db.User{{ID: "u1", Email: "u1@test.com"}},
+		comments:            map[string][]*db.Comment{"u1": twelveComments(), "du": twelveComments()},
+		pendingInserted:     true,
+		deferredDue:         deferred,
+		userLookupStarted:   started,
+		userLookupGate:      gate,
+		insertPendingSignal: weeklyDispatched,
+	}
+	clock := &fakeDigestClock{
+		t:     monday2024(7, 59).Add(30 * time.Second),
+		reads: make(chan time.Time, 64),
+	}
+	ticks := make(chan time.Time, 8)
+	w := &Worker{
+		Queries:   q,
+		LLMClient: newMockOpenCode(t, digestGoodRaw, "", 0),
+		Logger:    log.New(io.Discard, "", 0),
+		Now:       clock.now,
+		tickCh:    ticks,
+	}
+	w.dispatched = map[string]struct{}{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); w.run(ctx) }()
+
+	// Tick 1 (07:59:30, not the trigger minute): the loop launches the deferred
+	// sweep, which signals it is in flight and then blocks on the gate.
+	ticks <- monday2024(7, 59).Add(30 * time.Second)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("deferred retry never started")
+	}
+
+	// Tick 2 (08:00, the trigger minute): the weekly dispatch must fire. If the
+	// sweep ran before trigger evaluation it would block the loop here and this
+	// signal would never arrive.
+	clock.set(monday2024(8, 0))
+	ticks <- monday2024(8, 0)
+	select {
+	case <-weeklyDispatched:
+	case <-time.After(5 * time.Second):
+		t.Fatal("weekly trigger was starved by the stalled deferred sweep")
+	}
+
+	// Tick 3 (08:50, past the whole trigger window): wait until the loop has
+	// actually observed this instant, then assert no second dispatch happened.
+	clock.set(monday2024(8, 50))
+	ticks <- monday2024(8, 50)
+	waitForClockRead(t, clock.reads, monday2024(8, 50))
+
+	if got := q.insertedCount(); got != 1 {
+		t.Fatalf("weekly trigger must dispatch exactly once despite stalled deferred sweep, got %d", got)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("run loop did not stop after cancellation")
+	}
+	w.wg.Wait()
+}
+
+// TestRedispatchDeferred_RetriesAllDueRows proves deferred rows are still
+// retried (not dropped): every due row reaches a terminal update.
+func TestRedispatchDeferred_RetriesAllDueRows(t *testing.T) {
+	users := []*db.User{{ID: "u1"}, {ID: "u2"}, {ID: "u3"}}
+	comments := map[string][]*db.Comment{
+		"u1": twelveComments(), "u2": twelveComments(), "u3": twelveComments(),
+	}
+	deferred := []*db.WeeklyDigest{
+		{ID: "d1", UserID: "u1", WeekStartDate: "2024-01-01", Status: "deferred"},
+		{ID: "d2", UserID: "u2", WeekStartDate: "2024-01-01", Status: "deferred"},
+		{ID: "d3", UserID: "u3", WeekStartDate: "2024-01-01", Status: "deferred"},
+	}
+	q := &fakeDigestQuery{
+		users: users, comments: comments, deferredDue: deferred,
+	}
+	w := newTestWorker(t, q, newMockOpenCode(t, digestGoodRaw, "", 0))
+	w.redispatchDeferred(context.Background())
+
+	if len(q.contentUpdates) != len(deferred) {
+		t.Fatalf("expected all %d deferred rows retried, got %+v", len(deferred), q.contentUpdates)
+	}
+	for _, u := range q.contentUpdates {
+		if u.Status != "completed" {
+			t.Errorf("deferred row %s not completed: %s", u.DigestID, u.Status)
+		}
+	}
+}
+
+// TestStartStop_CancelsInFlightRedispatch proves Stop terminates cleanly
+// while a deferred sweep is blocked mid-retry.
+func TestStartStop_CancelsInFlightRedispatch(t *testing.T) {
+	t.Setenv("DIGEST_WORKER_ENABLED", "true")
+
+	started := make(chan struct{}, 1)
+	gate := make(chan struct{}) // never closed: Stop's cancellation must unblock
+
+	q := &fakeDigestQuery{
+		users:    []*db.User{{ID: "du"}},
+		comments: map[string][]*db.Comment{"du": twelveComments()},
+		deferredDue: []*db.WeeklyDigest{
+			{ID: "d1", UserID: "du", WeekStartDate: "2024-01-01", Status: "deferred"},
+		},
+		userLookupStarted: started,
+		userLookupGate:    gate,
+	}
+	w := &Worker{
+		Queries:      q,
+		LLMClient:    newMockOpenCode(t, digestGoodRaw, "", 0),
+		Logger:       log.New(io.Discard, "", 0),
+		Now:          func() time.Time { return monday2024(7, 59).Add(30 * time.Second) },
+		TickInterval: 5 * time.Millisecond,
+	}
+	w.Start(context.Background())
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight redispatch never started")
+	}
+
+	stopped := make(chan struct{})
+	go func() { w.Stop(); close(stopped) }()
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not terminate an in-flight redispatch")
+	}
+}
+
+// --- callWithRetry schedule tests ------------------------------------------
+
+// withRetrySchedule swaps the package-level retry schedule for the duration
+// of a test so the real multi-second backoffs never hit the default suite.
+func withRetrySchedule(t *testing.T, schedule []time.Duration) {
+	t.Helper()
+	prev := digestRetrySchedule
+	digestRetrySchedule = schedule
+	t.Cleanup(func() { digestRetrySchedule = prev })
+}
+
+// countingLLM builds an opencode client whose backing server counts requests
+// and lets the test decide the status/body for each (1-based) call. Non-200
+// responses are written verbatim; 200 responses wrap body as chat content.
+func countingLLM(t *testing.T, respond func(call int) (status int, body string)) (*opencodeClient, *int32) {
+	t.Helper()
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := int(atomic.AddInt32(&calls, 1))
+		status, body := respond(n)
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+			_, _ = io.WriteString(w, body)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{
+				map[string]any{"message": map[string]any{"content": body}},
+			},
+		})
+	}))
+	t.Cleanup(srv.Close)
+	return newOpenCodeClientWithHTTP(srv.Client(), srv.URL, "test-key", "test-model"), &calls
+}
+
+const digestGoodRaw = `{"top_ideas":[],"top_questions":[],"top_actionable_insights":[],"engagement_health_score":80,"health_score_breakdown":{"response_rate":70,"engagement_depth":75},"total_comments_analyzed":12,"filtered_comments":0}`
+
+// TestCallWithRetry_ExhaustsSchedule proves the synchronous retry chain fires
+// all three attempts (not one) and returns the final attempt's error.
+func TestCallWithRetry_ExhaustsSchedule(t *testing.T) {
+	withRetrySchedule(t, []time.Duration{0, 1 * time.Millisecond, 2 * time.Millisecond})
+
+	client, calls := countingLLM(t, func(call int) (int, string) {
+		return http.StatusBadRequest, fmt.Sprintf("attempt-%d", call)
+	})
+	w := &Worker{LLMClient: client, Logger: log.New(io.Discard, "", 0)}
+
+	_, err := w.callWithRetry(context.Background(), "p", truthFixture())
+	if err == nil {
+		t.Fatal("expected error after exhausting retries")
+	}
+	if got := atomic.LoadInt32(calls); got != int32(len(digestRetrySchedule)) {
+		t.Fatalf("expected %d provider calls, got %d", len(digestRetrySchedule), got)
+	}
+	if !strings.Contains(err.Error(), "attempt-3") {
+		t.Errorf("expected last attempt's error, got %v", err)
+	}
+}
+
+// TestCallWithRetry_SucceedsOnFinalAttempt proves the chain stops as soon as
+// an attempt succeeds.
+func TestCallWithRetry_SucceedsOnFinalAttempt(t *testing.T) {
+	withRetrySchedule(t, []time.Duration{0, 1 * time.Millisecond, 2 * time.Millisecond})
+
+	client, calls := countingLLM(t, func(call int) (int, string) {
+		if call < 3 {
+			return http.StatusBadRequest, "transient"
+		}
+		return http.StatusOK, digestGoodRaw
+	})
+	w := &Worker{LLMClient: client, Logger: log.New(io.Discard, "", 0)}
+
+	out, err := w.callWithRetry(context.Background(), "p", truthFixture())
+	if err != nil {
+		t.Fatalf("expected success on attempt 3, got %v", err)
+	}
+	if got := atomic.LoadInt32(calls); got != 3 {
+		t.Fatalf("expected 3 provider calls, got %d", got)
+	}
+	if out.TotalCommentsAnalyzed != truthFixture().TotalCommentsAnalyzed {
+		t.Errorf("ground-truth overwrite missing: got total=%d", out.TotalCommentsAnalyzed)
+	}
+}
+
+// TestCallWithRetry_ContextCancelAbortsEarly proves cancellation during the
+// first backoff aborts the chain and surfaces the context error.
+func TestCallWithRetry_ContextCancelAbortsEarly(t *testing.T) {
+	// Real long backoffs: cancellation must win the select, not the timer.
+	withRetrySchedule(t, []time.Duration{0, 10 * time.Second, 30 * time.Second})
+
+	firstAttempt := make(chan struct{}, 1)
+	client, calls := countingLLM(t, func(call int) (int, string) {
+		if call == 1 {
+			select {
+			case firstAttempt <- struct{}{}:
+			default:
+			}
+		}
+		return http.StatusBadRequest, "boom"
+	})
+	w := &Worker{LLMClient: client, Logger: log.New(io.Discard, "", 0)}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	type result struct {
+		out DigestContent
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		out, err := w.callWithRetry(ctx, "p", truthFixture())
+		done <- result{out: out, err: err}
+	}()
+
+	select {
+	case <-firstAttempt:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first attempt never fired")
+	}
+	cancel()
+
+	res := <-done
+	if !errors.Is(res.err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", res.err)
+	}
+	if got := atomic.LoadInt32(calls); got >= int32(len(digestRetrySchedule)) {
+		t.Fatalf("expected early abort (< %d calls), got %d", len(digestRetrySchedule), got)
 	}
 }

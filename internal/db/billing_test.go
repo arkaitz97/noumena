@@ -47,6 +47,99 @@ func seedUserWithPlan(t *testing.T, ctx context.Context, q *db.SQLiteQuery, emai
 	return u.ID
 }
 
+func TestExpirePastDueGraceWithUsersPausesAndReturnsUsers(t *testing.T) {
+	ctx, q := setupBillingDB(t)
+	now := time.Now().UTC().Truncate(time.Second)
+
+	pastDue := "past_due"
+
+	expired, err := q.CreateUser(ctx, "expired@example.com", "h")
+	if err != nil {
+		t.Fatalf("CreateUser expired: %v", err)
+	}
+	oldSince := now.Add(-100 * time.Hour)
+	if err := q.ApplySubscriptionUpdate(ctx, nil, db.SubscriptionUpdate{
+		UserID:             expired.ID,
+		SubscriptionStatus: &pastDue,
+		PastDueSince:       &oldSince,
+	}); err != nil {
+		t.Fatalf("ApplySubscriptionUpdate expired: %v", err)
+	}
+
+	recent, err := q.CreateUser(ctx, "recent@example.com", "h")
+	if err != nil {
+		t.Fatalf("CreateUser recent: %v", err)
+	}
+	newSince := now.Add(-1 * time.Hour)
+	if err := q.ApplySubscriptionUpdate(ctx, nil, db.SubscriptionUpdate{
+		UserID:             recent.ID,
+		SubscriptionStatus: &pastDue,
+		PastDueSince:       &newSince,
+	}); err != nil {
+		t.Fatalf("ApplySubscriptionUpdate recent: %v", err)
+	}
+
+	users, err := q.ExpirePastDueGraceWithUsers(ctx, 72)
+	if err != nil {
+		t.Fatalf("ExpirePastDueGraceWithUsers: %v", err)
+	}
+	if len(users) != 1 {
+		t.Fatalf("returned users: want 1 got %d (%+v)", len(users), users)
+	}
+	if users[0].ID != expired.ID || users[0].Email != "expired@example.com" {
+		t.Errorf("returned user: want %s/expired@example.com got %s/%s", expired.ID, users[0].ID, users[0].Email)
+	}
+
+	assertStatus := func(userID, want string) {
+		t.Helper()
+		var got string
+		if err := q.DB().QueryRowContext(ctx,
+			`SELECT subscription_status FROM users WHERE id = ?`, userID).Scan(&got); err != nil {
+			t.Fatalf("select status: %v", err)
+		}
+		if got != want {
+			t.Errorf("user %s status: want %s got %s", userID, want, got)
+		}
+	}
+	assertStatus(expired.ID, "paused")
+	assertStatus(recent.ID, "past_due")
+}
+
+func TestExpirePastDueGraceCountsAndPauses(t *testing.T) {
+	ctx, q := setupBillingDB(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	pastDue := "past_due"
+
+	u, err := q.CreateUser(ctx, "count-pause@example.com", "h")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	oldSince := now.Add(-100 * time.Hour)
+	if err := q.ApplySubscriptionUpdate(ctx, nil, db.SubscriptionUpdate{
+		UserID:             u.ID,
+		SubscriptionStatus: &pastDue,
+		PastDueSince:       &oldSince,
+	}); err != nil {
+		t.Fatalf("ApplySubscriptionUpdate: %v", err)
+	}
+
+	n, err := q.ExpirePastDueGrace(ctx, 72)
+	if err != nil {
+		t.Fatalf("ExpirePastDueGrace: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("ExpirePastDueGrace rows: want 1 got %d", n)
+	}
+	var status string
+	if err := q.DB().QueryRowContext(ctx,
+		`SELECT subscription_status FROM users WHERE id = ?`, u.ID).Scan(&status); err != nil {
+		t.Fatalf("select status: %v", err)
+	}
+	if status != "paused" {
+		t.Errorf("status: want paused got %s", status)
+	}
+}
+
 func TestUpsertBillingUsageIdempotentPerPeriod(t *testing.T) {
 	ctx, q := setupBillingDB(t)
 	u, err := q.CreateUser(ctx, "upsert@example.com", "h")
@@ -162,6 +255,45 @@ func TestGetBillingUsageNewestFirstLimit(t *testing.T) {
 	}
 	if rows[0].CommentsUsed != 200 {
 		t.Errorf("newest first: comments_used = %d, want 200", rows[0].CommentsUsed)
+	}
+}
+
+// IncrementCommentsUsedReturning must atomically bump the stored counter and
+// report the post-increment value, so overage billing can trust it under
+// concurrency.
+func TestIncrementCommentsUsedReturning(t *testing.T) {
+	ctx, q := setupBillingDB(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	reset := now.AddDate(0, 1, 0)
+	uid := seedUserWithPlan(t, ctx, q, "inc-returning@example.com", "creator", 90, 100, reset)
+
+	got, err := q.IncrementCommentsUsedReturning(ctx, uid, 7)
+	if err != nil {
+		t.Fatalf("IncrementCommentsUsedReturning: %v", err)
+	}
+	if got != 97 {
+		t.Fatalf("first increment: want 97 got %d", got)
+	}
+
+	got, err = q.IncrementCommentsUsedReturning(ctx, uid, 5)
+	if err != nil {
+		t.Fatalf("IncrementCommentsUsedReturning #2: %v", err)
+	}
+	if got != 102 {
+		t.Fatalf("second increment: want 102 got %d", got)
+	}
+
+	var stored int
+	if err := q.DB().QueryRowContext(ctx,
+		`SELECT comments_used_this_period FROM users WHERE id = ?`, uid).Scan(&stored); err != nil {
+		t.Fatalf("select stored count: %v", err)
+	}
+	if stored != 102 {
+		t.Errorf("stored count: want 102 got %d", stored)
+	}
+
+	if _, err := q.IncrementCommentsUsedReturning(ctx, "no-such-user", 1); err == nil {
+		t.Error("unknown user: want error, got nil")
 	}
 }
 

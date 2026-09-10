@@ -2,6 +2,7 @@ package db_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -222,6 +223,116 @@ func TestRecoverStaleIngestionJobs(t *testing.T) {
 	}
 }
 
+func countActiveIngestionJobs(t *testing.T, ctx context.Context, q *db.SQLiteQuery, chID string) int {
+	t.Helper()
+	var n int
+	if err := q.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM ingestion_jobs
+		  WHERE platform_channel_id = ? AND status IN ('pending','running')`, chID).Scan(&n); err != nil {
+		t.Fatalf("count active jobs: %v", err)
+	}
+	return n
+}
+
+// A pending backfill must suppress a poll for the same channel: with
+// AcquireChannelLock a no-op under SQLite, cross-type enqueue dedupe is the
+// only thing preventing backfill and poll from racing on the same channel.
+func TestEnqueueIngestionJob_SuppressesCrossTypeForSameChannel(t *testing.T) {
+	ctx, q := setupRecoveryDB(t)
+	_, chID := seedChannel(t, ctx, q, "xsuppress")
+
+	backfillID, err := q.EnqueueIngestionJob(ctx, chID, "backfill")
+	if err != nil || backfillID == "" {
+		t.Fatalf("backfill enqueue want id: id=%q err=%v", backfillID, err)
+	}
+
+	pollID, err := q.EnqueueIngestionJob(ctx, chID, "poll")
+	if err != nil {
+		t.Fatalf("poll enqueue error: %v", err)
+	}
+	if pollID != "" {
+		t.Fatalf("poll must be suppressed while backfill active, got id %q", pollID)
+	}
+	if n := countActiveIngestionJobs(t, ctx, q, chID); n != 1 {
+		t.Fatalf("want exactly 1 active job, got %d", n)
+	}
+
+	// Running state must suppress just the same as pending.
+	if _, err := q.ClaimNextIngestionJob(ctx); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if id, err := q.EnqueueIngestionJob(ctx, chID, "poll"); err != nil || id != "" {
+		t.Fatalf("poll must stay suppressed while backfill running: id=%q err=%v", id, err)
+	}
+
+	// A failed job is re-pended for retry, so it must still suppress a poll.
+	if err := q.MarkJobFailed(ctx, backfillID, "retry", 0); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+	if id, err := q.EnqueueIngestionJob(ctx, chID, "poll"); err != nil || id != "" {
+		t.Fatalf("poll must stay suppressed while backfill retry pending: id=%q err=%v", id, err)
+	}
+}
+
+// Completed/dead-lettered jobs must not block a fresh job of either type.
+func TestEnqueueIngestionJob_AllowsAfterTerminalState(t *testing.T) {
+	ctx, q := setupRecoveryDB(t)
+	_, chID := seedChannel(t, ctx, q, "xterminal")
+
+	backfillID, err := q.EnqueueIngestionJob(ctx, chID, "backfill")
+	if err != nil || backfillID == "" {
+		t.Fatalf("backfill enqueue: id=%q err=%v", backfillID, err)
+	}
+	if err := q.MarkJobCompleted(ctx, backfillID); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	pollID, err := q.EnqueueIngestionJob(ctx, chID, "poll")
+	if err != nil || pollID == "" {
+		t.Fatalf("poll after completion want id: id=%q err=%v", pollID, err)
+	}
+	if err := q.MarkJobDeadLettered(ctx, pollID, "dead"); err != nil {
+		t.Fatalf("dead-letter: %v", err)
+	}
+	backfill2, err := q.EnqueueIngestionJob(ctx, chID, "backfill")
+	if err != nil || backfill2 == "" {
+		t.Fatalf("backfill after dead-letter want id: id=%q err=%v", backfill2, err)
+	}
+	if n := countActiveIngestionJobs(t, ctx, q, chID); n != 1 {
+		t.Fatalf("want 1 active after terminal transitions, got %d", n)
+	}
+}
+
+// Suppression is scoped per channel: two channels may each hold an active job.
+func TestEnqueueIngestionJob_DifferentChannelsRunConcurrently(t *testing.T) {
+	ctx, q := setupRecoveryDB(t)
+	_, ch1 := seedChannel(t, ctx, q, "xchan1")
+	_, ch2 := seedChannel(t, ctx, q, "xchan2")
+
+	bf1, err := q.EnqueueIngestionJob(ctx, ch1, "backfill")
+	if err != nil || bf1 == "" {
+		t.Fatalf("ch1 backfill: id=%q err=%v", bf1, err)
+	}
+	bf2, err := q.EnqueueIngestionJob(ctx, ch2, "backfill")
+	if err != nil || bf2 == "" {
+		t.Fatalf("ch2 backfill must not be suppressed: id=%q err=%v", bf2, err)
+	}
+	if n := countActiveIngestionJobs(t, ctx, q, ch1); n != 1 {
+		t.Fatalf("ch1 want 1 active, got %d", n)
+	}
+	if n := countActiveIngestionJobs(t, ctx, q, ch2); n != 1 {
+		t.Fatalf("ch2 want 1 active, got %d", n)
+	}
+}
+
+func llmJobStatus(t *testing.T, ctx context.Context, q *db.SQLiteQuery, id string) string {
+	t.Helper()
+	var status string
+	if err := q.DB().QueryRowContext(ctx, `SELECT status FROM llm_processing_jobs WHERE id = ?`, id).Scan(&status); err != nil {
+		t.Fatalf("read job %s status: %v", id, err)
+	}
+	return status
+}
+
 func TestRecoverStaleLLMJobs(t *testing.T) {
 	ctx, q := setupRecoveryDB(t)
 	jobID, err := q.EnqueueLLMJob(ctx, []string{"c1"}, "p")
@@ -238,6 +349,119 @@ func TestRecoverStaleLLMJobs(t *testing.T) {
 	n, err := q.RecoverStaleLLMJobs(ctx, 15*time.Minute)
 	if err != nil || n != 1 {
 		t.Fatalf("recover want 1 got %d err %v", n, err)
+	}
+	if got := llmJobStatus(t, ctx, q, jobID); got != "failed" {
+		t.Fatalf("stale processing job status = %q, want failed", got)
+	}
+	var completedAt, errMsg sql.NullString
+	if err := q.DB().QueryRowContext(ctx,
+		`SELECT completed_at, error_message FROM llm_processing_jobs WHERE id = ?`, jobID).
+		Scan(&completedAt, &errMsg); err != nil {
+		t.Fatalf("read failed job fields: %v", err)
+	}
+	if !completedAt.Valid || completedAt.String == "" {
+		t.Errorf("failed job must record completed_at")
+	}
+	if !errMsg.Valid || errMsg.String == "" {
+		t.Errorf("failed job must record an error_message")
+	}
+}
+
+// A pending orphan (crash between enqueue and MarkLLMJobProcessing) must be
+// reaped, otherwise its comment set is excluded by the claim query forever.
+func TestRecoverStaleLLMJobs_FailsStalePendingAndClearsWedge(t *testing.T) {
+	ctx, q, chID := retryDB(t, "reap-pending")
+	commentID := insertRetryComment(t, ctx, q, chID, "stale-pending")
+
+	jobID, created, err := q.EnqueueLLMJobIfNotExists(ctx, []string{commentID}, "p")
+	if err != nil || !created {
+		t.Fatalf("enqueue: created=%v err=%v", created, err)
+	}
+	if got := llmJobStatus(t, ctx, q, jobID); got != "pending" {
+		t.Fatalf("fresh job status = %q, want pending", got)
+	}
+	if contains(claimedIDs(t, ctx, q, chID, 3), commentID) {
+		t.Fatalf("pending-orphan comment must be excluded before reaping")
+	}
+
+	old := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
+	if _, err := q.DB().ExecContext(ctx,
+		`UPDATE llm_processing_jobs SET created_at=? WHERE id=?`, old, jobID); err != nil {
+		t.Fatalf("backdate created_at: %v", err)
+	}
+
+	n, err := q.RecoverStaleLLMJobs(ctx, 10*time.Minute)
+	if err != nil || n != 1 {
+		t.Fatalf("recover want 1 got %d err %v", n, err)
+	}
+	if got := llmJobStatus(t, ctx, q, jobID); got != "failed" {
+		t.Fatalf("stale pending job status = %q, want failed", got)
+	}
+	if !contains(claimedIDs(t, ctx, q, chID, 3), commentID) {
+		t.Fatalf("wedge not cleared: comment still excluded after reaping pending orphan")
+	}
+
+	// The identical payload must be enqueueable again as a fresh job.
+	rejobID, created2, err := q.EnqueueLLMJobIfNotExists(ctx, []string{commentID}, "p")
+	if err != nil || !created2 {
+		t.Fatalf("re-enqueue want created: created=%v err=%v", created2, err)
+	}
+	if rejobID == jobID {
+		t.Fatalf("re-enqueue returned the failed job id %q", rejobID)
+	}
+	if got := llmJobStatus(t, ctx, q, rejobID); got != "pending" {
+		t.Fatalf("re-enqueued job status = %q, want pending", got)
+	}
+}
+
+// A pending job that was just created is about to be marked processing by a
+// live worker and must not be reaped by the periodic sweep.
+func TestRecoverStaleLLMJobs_KeepsFreshPending(t *testing.T) {
+	ctx, q, chID := retryDB(t, "reap-fresh")
+	commentID := insertRetryComment(t, ctx, q, chID, "fresh-pending")
+
+	jobID, created, err := q.EnqueueLLMJobIfNotExists(ctx, []string{commentID}, "p")
+	if err != nil || !created {
+		t.Fatalf("enqueue: created=%v err=%v", created, err)
+	}
+
+	n, err := q.RecoverStaleLLMJobs(ctx, 10*time.Minute)
+	if err != nil || n != 0 {
+		t.Fatalf("fresh pending must not be reaped: got n=%d err=%v", n, err)
+	}
+	if got := llmJobStatus(t, ctx, q, jobID); got != "pending" {
+		t.Fatalf("fresh pending job status = %q, want pending", got)
+	}
+	if contains(claimedIDs(t, ctx, q, chID, 3), commentID) {
+		t.Fatalf("live pending job's comment must stay excluded")
+	}
+}
+
+// olderThan == 0 is the post-restart boot sweep: no in-flight work can exist,
+// so every pending/processing row is failed regardless of age.
+func TestRecoverStaleLLMJobs_ZeroAgeReapsPendingAndProcessing(t *testing.T) {
+	ctx, q := setupRecoveryDB(t)
+	pendingID, err := q.EnqueueLLMJob(ctx, []string{"p-pending"}, "p")
+	if err != nil {
+		t.Fatalf("enqueue pending: %v", err)
+	}
+	processingID, err := q.EnqueueLLMJob(ctx, []string{"p-processing"}, "p")
+	if err != nil {
+		t.Fatalf("enqueue processing: %v", err)
+	}
+	if err := q.MarkLLMJobProcessing(ctx, processingID); err != nil {
+		t.Fatalf("mark processing: %v", err)
+	}
+
+	n, err := q.RecoverStaleLLMJobs(ctx, 0)
+	if err != nil || n != 2 {
+		t.Fatalf("zero-age recover want 2 got %d err %v", n, err)
+	}
+	if got := llmJobStatus(t, ctx, q, pendingID); got != "failed" {
+		t.Fatalf("pending job status = %q, want failed", got)
+	}
+	if got := llmJobStatus(t, ctx, q, processingID); got != "failed" {
+		t.Fatalf("processing job status = %q, want failed", got)
 	}
 }
 

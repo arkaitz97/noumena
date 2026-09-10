@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,6 +33,12 @@ type wsMockQuery struct {
 	membersList       []*db.WorkspaceMemberWithEmail
 	addedMember       bool
 	updatedRole       bool
+
+	mu              sync.Mutex
+	trackedChannels map[string]bool
+	grantCalled     bool
+	grantedChannel  string
+	removedMember   bool
 }
 
 func (m *wsMockQuery) CreateWorkspace(ctx context.Context, name, createdBy string) (*db.Workspace, error) {
@@ -42,7 +49,33 @@ func (m *wsMockQuery) CreateWorkspace(ctx context.Context, name, createdBy strin
 }
 
 func (m *wsMockQuery) AddWorkspaceMember(ctx context.Context, workspaceID, userID, role string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.memberCount++
 	m.addedMember = true
+	return nil
+}
+
+func (m *wsMockQuery) AddWorkspaceMemberAtomic(ctx context.Context, workspaceID, userID, role string, limit int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.memberCount >= limit {
+		return db.ErrSeatLimit
+	}
+	m.memberCount++
+	m.addedMember = true
+	return nil
+}
+
+func (m *wsMockQuery) UserTracksChannel(ctx context.Context, userID, channelID string) (bool, error) {
+	return m.trackedChannels[channelID], nil
+}
+
+func (m *wsMockQuery) GrantChannel(ctx context.Context, workspaceID, channelID, grantedBy string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.grantCalled = true
+	m.grantedChannel = channelID
 	return nil
 }
 
@@ -80,6 +113,8 @@ func (m *wsMockQuery) ListWorkspaceMembers(ctx context.Context, workspaceID stri
 }
 
 func (m *wsMockQuery) CountWorkspaceMembers(ctx context.Context, workspaceID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.memberCount, nil
 }
 
@@ -119,6 +154,9 @@ func (m *wsMockQuery) ConsumeWorkspaceInvite(ctx context.Context, inviteID strin
 }
 
 func (m *wsMockQuery) RemoveWorkspaceMember(ctx context.Context, workspaceID, userID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.removedMember = true
 	return nil
 }
 
@@ -343,8 +381,37 @@ func TestWorkspaceHandler_RemoveMember_Success(t *testing.T) {
 	}
 }
 
+func TestWorkspaceHandler_RemoveMember_OwnerRejected(t *testing.T) {
+	// The owner cannot be removed (no ownership-transfer endpoint exists);
+	// the owner must remain a member.
+	q := &wsMockQuery{
+		member:     &db.WorkspaceMember{Role: "admin"},
+		adminCount: 2,
+		isOwner:    true,
+	}
+	h := &api.WorkspaceHandler{Queries: q, Cfg: &config.Config{AppBaseURL: "http://localhost:3000"}}
+
+	req := httptest.NewRequest("DELETE", "/api/workspaces/ws-1/members/user-owner", nil)
+	ctx := context.WithValue(req.Context(), api.UserIDKey, "user-1")
+	req = req.WithContext(ctx)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "ws-1")
+	rctx.URLParams.Add("user_id", "user-owner")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rr := httptest.NewRecorder()
+
+	h.RemoveMember(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 removing the owner, got %d (%s)", rr.Code, rr.Body.String())
+	}
+	if q.removedMember {
+		t.Error("must not remove the workspace owner")
+	}
+}
+
 func TestWorkspaceHandler_ChangeMemberRole(t *testing.T) {
-	q := &wsMockQuery{member: &db.WorkspaceMember{Role: "admin"}}
+	q := &wsMockQuery{member: &db.WorkspaceMember{Role: "admin"}, adminCount: 2}
 	h := &api.WorkspaceHandler{Queries: q, Cfg: &config.Config{AppBaseURL: "http://localhost:3000"}}
 
 	body := `{"role": "analyst"}`
@@ -603,9 +670,11 @@ func TestWorkspaceHandler_AcceptInvite_SeatLimit(t *testing.T) {
 	}
 }
 
-func TestWorkspaceHandler_ChangeMemberRole_SeatLimit(t *testing.T) {
-	// Free plan (1 seat), 1 member -> at cap: role change rejected.
-	q := &wsMockQuery{member: &db.WorkspaceMember{Role: "admin"}, ownerPlan: "free", memberCount: 1}
+func TestWorkspaceHandler_ChangeMemberRole_AtSeatLimitSucceeds(t *testing.T) {
+	// Free plan (1 seat), 1 member -> used == limit. A role change consumes
+	// no seat, so it must still succeed (regression: the old seat-capacity
+	// check wrongly blocked it).
+	q := &wsMockQuery{member: &db.WorkspaceMember{Role: "admin"}, ownerPlan: "free", memberCount: 1, adminCount: 2}
 	h := &api.WorkspaceHandler{Queries: q, Cfg: &config.Config{AppBaseURL: "http://localhost:3000"}}
 
 	body := `{"role": "analyst"}`
@@ -620,14 +689,65 @@ func TestWorkspaceHandler_ChangeMemberRole_SeatLimit(t *testing.T) {
 
 	h.ChangeMemberRole(rr, req)
 
-	if rr.Code != http.StatusConflict {
-		t.Fatalf("expected 409, got %d (%s)", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 at seat cap (role change consumes no seat), got %d (%s)", rr.Code, rr.Body.String())
 	}
-	if !strings.Contains(rr.Body.String(), "seat limit reached") {
-		t.Errorf("expected seat-limit message, got %s", rr.Body.String())
+	if !q.updatedRole {
+		t.Error("expected role to be updated at the seat cap")
+	}
+}
+
+func TestWorkspaceHandler_ChangeMemberRole_LastAdminRejected(t *testing.T) {
+	// Sole admin being demoted: must be refused so the workspace keeps an
+	// admin, and the admin count / role must remain unchanged.
+	q := &wsMockQuery{member: &db.WorkspaceMember{Role: "admin"}, adminCount: 1}
+	h := &api.WorkspaceHandler{Queries: q, Cfg: &config.Config{AppBaseURL: "http://localhost:3000"}}
+
+	body := `{"role": "analyst"}`
+	req := httptest.NewRequest("PATCH", "/api/workspaces/ws-1/members/user-2", bytes.NewBufferString(body))
+	ctx := context.WithValue(req.Context(), api.UserIDKey, "user-1")
+	req = req.WithContext(ctx)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "ws-1")
+	rctx.URLParams.Add("user_id", "user-2")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rr := httptest.NewRecorder()
+
+	h.ChangeMemberRole(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 demoting the last admin, got %d (%s)", rr.Code, rr.Body.String())
 	}
 	if q.updatedRole {
-		t.Error("must not change role when at the seat cap")
+		t.Error("must not change role when demoting the last admin")
+	}
+	if q.adminCount != 1 {
+		t.Errorf("admin count changed: got %d want 1", q.adminCount)
+	}
+}
+
+func TestWorkspaceHandler_ChangeMemberRole_OwnerRejected(t *testing.T) {
+	// The workspace owner must never be demoted.
+	q := &wsMockQuery{member: &db.WorkspaceMember{Role: "admin"}, adminCount: 2, isOwner: true}
+	h := &api.WorkspaceHandler{Queries: q, Cfg: &config.Config{AppBaseURL: "http://localhost:3000"}}
+
+	body := `{"role": "viewer"}`
+	req := httptest.NewRequest("PATCH", "/api/workspaces/ws-1/members/user-owner", bytes.NewBufferString(body))
+	ctx := context.WithValue(req.Context(), api.UserIDKey, "user-1")
+	req = req.WithContext(ctx)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "ws-1")
+	rctx.URLParams.Add("user_id", "user-owner")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rr := httptest.NewRecorder()
+
+	h.ChangeMemberRole(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 demoting the owner, got %d (%s)", rr.Code, rr.Body.String())
+	}
+	if q.updatedRole {
+		t.Error("must not change the workspace owner's role")
 	}
 }
 
@@ -715,5 +835,113 @@ func TestWorkspaceHandler_GetWorkspaceByID_ExposesSeats(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), `"member_count":3`) || !strings.Contains(rr.Body.String(), `"seats_limit":5`) {
 		t.Errorf("expected member_count 3 and seats_limit 5, got %s", rr.Body.String())
+	}
+}
+
+// --- GrantChannel ownership (security fix) ---
+
+func newGrantChannelRequest(t *testing.T, channelID string) *http.Request {
+	t.Helper()
+	req := httptest.NewRequest("POST", "/api/workspaces/ws-1/channels/"+channelID+"/grant", nil)
+	ctx := context.WithValue(req.Context(), api.UserIDKey, "user-1")
+	req = req.WithContext(ctx)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "ws-1")
+	rctx.URLParams.Add("channelId", channelID)
+	return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+}
+
+func TestWorkspaceHandler_GrantChannel_UntrackedRejected(t *testing.T) {
+	// An analyst may only grant channels they already legitimately track;
+	// a guessed/foreign channel UUID must be refused and never inserted.
+	q := &wsMockQuery{member: &db.WorkspaceMember{Role: "analyst"}}
+	h := &api.WorkspaceHandler{Queries: q, Cfg: &config.Config{AppBaseURL: "http://localhost:3000"}}
+
+	rr := httptest.NewRecorder()
+	h.GrantChannel(rr, newGrantChannelRequest(t, "ch-foreign"))
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for an untracked channel, got %d (%s)", rr.Code, rr.Body.String())
+	}
+	if q.grantCalled {
+		t.Error("must not grant a channel the actor does not track")
+	}
+}
+
+func TestWorkspaceHandler_GrantChannel_TrackedSucceeds(t *testing.T) {
+	q := &wsMockQuery{
+		member:          &db.WorkspaceMember{Role: "analyst"},
+		trackedChannels: map[string]bool{"ch-1": true},
+	}
+	h := &api.WorkspaceHandler{Queries: q, Cfg: &config.Config{AppBaseURL: "http://localhost:3000"}}
+
+	rr := httptest.NewRecorder()
+	h.GrantChannel(rr, newGrantChannelRequest(t, "ch-1"))
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for a tracked channel, got %d (%s)", rr.Code, rr.Body.String())
+	}
+	if !q.grantCalled || q.grantedChannel != "ch-1" {
+		t.Errorf("expected grant of ch-1, got called=%v channel=%q", q.grantCalled, q.grantedChannel)
+	}
+}
+
+// --- AcceptInvite atomic seat admission ---
+
+func TestWorkspaceHandler_AcceptInvite_ConcurrentSeatLimit(t *testing.T) {
+	// Studio plan (5 seats), 4 members, two valid invites accepted at the
+	// same time: exactly one may consume the last seat; the other gets 409.
+	// The atomic guarded insert is the authority, so the cap is never
+	// exceeded (regression: check-then-act admitted both).
+	q := &wsMockQuery{
+		createdInvite: makeValidInvite(),
+		ownerPlan:     "studio",
+		memberCount:   4,
+	}
+	h := &api.WorkspaceHandler{Queries: q, Cfg: &config.Config{AppBaseURL: "http://localhost:3000"}}
+
+	type result struct {
+		code int
+		body string
+	}
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	for _, uid := range []string{"user-a", "user-b"} {
+		wg.Add(1)
+		go func(uid string) {
+			defer wg.Done()
+			req := httptest.NewRequest("GET", "/invites/accept?token=tok-"+uid, nil)
+			req = req.WithContext(context.WithValue(req.Context(), api.UserIDKey, uid))
+			rr := httptest.NewRecorder()
+			h.AcceptInvite(rr, req)
+			results <- result{code: rr.Code, body: rr.Body.String()}
+		}(uid)
+	}
+	wg.Wait()
+	close(results)
+
+	var redirects, conflicts int
+	for r := range results {
+		switch r.code {
+		case http.StatusFound:
+			redirects++
+		case http.StatusConflict:
+			conflicts++
+			if !strings.Contains(r.body, "seat limit reached") {
+				t.Errorf("expected seat-limit message, got %s", r.body)
+			}
+		default:
+			t.Errorf("unexpected status %d (%s)", r.code, r.body)
+		}
+	}
+	if redirects != 1 || conflicts != 1 {
+		t.Fatalf("expected exactly one 302 and one 409, got %d redirects and %d conflicts", redirects, conflicts)
+	}
+
+	q.mu.Lock()
+	got := q.memberCount
+	q.mu.Unlock()
+	if got != 5 {
+		t.Fatalf("expected exactly 5 members after concurrent accepts, got %d", got)
 	}
 }

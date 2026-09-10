@@ -165,14 +165,26 @@ func VerifyIDToken(ctx context.Context, idToken string) (*IDClaims, error) {
 	if !ok || !parsed.Valid {
 		return nil, errors.New("invalid id token")
 	}
-	if claims.Aud != config.Default.GoogleSSOClientID {
-		return nil, fmt.Errorf("id token aud mismatch")
-	}
-	if claims.Iss != "https://accounts.google.com" && claims.Iss != "accounts.google.com" {
-		return nil, fmt.Errorf("id token iss mismatch")
-	}
-	if claims.Email == "" || claims.Sub == "" {
-		return nil, fmt.Errorf("id token missing email or sub")
+	if err := validateIDClaims(claims); err != nil {
+		return nil, err
 	}
 	return claims, nil
+}
+
+// validateIDClaims enforces the claim invariants every Google ID token must
+// satisfy after signature verification.
+func validateIDClaims(claims *IDClaims) error {
+	if claims.Aud != config.Default.GoogleSSOClientID {
+		return fmt.Errorf("id token aud mismatch")
+	}
+	if claims.Iss != "https://accounts.google.com" && claims.Iss != "accounts.google.com" {
+		return fmt.Errorf("id token iss mismatch")
+	}
+	if claims.Email == "" || claims.Sub == "" {
+		return fmt.Errorf("id token missing email or sub")
+	}
+	if !claims.EmailVerified {
+		return errors.New("id token email not verified")
+	}
+	return nil
 }

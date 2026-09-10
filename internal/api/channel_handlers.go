@@ -41,7 +41,17 @@ type ChannelHandler struct {
 	// YouTubeResolver resolves public channels by @handle/URL for OAuth-free
 	// competitor tracking. May be nil; ConnectYouTubeByName returns 503 then.
 	YouTubeResolver YouTubeChannelResolver
+	// OAuthExchanger swaps an authorization code for tokens + channel
+	// metadata. May be nil; the handler then falls back to
+	// oauth.ExchangeAndFetchChannel. Injectable so tests can exercise the
+	// upstream-failure path without calling Google.
+	OAuthExchanger OAuthExchanger
 }
+
+// OAuthExchanger is the contract for swapping a Google authorization code for
+// an OAuth token pair and the authorizing channel's metadata. Satisfied in
+// production by the function value oauth.ExchangeAndFetchChannel.
+type OAuthExchanger func(ctx context.Context, code string) (*oauth2.Token, *ingestion.ChannelInfo, error)
 
 // YouTubeChannelResolver resolves a public YouTube channel from a user
 // supplied handle or URL reference. Satisfied by *ingestion.YouTubeClient
@@ -203,7 +213,7 @@ func (h *ChannelHandler) ExchangeYouTubeCode(w http.ResponseWriter, r *http.Requ
 	if !h.requirePlanCapacity(w, r, userID) {
 		return
 	}
-	token, info, ok := exchangeOAuthCode(w, r, req.Code)
+	token, info, ok := h.exchangeOAuthCode(w, r, req.Code)
 	if !ok {
 		return
 	}
@@ -276,8 +286,12 @@ func (h *ChannelHandler) requirePlanCapacity(w http.ResponseWriter, r *http.Requ
 }
 
 // exchangeOAuthCode swaps the one-time code and fetches the channel metadata.
-func exchangeOAuthCode(w http.ResponseWriter, r *http.Request, code string) (*oauth2.Token, *ingestion.ChannelInfo, bool) {
-	token, info, err := oauth.ExchangeAndFetchChannel(r.Context(), code)
+func (h *ChannelHandler) exchangeOAuthCode(w http.ResponseWriter, r *http.Request, code string) (*oauth2.Token, *ingestion.ChannelInfo, bool) {
+	exchanger := h.OAuthExchanger
+	if exchanger == nil {
+		exchanger = oauth.ExchangeAndFetchChannel
+	}
+	token, info, err := exchanger(r.Context(), code)
 	if err == nil {
 		return token, info, true
 	}
@@ -286,7 +300,11 @@ func exchangeOAuthCode(w http.ResponseWriter, r *http.Request, code string) (*oa
 			"google did not return a refresh token; revoke the app at myaccount.google.com/permissions and try again")
 		return nil, nil, false
 	}
-	writeChannelError(w, http.StatusBadRequest, "exchange_failed", err.Error())
+	// SECURITY: the raw upstream error can carry Google endpoints, request
+	// payload fragments, and library internals. Keep the detail server-side
+	// and return a stable, generic client message.
+	log.Printf("youtube oauth code exchange failed: %v", err)
+	writeChannelError(w, http.StatusBadRequest, "exchange_failed", "could not exchange authorization code")
 	return nil, nil, false
 }
 
@@ -437,7 +455,10 @@ func (h *ChannelHandler) ConnectYouTubeByName(w http.ResponseWriter, r *http.Req
 	}
 	info, err := h.YouTubeResolver.ResolveChannelRef(r.Context(), req.Ref)
 	if err != nil {
-		writeChannelError(w, http.StatusBadRequest, "resolve_failed", err.Error())
+		// SECURITY: the resolver error can carry upstream endpoint URLs and
+		// response fragments; log it and return a stable client message.
+		log.Printf("youtube channel resolve failed for ref %q: %v", req.Ref, err)
+		writeChannelError(w, http.StatusBadRequest, "resolve_failed", "could not resolve channel")
 		return
 	}
 	// Tokenless row: empty tokens + zero expiry. Ingestion reads public
@@ -525,7 +546,7 @@ func (h *ChannelHandler) ExchangeReauthorize(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
-	token, info, ok := exchangeOAuthCode(w, r, req.Code)
+	token, info, ok := h.exchangeOAuthCode(w, r, req.Code)
 	if !ok {
 		return
 	}
@@ -849,6 +870,12 @@ func checkChannelLimit(ctx context.Context, q db.DBQuery, userID string) (blocke
 	user, err := q.GetUserByID(ctx, userID)
 	if err != nil || user == nil {
 		return false, err
+	}
+	// A paused subscription means the 3-day past-due grace expired and the
+	// user is delinquent. Block new connects (and the backfills they trigger)
+	// regardless of plan capacity, matching the LLM processor's guard.
+	if user.SubscriptionStatus == "paused" {
+		return true, nil
 	}
 	plan := user.SubscriptionPlan
 	if plan == "" {

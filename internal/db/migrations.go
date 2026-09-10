@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 )
 
 // Versioned SQLite migrations.
@@ -547,6 +548,25 @@ FROM users`); err != nil {
 			return nil
 		},
 	},
+	{
+		version: 19,
+		name:    "unique active LLM job per comment set",
+		run: func(ctx context.Context, tx *sql.Tx) error {
+			// Two workers can both miss the SELECT-then-INSERT dedupe in
+			// EnqueueLLMJobIfNotExists and both insert a pending job for the
+			// same comment_ids, causing duplicate classification and duplicate
+			// quota charges. This partial unique index is the durable backstop:
+			// at most one active (pending/processing) job per comment set. The
+			// predicate deliberately excludes terminal rows (failed/completed)
+			// so re-enqueuing the same set after a terminal job still succeeds.
+			if _, err := tx.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_llm_jobs_active_comment_ids
+				ON llm_processing_jobs(comment_ids)
+				WHERE status IN ('pending','processing')`); err != nil {
+				return fmt.Errorf("create idx_llm_jobs_active_comment_ids: %w", err)
+			}
+			return nil
+		},
+	},
 }
 
 // Migrate applies all pending migrations to the given database inside a
@@ -555,41 +575,205 @@ FROM users`); err != nil {
 // connection (the noFK migrations toggle PRAGMA foreign_keys, which is a
 // per-connection setting).
 func Migrate(ctx context.Context, database *sql.DB) error {
-	if _, err := database.ExecContext(ctx, `
+	// Serialize the check-and-apply critical section across processes.
+	// Two API processes booting together on the same SQLite file would
+	// otherwise each read an empty applied set and apply the same
+	// migration, colliding on schema_migrations' PK (or, worse, racing a
+	// users rebuild). The lock is a single logically-owned row in SQLite
+	// itself: acquiring is an atomic UPDATE, so every contender but one
+	// observes 0 rows affected and waits. The applied set is re-read only
+	// after the lock is held, so a waiter sees the winner's writes.
+	return withMigrationLock(ctx, database, func() error {
+		// Created under the lock: concurrent DDL on the ledger table is
+		// the exact race the lock exists to prevent.
+		if _, err := retryBusy(ctx, database, `
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
     applied_at TEXT NOT NULL
 )`); err != nil {
-		return fmt.Errorf("create schema_migrations: %w", err)
-	}
+			return fmt.Errorf("create schema_migrations: %w", err)
+		}
 
-	applied := map[int]bool{}
-	rows, err := database.QueryContext(ctx, `SELECT version FROM schema_migrations`)
-	if err != nil {
-		return fmt.Errorf("read schema_migrations: %w", err)
-	}
-	for rows.Next() {
-		var v int
-		if err := rows.Scan(&v); err != nil {
-			rows.Close()
+		applied := map[int]bool{}
+		rows, err := database.QueryContext(ctx, `SELECT version FROM schema_migrations`)
+		if err != nil {
+			return fmt.Errorf("read schema_migrations: %w", err)
+		}
+		for rows.Next() {
+			var v int
+			if err := rows.Scan(&v); err != nil {
+				rows.Close()
+				return err
+			}
+			applied[v] = true
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
 			return err
 		}
-		applied[v] = true
+
+		for _, m := range migrations {
+			if applied[m.version] {
+				continue
+			}
+			if err := runMigrationWithRetry(ctx, database, m); err != nil {
+				return fmt.Errorf("migration v%d (%s): %w", m.version, m.name, err)
+			}
+		}
+		return nil
+	})
+}
+
+// runMigrationWithRetry wraps runMigration in a bounded retry for
+// transient SQLITE_BUSY. The lock keeps other migration processes out,
+// but a contender's initial lock-acquisition write (and any external app
+// write) can briefly invalidate our snapshot; the driver surfaces that as
+// an immediate BUSY that bypasses busy_timeout. A failed migration is
+// fully transactional (runMigration rolls back), so re-running it is safe.
+func runMigrationWithRetry(ctx context.Context, database *sql.DB, m migration) error {
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		err := runMigration(ctx, database, m)
+		if err == nil {
+			return nil
+		}
+		if !strings.Contains(err.Error(), "database is locked") {
+			return err
+		}
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		if time.Now().After(deadline) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+}
+
+// migrationLockStaleAfter bounds how long a lock may stay held before a
+// later boot assumes the holder crashed and takes over. Migrations are
+// sub-second; the margin is generous so a legitimately slow migration is
+// never preempted.
+const migrationLockStaleAfter = 5 * time.Minute
+
+// withMigrationLock runs fn while holding the cross-process migration
+// lock. The waiting loop is read-only while another holder owns the lock,
+// so waiters never contend with the holder's writes. A crash leaves
+// locked=1; the stale timeout recovers it on the next boot.
+func withMigrationLock(ctx context.Context, database *sql.DB, fn func() error) error {
+	if err := ensureMigrationLock(ctx, database); err != nil {
+		return fmt.Errorf("migration lock table: %w", err)
+	}
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		acquired, err := tryAcquireMigrationLock(ctx, database)
+		if err == nil && acquired {
+			defer func() {
+				_, _ = retryBusy(context.WithoutCancel(ctx), database,
+					`UPDATE schema_migration_lock SET locked=0 WHERE id=1`)
+			}()
+			return fn()
+		}
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				return fmt.Errorf("acquire migration lock: %w", err)
+			}
+			return fmt.Errorf("acquire migration lock: timed out")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
+func ensureMigrationLock(ctx context.Context, database *sql.DB) error {
+	if _, err := retryBusy(ctx, database, `
+CREATE TABLE IF NOT EXISTS schema_migration_lock (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    locked INTEGER NOT NULL DEFAULT 0,
+    locked_at TEXT
+)`); err != nil {
 		return err
 	}
+	_, err := retryBusy(ctx, database,
+		`INSERT OR IGNORE INTO schema_migration_lock (id, locked) VALUES (1, 0)`)
+	return err
+}
 
-	for _, m := range migrations {
-		if applied[m.version] {
-			continue
+// tryAcquireMigrationLock takes the lock if it is free, or if it has been
+// held longer than migrationLockStaleAfter (crashed holder). It reads the
+// current state first: while another process owns the lock the waiter issues
+// no write at all, so it cannot disturb the holder's migrations. The UPDATE
+// is atomic, so exactly one contender can succeed per state.
+func tryAcquireMigrationLock(ctx context.Context, database *sql.DB) (bool, error) {
+	var locked int
+	var lockedAt sql.NullString
+	if err := database.QueryRowContext(ctx,
+		`SELECT locked, locked_at FROM schema_migration_lock WHERE id=1`).
+		Scan(&locked, &lockedAt); err != nil {
+		return false, err
+	}
+	if locked == 1 && !migrationLockIsStale(lockedAt) {
+		return false, nil
+	}
+	res, err := database.ExecContext(ctx, `
+UPDATE schema_migration_lock
+SET locked=1, locked_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE id=1 AND (locked=0 OR (locked=1 AND locked_at IS NOT NULL AND locked_at < ?))`,
+		time.Now().UTC().Add(-migrationLockStaleAfter).Format(time.RFC3339))
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
+}
+
+func migrationLockIsStale(lockedAt sql.NullString) bool {
+	if !lockedAt.Valid {
+		return true
+	}
+	t, err := time.Parse(time.RFC3339, lockedAt.String)
+	if err != nil {
+		return true
+	}
+	return time.Since(t) > migrationLockStaleAfter
+}
+
+// retryBusy runs a single write statement, retrying while SQLite reports
+// the database is locked. SQLITE_BUSY / SQLITE_BUSY_SNAPSHOT are returned
+// immediately by the driver (bypassing busy_timeout) when a snapshot is
+// invalidated, so a bounded retry loop is required for correctness at boot.
+func retryBusy(ctx context.Context, database *sql.DB, query string, args ...any) (sql.Result, error) {
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		res, err := database.ExecContext(ctx, query, args...)
+		if err == nil {
+			return res, nil
 		}
-		if err := runMigration(ctx, database, m); err != nil {
-			return fmt.Errorf("migration v%d (%s): %w", m.version, m.name, err)
+		if !strings.Contains(err.Error(), "database is locked") {
+			return nil, err
+		}
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, cerr
+		}
+		if time.Now().After(deadline) {
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(25 * time.Millisecond):
 		}
 	}
-	return nil
 }
 
 func runMigration(ctx context.Context, database *sql.DB, m migration) error {
@@ -629,9 +813,26 @@ func runMigration(ctx context.Context, database *sql.DB, m migration) error {
 
 	if restoreFK {
 		// Prove the rebuild left referential integrity intact.
-		var violations int
-		if err := database.QueryRowContext(ctx, `PRAGMA foreign_key_check`).Scan(&violations); err == nil && violations > 0 {
-			return fmt.Errorf("foreign_key_check: %d violations after v%d", violations, m.version)
+		// PRAGMA foreign_key_check returns one row per violation with
+		// columns (table, rowid, parent, fkid); a single-int Scan would
+		// always error and silently skip the check. Iterate instead.
+		vrows, err := database.QueryContext(ctx, `PRAGMA foreign_key_check`)
+		if err != nil {
+			return fmt.Errorf("foreign_key_check after v%d: %w", m.version, err)
+		}
+		defer vrows.Close()
+		for vrows.Next() {
+			var table, parent sql.NullString
+			var rowid sql.NullInt64
+			var fkid int
+			if err := vrows.Scan(&table, &rowid, &parent, &fkid); err != nil {
+				return fmt.Errorf("foreign_key_check scan after v%d: %w", m.version, err)
+			}
+			return fmt.Errorf("foreign_key_check: violation in table %q rowid %v references %q (fk %d) after v%d",
+				table.String, rowid, parent.String, fkid, m.version)
+		}
+		if err := vrows.Err(); err != nil {
+			return fmt.Errorf("foreign_key_check after v%d: %w", m.version, err)
 		}
 	}
 	return nil

@@ -194,7 +194,7 @@ func (q *SQLiteQuery) GetStalePendingDigests(ctx context.Context, olderThan time
 		FROM weekly_digests
 		WHERE status = 'pending' AND created_at < ?
 	`
-	rows, err := q.db.QueryContext(ctx, sqlStr, olderThan.Format(time.RFC3339))
+	rows, err := q.db.QueryContext(ctx, sqlStr, olderThan.UTC().Format(time.RFC3339))
 	if err != nil {
 		return nil, err
 	}
@@ -215,8 +215,8 @@ func (q *SQLiteQuery) GetDeferredDigestsDue(ctx context.Context, now time.Time, 
 	if limit <= 0 {
 		limit = 50
 	}
-	retryAfter := now.Add(-24 * time.Hour).Format(time.RFC3339)
-	expireAfter := now.Add(-7 * 24 * time.Hour).Format(time.RFC3339)
+	retryAfter := now.Add(-24 * time.Hour).UTC().Format(time.RFC3339)
+	expireAfter := now.Add(-7 * 24 * time.Hour).UTC().Format(time.RFC3339)
 	const sqlStr = `
 		SELECT id, user_id, week_start_date, status,
 		       COALESCE(content, ''), emailed_at, created_at
@@ -418,11 +418,11 @@ func parseTimePtr(s sql.NullString) *time.Time {
 func (q *SQLiteQuery) MarkDigestEmailed(ctx context.Context, digestID, userID string, at time.Time) error {
 	if _, err := q.db.ExecContext(ctx,
 		`UPDATE weekly_digests SET emailed_at = ? WHERE id = ?`,
-		at.Format(time.RFC3339), digestID); err != nil {
+		at.UTC().Format(time.RFC3339), digestID); err != nil {
 		return err
 	}
 	_, err := q.db.ExecContext(ctx,
 		`UPDATE users SET digest_email_sent_at = ? WHERE id = ?`,
-		at.Format(time.RFC3339), userID)
+		at.UTC().Format(time.RFC3339), userID)
 	return err
 }

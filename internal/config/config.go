@@ -530,16 +530,20 @@ func Load(strict bool) (*Config, error) {
 		c.ExportPreDeleteTimeout, _ = envDuration("EXPORT_PRE_DELETE_TIMEOUT", v)
 	}
 
-	if c.LifecycleWorkersEnabled {
+	// Signed-URL endpoints are reachable whenever the workers emit links or
+	// the account lifecycle API serves downloads, so the signing secret and
+	// the export storage dir must be present in either case. Without the
+	// secret a booted API would accept an HMAC forged with an empty key.
+	if c.LifecycleWorkersEnabled || c.AccountLifecycleAPIEnabled {
 		if c.ExportSignedURLSecret == "" {
-			return nil, fmt.Errorf("LIFECYCLE_WORKERS_ENABLED=true but EXPORT_SIGNED_URL_SECRET is unset")
+			return nil, fmt.Errorf("EXPORT_SIGNED_URL_SECRET is unset (required when LIFECYCLE_WORKERS_ENABLED=true or ACCOUNT_LIFECYCLE_API_ENABLED=true)")
 		}
 		if c.ExportStorageDir == "" {
-			return nil, fmt.Errorf("LIFECYCLE_WORKERS_ENABLED=true but EXPORT_STORAGE_DIR is unset")
+			return nil, fmt.Errorf("EXPORT_STORAGE_DIR is unset (required when LIFECYCLE_WORKERS_ENABLED=true or ACCOUNT_LIFECYCLE_API_ENABLED=true)")
 		}
-		if !c.EmailEnabled {
-			return nil, fmt.Errorf("LIFECYCLE_WORKERS_ENABLED=true requires EMAIL_ENABLED=true")
-		}
+	}
+	if c.LifecycleWorkersEnabled && !c.EmailEnabled {
+		return nil, fmt.Errorf("LIFECYCLE_WORKERS_ENABLED=true requires EMAIL_ENABLED=true")
 	}
 
 	// --- OpenTelemetry ----------------------------------------------------

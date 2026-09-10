@@ -10,7 +10,7 @@ import (
 
 type fakeSchedDB struct {
 	channels  []*db.PlatformChannel
-	enqueued  map[string]string // platformChannelID|jobType -> jobID
+	enqueued  map[string]string // platformChannelID -> jobID
 	idCounter int
 }
 
@@ -22,9 +22,9 @@ func (f *fakeSchedDB) EnqueueIngestionJob(ctx context.Context, platformChannelID
 	if f.enqueued == nil {
 		f.enqueued = map[string]string{}
 	}
-	key := platformChannelID + "|" + jobType
+	key := platformChannelID
 	if _, exists := f.enqueued[key]; exists {
-		return "", nil // idempotent: already pending
+		return "", nil // idempotent: any pending/running job for this channel
 	}
 	f.idCounter++
 	id := "job-"
@@ -72,6 +72,24 @@ func TestScheduler_IdempotentAcrossTicks(t *testing.T) {
 	}
 	if res.Backfills != 0 || res.Polls != 0 || res.Skipped != 2 {
 		t.Fatalf("expected all skipped on second tick, got %+v", res)
+	}
+}
+
+// A poll for a channel with an in-flight backfill must be skipped: cross-type
+// enqueue dedupe is the SQLite substitute for the no-op channel lock.
+func TestScheduler_PollSuppressedByInFlightBackfill(t *testing.T) {
+	old := time.Now().Add(-2 * time.Hour)
+	f := &fakeSchedDB{
+		channels: []*db.PlatformChannel{{ID: "c1", LastSyncedAt: &old}},
+		enqueued: map[string]string{"c1": "job-inflight-backfill"},
+	}
+	s := NewScheduler(f, 30)
+	res, err := s.Tick(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Polls != 0 || res.Skipped != 1 {
+		t.Fatalf("poll must be suppressed by in-flight backfill, got %+v", res)
 	}
 }
 

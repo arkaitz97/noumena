@@ -3,8 +3,10 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -91,9 +93,18 @@ type UserExportBundle struct {
 	User     *User
 	Profile  *UserProfile
 	Tracking []*UserChannelTracking
-	Comments []*Comment
+	Comments []*ExportComment
 	Digests  []*WeeklyDigest
 	Stars    []*UserCommentStar
+}
+
+// ExportComment is the GDPR-bundle view of a comment. It embeds the
+// canonical Comment row and adds SentimentScore, which the feed model
+// does not carry but the comments table stores (-1/0/1; NULL = unscored).
+// Populated only by GetUserExportBundle so the export is self-contained.
+type ExportComment struct {
+	*Comment
+	SentimentScore *int `json:"sentiment_score,omitempty"`
 }
 
 func (q *SQLiteQuery) ScheduleAccountDeletion(ctx context.Context, userID string, totalChannels int) (*AccountDeletionJob, error) {
@@ -463,6 +474,8 @@ func (q *SQLiteQuery) DeleteUserGDPRData(ctx context.Context, tx *sql.Tx, userID
 		{`DELETE FROM user_comment_stars WHERE user_id = ?`, userID},
 		{`DELETE FROM comment_usage_logs WHERE user_id = ?`, userID},
 		{`DELETE FROM comment_exports WHERE user_id = ?`, userID},
+		{`DELETE FROM email_send_log WHERE user_id = ?`, userID},
+		{`DELETE FROM audit_log WHERE user_id = ?`, userID},
 		{`DELETE FROM workspace_members WHERE user_id = ?`, userID},
 		{`DELETE FROM rate_limit_buckets WHERE user_key = ?`, "u:" + userID},
 		{`DELETE FROM user_channel_tracking WHERE user_id = ?`, userID},
@@ -492,8 +505,12 @@ func (q *SQLiteQuery) EnqueueDataExport(ctx context.Context, userID string) (*Da
 	if err == nil {
 		return job, nil
 	}
-	// Check for unique constraint violation (in-flight job exists)
-	if err != nil {
+	// Only a partial-unique-index collision (one in-flight job per user)
+	// means "an export is already queued/exporting". Any other failure
+	// (disk full, missing table, FK violation) is a real DB error and
+	// must surface as-is instead of being masked as ErrNotFound by the
+	// inflight lookup.
+	if strings.Contains(err.Error(), "UNIQUE constraint failed") {
 		return q.getInflightExport(ctx, userID)
 	}
 	return nil, err
@@ -554,13 +571,13 @@ func (q *SQLiteQuery) MarkDataExportCompleted(ctx context.Context, jobID, userID
 		UPDATE data_export_jobs
 		SET status='completed', export_url=?,
 		    expires_at=?, completed_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-		WHERE id=?`, downloadURL, expiresAt.Format(time.RFC3339), jobID); err != nil {
+		WHERE id=?`, downloadURL, expiresAt.UTC().Format(time.RFC3339), jobID); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE users
 		SET data_export_url=?, data_export_expires_at=?, updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-		WHERE id=?`, downloadURL, expiresAt.Format(time.RFC3339), userID); err != nil {
+		WHERE id=?`, downloadURL, expiresAt.UTC().Format(time.RFC3339), userID); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -635,7 +652,7 @@ func (q *SQLiteQuery) ListExpiredDataExports(ctx context.Context, now time.Time)
 	rows, err := q.db.QueryContext(ctx, `
 		SELECT `+dataExportJobColumns+`
 		FROM data_export_jobs
-		WHERE expires_at IS NOT NULL AND expires_at < ? AND export_url IS NOT NULL`, now.Format(time.RFC3339))
+		WHERE expires_at IS NOT NULL AND expires_at < ? AND export_url IS NOT NULL`, now.UTC().Format(time.RFC3339))
 	if err != nil {
 		return nil, err
 	}
@@ -651,12 +668,45 @@ func (q *SQLiteQuery) ListExpiredDataExports(ctx context.Context, now time.Time)
 	return out, rows.Err()
 }
 
+// ClearExportStoragePath nulls a completed job's export_url after its
+// ZIP has been removed by TTL cleanup. MarkDataExportCompleted mirrored
+// the same URL onto users.data_export_url, so that pointer is stale too;
+// clear it in the same transaction. The user pointer is only cleared
+// when it still equals this job's URL, so cleaning an older expired job
+// never wipes the dashboard link of a newer export.
 func (q *SQLiteQuery) ClearExportStoragePath(ctx context.Context, jobID string) error {
-	_, err := q.db.ExecContext(ctx, `
+	tx, err := q.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var userID string
+	var exportURL sql.NullString
+	if err := tx.QueryRowContext(ctx,
+		`SELECT user_id, export_url FROM data_export_jobs WHERE id = ?`, jobID).
+		Scan(&userID, &exportURL); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
 		UPDATE data_export_jobs
 		SET export_url=NULL
-		WHERE id=?`, jobID)
-	return err
+		WHERE id=?`, jobID); err != nil {
+		return err
+	}
+	if exportURL.Valid {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE users
+			SET data_export_url=NULL, data_export_expires_at=NULL,
+			    updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+			WHERE id=? AND data_export_url=?`, userID, exportURL.String); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 const dataExportJobColumns = `id, user_id, status, export_url,
@@ -718,6 +768,60 @@ func scanDataExportJobRows(rows *sql.Rows) (*DataExportJob, error) {
 	return j, nil
 }
 
+// scanExportCommentRow scans the GDPR-bundle comment projection (the
+// canonical columns plus video_id, video_title and sentiment_score) into
+// an ExportComment. It is deliberately independent of scanCommentRow,
+// which serves the feed's fixed column set.
+func scanExportCommentRow(rows *sql.Rows) (*ExportComment, error) {
+	c := &Comment{}
+	var parentCommentID, authorHandle, category, topic sql.NullString
+	var postedAt, actionableInsights, videoID, videoTitle, processedAt, createdAt sql.NullString
+	var confidence sql.NullFloat64
+	var sentimentScore sql.NullInt64
+	if err := rows.Scan(
+		&c.ID, &c.PlatformChannelID, &c.PlatformCommentID, &parentCommentID, &c.ReplyDepth,
+		&authorHandle, &c.Body, &postedAt, &category, &actionableInsights,
+		&topic, &confidence, &videoID, &videoTitle, &sentimentScore,
+		&processedAt, &createdAt,
+	); err != nil {
+		return nil, err
+	}
+	if parentCommentID.Valid {
+		c.ParentCommentID = &parentCommentID.String
+	}
+	if authorHandle.Valid {
+		c.AuthorHandle = &authorHandle.String
+	}
+	if category.Valid {
+		c.Category = &category.String
+	}
+	if topic.Valid {
+		c.Topic = &topic.String
+	}
+	if confidence.Valid {
+		c.Confidence = &confidence.Float64
+	}
+	if actionableInsights.Valid {
+		c.ActionableInsights = json.RawMessage(actionableInsights.String)
+	}
+	if videoID.Valid {
+		c.VideoID = &videoID.String
+	}
+	if videoTitle.Valid {
+		c.VideoTitle = &videoTitle.String
+	}
+	c.PostedAt = parseTime(postedAt.String)
+	c.ProcessedAt = parseTimePtr(processedAt)
+	c.CreatedAt = parseTime(createdAt.String)
+
+	ec := &ExportComment{Comment: c}
+	if sentimentScore.Valid {
+		v := int(sentimentScore.Int64)
+		ec.SentimentScore = &v
+	}
+	return ec, nil
+}
+
 func (q *SQLiteQuery) GetUserExportBundle(ctx context.Context, userID string) (*UserExportBundle, error) {
 	user, err := q.GetUserByID(ctx, userID)
 	if err != nil {
@@ -756,6 +860,7 @@ func (q *SQLiteQuery) GetUserExportBundle(ctx context.Context, userID string) (*
 		SELECT c.id, c.platform_channel_id, c.platform_comment_id,
 		       c.parent_comment_id, c.reply_depth, c.author_handle, c.body, c.posted_at,
 		       c.category, c.actionable_insights, c.topic, c.confidence,
+		       c.video_id, c.video_title, c.sentiment_score,
 		       c.processed_at, c.created_at
 		FROM comments c
 		WHERE c.platform_channel_id IN (
@@ -766,7 +871,7 @@ func (q *SQLiteQuery) GetUserExportBundle(ctx context.Context, userID string) (*
 		return nil, err
 	}
 	for commentRows.Next() {
-		c, err := scanCommentRow(commentRows)
+		c, err := scanExportCommentRow(commentRows)
 		if err != nil {
 			commentRows.Close()
 			return nil, err

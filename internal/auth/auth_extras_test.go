@@ -2,6 +2,7 @@ package auth_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -275,6 +276,35 @@ func TestRefreshTokenExpired(t *testing.T) {
 	}
 }
 
+// A refresh token minted before a token_version bump must not be rotatable
+// afterwards, even when the bumping code path failed to delete the row. The
+// version bound into the raw token is compared against the user's current
+// version, and the stale row is swept on rejection.
+func TestRotateRefreshTokenRejectsPreBumpToken(t *testing.T) {
+	store := newMemStore()
+	ctx := context.Background()
+
+	raw, _, err := auth.IssueRefreshToken(ctx, store, "user-v")
+	if err != nil {
+		t.Fatalf("IssueRefreshToken: %v", err)
+	}
+	if len(store.rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(store.rows))
+	}
+
+	// Simulate token_version being bumped without sweeping the row.
+	store.mu.Lock()
+	store.versions["user-v"] = 1
+	store.mu.Unlock()
+
+	if _, _, _, err := auth.RotateRefreshToken(ctx, store, raw); !errors.Is(err, auth.ErrInvalidRefreshToken) {
+		t.Fatalf("expected ErrInvalidRefreshToken for pre-bump token, got %v", err)
+	}
+	if len(store.rows) != 0 {
+		t.Errorf("stale row not swept on rejection: got %d rows", len(store.rows))
+	}
+}
+
 func TestRevokeAllRefreshTokensForUser(t *testing.T) {
 	store := newMemStore()
 	ctx := context.Background()
@@ -289,5 +319,15 @@ func TestRevokeAllRefreshTokensForUser(t *testing.T) {
 	}
 	if len(store.rows) != 1 {
 		t.Errorf("want 1 row remaining, got %d", len(store.rows))
+	}
+	// Every u1 row is gone; the only survivor belongs to u2.
+	for _, r := range store.rows {
+		if r.userID != "u2" {
+			t.Errorf("unexpected surviving row for user %q", r.userID)
+		}
+	}
+	// Revoking for a user with no rows is a no-op, not an error.
+	if err := store.DeleteAllRefreshTokensForUser(ctx, "ghost"); err != nil {
+		t.Errorf("DeleteAllRefreshTokensForUser(ghost): %v", err)
 	}
 }

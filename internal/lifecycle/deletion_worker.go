@@ -23,6 +23,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,6 +35,10 @@ import (
 	"noumena/internal/email"
 	"noumena/internal/telemetry"
 )
+
+// removeAll is a seam so tests can force the export-dir removal to fail
+// and assert that runFinalStage aborts before the irreversible DB wipe.
+var removeAll = os.RemoveAll
 
 // DeletionWorker is the long-lived ticker. Construct via NewDeletionWorker;
 // call Start(ctx) once. The worker exits when ctx is cancelled.
@@ -367,9 +374,42 @@ func (w *DeletionWorker) dropPlatformChannel(ctx context.Context, platformChanne
 	return tx2.Commit()
 }
 
+// removeUserExportDir deletes the whole per-user GDPR export directory
+// <ExportStorageDir>/<userID>, including any completed export ZIPs. It
+// must run BEFORE the DB rows that locate those files are wiped. A nil
+// or empty configured storage dir is treated as "nothing on disk" (the
+// same guard cleanup.go uses). The user id is lexically contained to the
+// configured root so a malformed id can never escape it; os.RemoveAll
+// does not follow symlinks, so a symlinked entry is unlinked, not
+// traversed.
+func (w *DeletionWorker) removeUserExportDir(userID string) error {
+	if w.Cfg == nil || w.Cfg.ExportStorageDir == "" {
+		return nil
+	}
+	base := filepath.Clean(w.Cfg.ExportStorageDir)
+	target := filepath.Clean(filepath.Join(base, userID))
+	rel, err := filepath.Rel(base, target)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("refusing to remove export dir outside storage root: %q", target)
+	}
+	if err := removeAll(target); err != nil {
+		return fmt.Errorf("remove export dir %s: %w", target, err)
+	}
+	return nil
+}
+
 // runFinalStage: drop digests, remaining stars, auth tokens; emit the
 // deletion_completed email; hard-delete the user; close the job.
 func (w *DeletionWorker) runFinalStage(ctx context.Context, job *db.AccountDeletionJob, user *db.User) error {
+	// Purge the on-disk GDPR export bundle first. The DB rows that would
+	// otherwise let a cleanup sweep locate it are removed by the wipe
+	// below, so this is the last chance to delete it. If this fails we
+	// must NOT proceed: the ZIP holds full PII and we would be making it
+	// permanently unreachable.
+	if err := w.removeUserExportDir(job.UserID); err != nil {
+		return fmt.Errorf("remove export dir: %w", err)
+	}
+
 	tx, err := w.Pool.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -408,12 +448,23 @@ func (w *DeletionWorker) runFinalStage(ctx context.Context, job *db.AccountDelet
 	// present, and re-run the final stage. The deletion_completed email
 	// is idempotency-keyed by user-id so it won't re-send.
 
-	// Audit log before hard delete (user_id FK will be SET NULL after delete).
-	_ = w.Queries.InsertAuditLog(ctx, user.ID, "deletion_completed", `{"user_id":"`+user.ID+`"}`, "")
+	// Audit log before hard delete. The event is retained but the details
+	// are anonymized: the row is already structurally tied to the user via
+	// user_id (ON DELETE SET NULL), so storing the id again in details
+	// would leave PII behind after the account is gone.
+	_ = w.Queries.InsertAuditLog(ctx, user.ID, "deletion_completed", `{"event":"deletion_completed"}`, "")
 
 	tx2, err := w.Pool.BeginTx(ctx, nil)
 	if err != nil {
 		return err
+	}
+	// The deletion_completed email above just wrote an email_send_log row
+	// carrying to_address + rendered body. Wipe those rows now, in the
+	// same tx as the hard delete, so the completed notification does not
+	// become the one piece of PII that outlives the account.
+	if _, err := tx2.ExecContext(ctx, `DELETE FROM email_send_log WHERE user_id = ?`, user.ID); err != nil {
+		_ = tx2.Rollback()
+		return fmt.Errorf("delete email log: %w", err)
 	}
 	if err := w.Queries.HardDeleteUser(ctx, tx2, user.ID); err != nil {
 		_ = tx2.Rollback()

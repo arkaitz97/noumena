@@ -601,7 +601,12 @@ func (w *Worker) runIngestion(jobCtx, persistCtx context.Context, pc *db.Platfor
 		// otel-instrumentation §10.5: increment by the count
 		// actually persisted (InsertComments may dedupe).
 		recordCommentsIngested(persistCtx, n)
-		if !maxPostedAt.IsZero() {
+		// Backfill must not advance the channel watermark mid-run: a partial
+		// walk (video/page/reply ceiling or deadline) would otherwise promote
+		// the channel to polling and strand the un-scanned older videos.
+		// last_synced_at is set for backfills only by completeJob, which runs
+		// solely when the full requested window was walked.
+		if !maxPostedAt.IsZero() && job.JobType != "backfill" {
 			_ = w.DB.UpdateLastSyncedAt(persistCtx, pc.ID, maxPostedAt)
 		}
 		if hasSDB && walk != nil {

@@ -74,13 +74,13 @@ func (q *SQLiteQuery) LogEmailAttempt(ctx context.Context, in EmailAttemptInput)
 	`
 	var lastAttemptedAt, lastError, sentAt string
 	if in.LastAttemptedAt != nil {
-		lastAttemptedAt = in.LastAttemptedAt.Format(time.RFC3339)
+		lastAttemptedAt = in.LastAttemptedAt.UTC().Format(time.RFC3339)
 	}
 	if in.LastError != nil {
 		lastError = *in.LastError
 	}
 	if in.SentAt != nil {
-		sentAt = in.SentAt.Format(time.RFC3339)
+		sentAt = in.SentAt.UTC().Format(time.RFC3339)
 	}
 	var userID interface{} = in.UserID
 	if in.UserID != nil {
@@ -98,7 +98,7 @@ func (q *SQLiteQuery) LogEmailAttempt(ctx context.Context, in EmailAttemptInput)
 func (q *SQLiteQuery) MarkEmailSent(ctx context.Context, id string, at time.Time) error {
 	_, err := q.db.ExecContext(ctx,
 		`UPDATE email_send_log SET status='sent', sent_at=?, last_error=NULL WHERE id=?`,
-		at.Format(time.RFC3339), id)
+		at.UTC().Format(time.RFC3339), id)
 	return err
 }
 
@@ -156,10 +156,10 @@ func (q *SQLiteQuery) ClaimPendingEmails(ctx context.Context, now time.Time, max
 	`
 	rows, err := q.db.QueryContext(ctx, sqlStr,
 		nowStr,
-		deadline1.Format(time.RFC3339),
-		deadline2.Format(time.RFC3339),
-		deadline1.Format(time.RFC3339),
-		deadline3.Format(time.RFC3339),
+		deadline1.UTC().Format(time.RFC3339),
+		deadline2.UTC().Format(time.RFC3339),
+		deadline1.UTC().Format(time.RFC3339),
+		deadline3.UTC().Format(time.RFC3339),
 		max)
 	if err != nil {
 		return nil, err

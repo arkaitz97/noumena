@@ -11,7 +11,7 @@ import (
 func (q *SQLiteQuery) InsertOAuthState(ctx context.Context, stateHash, userID string, expiresAt time.Time) error {
 	_, err := q.db.ExecContext(ctx,
 		`INSERT INTO oauth_states (state_hash, user_id, expires_at) VALUES (?, ?, ?)`,
-		stateHash, userID, expiresAt.Format(time.RFC3339))
+		stateHash, userID, expiresAt.UTC().Format(time.RFC3339))
 	return err
 }
 
@@ -215,7 +215,7 @@ func (q *SQLiteQuery) CreateUserChannelTrackingWithLimit(ctx context.Context, us
 	// expiry scans and the frontend never treat them as expired.
 	tokenExpiresAt := sql.NullString{}
 	if !expiresAt.IsZero() {
-		tokenExpiresAt = sql.NullString{String: expiresAt.Format(time.RFC3339), Valid: true}
+		tokenExpiresAt = sql.NullString{String: expiresAt.UTC().Format(time.RFC3339), Valid: true}
 	}
 	row := q.db.QueryRowContext(ctx,
 		`INSERT INTO user_channel_tracking
@@ -447,7 +447,7 @@ func (q *SQLiteQuery) UpdateTokenAndExpiry(ctx context.Context, trackingID, encr
 		     token_expires_at = ?,
 		     token_expiry_notified_at = NULL
 		 WHERE id = ?`,
-		encryptedAccess, encryptedRefresh, expiresAt.Format(time.RFC3339), trackingID)
+		encryptedAccess, encryptedRefresh, expiresAt.UTC().Format(time.RFC3339), trackingID)
 	if err != nil {
 		return err
 	}
@@ -459,14 +459,14 @@ func (q *SQLiteQuery) UpdateTokenAndExpiry(ctx context.Context, trackingID, encr
 
 func (q *SQLiteQuery) GetExpiringTokens(ctx context.Context, withinDays int) ([]UserChannelTracking, error) {
 	now := time.Now().UTC()
-	until := now.AddDate(0, 0, withinDays).Format(time.RFC3339)
+	until := now.AddDate(0, 0, withinDays).UTC().Format(time.RFC3339)
 	rows, err := q.db.QueryContext(ctx,
 		`SELECT `+trackingColumns+` FROM user_channel_tracking
 		 WHERE tracking_status IN ('active','paused')
 		   AND token_expires_at IS NOT NULL
 		   AND token_expires_at BETWEEN ? AND ?
 		   AND token_expiry_notified_at IS NULL`,
-		now.Format(time.RFC3339), until)
+		now.UTC().Format(time.RFC3339), until)
 	if err != nil {
 		return nil, err
 	}

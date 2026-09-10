@@ -196,7 +196,7 @@ type CategoryRow struct {
 }
 
 func (q *SQLiteQuery) GetInsightDistribution(ctx context.Context, userID string, channelID *string, since time.Time) ([]InsightTypeCount, error) {
-	args := []any{userID, userID, since.Format(time.RFC3339)}
+	args := []any{userID, userID, since.UTC().Format(time.RFC3339)}
 	channelClause := ""
 	if channelID != nil {
 		args = append(args, *channelID)
@@ -241,7 +241,7 @@ func (q *SQLiteQuery) GetInsightDistribution(ctx context.Context, userID string,
 }
 
 func (q *SQLiteQuery) GetTopInsights(ctx context.Context, userID string, channelID *string, since time.Time, limit int) ([]TopInsight, error) {
-	args := []any{userID, userID, since.Format(time.RFC3339)}
+	args := []any{userID, userID, since.UTC().Format(time.RFC3339)}
 	channelClause := ""
 	if channelID != nil {
 		args = append(args, *channelID)
@@ -289,7 +289,7 @@ func (q *SQLiteQuery) GetTopInsights(ctx context.Context, userID string, channel
 }
 
 func (q *SQLiteQuery) GetToxicityShield(ctx context.Context, userID string, channelID *string, since time.Time) (ToxicityBucket, error) {
-	args := []any{userID, userID, since.Format(time.RFC3339)}
+	args := []any{userID, userID, since.UTC().Format(time.RFC3339)}
 	channelClause := ""
 	if channelID != nil {
 		args = append(args, *channelID)

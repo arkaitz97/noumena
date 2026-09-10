@@ -32,6 +32,7 @@ type fakeWorkerDB struct {
 	backoffSet       map[string]time.Time
 	resetCalls       []string
 	maxBackfillDays  int
+	enqueueCounter   int
 
 	// SyncStateDB state (optimize-youtube-api-quota).
 	playlists   map[string]string
@@ -190,6 +191,28 @@ func (f *fakeWorkerDB) InsertComments(_ context.Context, comments []*db.Comment)
 	copy(cp, comments)
 	f.insertCalls = append(f.insertCalls, cp)
 	return len(comments), nil
+}
+
+// GetChannelsNeedingSync / EnqueueIngestionJob make fakeWorkerDB usable as a
+// SchedulerDB so tests can assert how the scheduler classifies a channel from
+// the exact watermark state the worker produced.
+func (f *fakeWorkerDB) GetChannelsNeedingSync(_ context.Context, _ int) ([]*db.PlatformChannel, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*db.PlatformChannel
+	for id, ch := range f.channels {
+		if _, synced := f.lastSyncedSet[id]; !synced {
+			out = append(out, ch)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeWorkerDB) EnqueueIngestionJob(_ context.Context, platformChannelID, jobType string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.enqueueCounter++
+	return "job-" + platformChannelID + "-" + jobType, nil
 }
 
 // processJobNoLock is a test-only variant of processJob that skips advisory
@@ -362,6 +385,9 @@ func TestWorker_HappyPathPoll(t *testing.T) {
 	}
 	if len(f.resetCalls) != 1 {
 		t.Fatalf("expected ResetIngestionError once, got %v", f.resetCalls)
+	}
+	if _, ok := f.lastSyncedSet["pc1"]; !ok {
+		t.Fatalf("normal poll must advance last_synced_at")
 	}
 }
 
@@ -792,6 +818,85 @@ func TestWorker_JobRequestCeilingDefers(t *testing.T) {
 	}
 	if len(f.completedJobs) != 1 {
 		t.Fatalf("expected completed, got %v", f.completedJobs)
+	}
+}
+
+// TestWorker_PartialBackfillDoesNotAdvanceWatermark proves the ingestion-loss
+// invariant: a backfill that stops at its video ceiling must leave
+// last_synced_at nil so the scheduler keeps classifying the channel as a
+// backfill, and a later run still discovers the older, un-scanned video.
+func TestWorker_PartialBackfillDoesNotAdvanceWatermark(t *testing.T) {
+	v1pub := time.Now().Add(-1 * time.Hour).UTC().Format(time.RFC3339)
+	v2pub := time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/channels":
+			_, _ = w.Write([]byte(`{"items":[{"contentDetails":{"relatedPlaylists":{"uploads":"UU1"}}}]}`))
+		case "/playlistItems":
+			// Newest-first: v1 then the older v2.
+			_, _ = w.Write([]byte(`{"items":[
+				{"contentDetails":{"videoId":"v1"},"snippet":{"publishedAt":"` + v1pub + `","title":"Video One"}},
+				{"contentDetails":{"videoId":"v2"},"snippet":{"publishedAt":"` + v2pub + `","title":"Video Two"}}
+			]}`))
+		case "/commentThreads":
+			vid := r.URL.Query().Get("videoId")
+			_, _ = w.Write([]byte(`{"items":[{"snippet":{"topLevelComment":{"id":"c-` + vid + `","snippet":{"authorDisplayName":"A","textDisplay":"hi","publishedAt":"` + v1pub + `"}},"totalReplyCount":0}}]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	f := newFakeWorkerDB()
+	f.channels["pc1"] = &db.PlatformChannel{ID: "pc1", Platform: "youtube", PlatformChannelID: "UC1"} // LastSyncedAt nil
+	f.tokenA, f.tokenR = "tok", "ref"
+
+	// First backfill: ceiling of 1 stops after v1, leaving v2 un-scanned.
+	w := newTestWorker(f, srv)
+	w.MaxVideosPerJob = 1
+	w.processJobNoLock(context.Background(), &db.IngestionJob{ID: "j1", PlatformChannelID: "pc1", JobType: "backfill"})
+
+	if len(f.completedJobs) != 1 {
+		t.Fatalf("ceiling stop should complete the job, got completed=%v failed=%v", f.completedJobs, f.failedJobs)
+	}
+	if ts, ok := f.lastSyncedSet["pc1"]; ok {
+		t.Fatalf("partial backfill must NOT advance last_synced_at, got %v", ts)
+	}
+
+	// The scheduler must still classify the channel as a backfill.
+	res, err := NewScheduler(f, 30).Tick(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Backfills != 1 || res.Polls != 0 {
+		t.Fatalf("incomplete backfill must re-enqueue as backfill, got %+v", res)
+	}
+
+	// A later backfill with room for both videos discovers the older v2
+	// rather than skipping it.
+	w2 := newTestWorker(f, srv)
+	w2.MaxVideosPerJob = 2
+	w2.processJobNoLock(context.Background(), &db.IngestionJob{ID: "j2", PlatformChannelID: "pc1", JobType: "backfill"})
+
+	var ids []string
+	for _, b := range f.insertCalls {
+		for _, c := range b {
+			ids = append(ids, c.PlatformCommentID)
+		}
+	}
+	foundV2 := false
+	for _, id := range ids {
+		if id == "c-v2" {
+			foundV2 = true
+		}
+	}
+	if !foundV2 {
+		t.Fatalf("older video v2 must be discovered on the resumed backfill, got %v", ids)
+	}
+	// Now the full window is walked, so the channel is promoted to polling.
+	if _, ok := f.lastSyncedSet["pc1"]; !ok {
+		t.Fatalf("completed backfill must advance last_synced_at")
 	}
 }
 

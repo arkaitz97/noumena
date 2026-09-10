@@ -26,6 +26,7 @@ import (
 	"github.com/stripe/stripe-go/v76"
 
 	"noumena/internal/api"
+	"noumena/internal/auth"
 	"noumena/internal/billing"
 	"noumena/internal/config"
 	"noumena/internal/db"
@@ -48,6 +49,7 @@ func newAccountRouter(h *api.AccountHandler, userID string) *chi.Mux {
 		r.Post("/user/account/cancel-deletion", h.CancelAccountDeletion)
 		r.Get("/user/data-export/{id}/status", h.GetExportStatus)
 		r.Get("/user/me", h.GetProfile)
+		r.Patch("/user/me", h.PatchProfile)
 	})
 	return r
 }
@@ -370,5 +372,50 @@ func TestDeleteAccount_RealDB(t *testing.T) {
 	}
 	if status != "pending" {
 		t.Errorf("deletion job status = %q, want pending", status)
+	}
+}
+
+// TestPatchProfile_EmailChangeRevokesRefreshTokens proves the email-change
+// flow is a true "revoke all sessions": PATCH /api/user/me wipes every
+// refresh-token row for the user, and a pre-change refresh cookie can no
+// longer be rotated into a fresh access token.
+func TestPatchProfile_EmailChangeRevokesRefreshTokens(t *testing.T) {
+	ctx := context.Background()
+	user := &db.User{ID: "u-email-revoke", Email: "old@example.com", TokenVersion: 1}
+	mock := &MockQuery{users: map[string]*db.User{"old@example.com": user}}
+
+	// A live session minted at the user's current token_version.
+	preChangeRaw, _, err := auth.IssueRefreshToken(ctx, mock, user.ID)
+	if err != nil {
+		t.Fatalf("IssueRefreshToken: %v", err)
+	}
+	if len(mock.refreshTokens) != 1 {
+		t.Fatalf("expected 1 refresh row before email change, got %d", len(mock.refreshTokens))
+	}
+
+	h := &api.AccountHandler{Queries: mock, Cfg: config.Default}
+	r := newAccountRouter(h, user.ID)
+	req := httptest.NewRequest(http.MethodPatch, "/api/user/me",
+		bytes.NewBufferString(`{"email":"new@example.com"}`))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(mock.refreshTokens) != 0 {
+		t.Fatalf("email change did not revoke sessions: %d refresh rows remain", len(mock.refreshTokens))
+	}
+	if user.TokenVersion != 2 {
+		t.Errorf("token_version = %d, want 2", user.TokenVersion)
+	}
+
+	// The stolen pre-change cookie must not rotate (row gone and version
+	// binding rejects it).
+	if _, _, _, err := auth.RotateRefreshToken(ctx, mock, preChangeRaw); !errors.Is(err, auth.ErrInvalidRefreshToken) {
+		t.Fatalf("expected ErrInvalidRefreshToken for pre-change cookie, got %v", err)
+	}
+	if len(mock.refreshTokens) != 0 {
+		t.Errorf("rotation attempt re-created a row: %d", len(mock.refreshTokens))
 	}
 }

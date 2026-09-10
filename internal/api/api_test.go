@@ -15,7 +15,23 @@ import (
 	"noumena/internal/api"
 	"noumena/internal/auth"
 	"noumena/internal/db"
+	"noumena/internal/email"
 )
+
+// MockEmailSend emulates one row of the durable email_send_log table.
+type MockEmailSend struct {
+	Template  string
+	ToAddress string
+	At        time.Time
+}
+
+// recordEmailSend is called by mockEmailSender to mirror the production
+// pipeline's email_send_log write, so rate-limit counters see the send.
+func (m *MockQuery) recordEmailSend(template, toAddress string) {
+	m.emailSends = append(m.emailSends, MockEmailSend{
+		Template: template, ToAddress: toAddress, At: time.Now().UTC(),
+	})
+}
 
 // MockQuery implements db.DBQuery for testing
 type MockQuery struct {
@@ -40,8 +56,11 @@ type MockQuery struct {
 		expires time.Time
 		usedAt  *time.Time
 	}
-	verifResendCount  map[string]int
-	forgotPwSentCount map[string]int
+	verifResendCount       map[string]int
+	emailChangeResendCount map[string]int
+	// emailSends emulates the durable email_send_log rows the production
+	// pipeline writes; the mock sender records into it via recordEmailSend.
+	emailSends        []MockEmailSend
 	lockoutEmailsSent int
 	verifyEmailsSent  int
 	resetEmailsSent   int
@@ -463,7 +482,33 @@ func (m *MockQuery) InsertEmailChangeToken(ctx context.Context, userID, pendingE
 		expires time.Time
 		usedAt  *time.Time
 	}{userID: userID, email: pendingEmail, expires: expiresAt}
+	if m.emailChangeResendCount == nil {
+		m.emailChangeResendCount = make(map[string]int)
+	}
+	m.emailChangeResendCount[userID]++
 	return nil
+}
+func (m *MockQuery) CountEmailChangeResendsInWindow(ctx context.Context, userID string, since time.Time) (int, error) {
+	return m.emailChangeResendCount[userID], nil
+}
+
+// seedActiveEmailChange primes an in-flight email change WITHOUT counting it
+// as a resend, so tests can isolate the resend cap from the initial request.
+func (m *MockQuery) seedActiveEmailChange(userID, pendingEmail string) {
+	if m.emailChangeTokens == nil {
+		m.emailChangeTokens = make(map[string]struct {
+			userID  string
+			email   string
+			expires time.Time
+			usedAt  *time.Time
+		})
+	}
+	m.emailChangeTokens["seed-"+pendingEmail] = struct {
+		userID  string
+		email   string
+		expires time.Time
+		usedAt  *time.Time
+	}{userID: userID, email: pendingEmail, expires: time.Now().Add(time.Hour)}
 }
 func (m *MockQuery) ConsumeEmailChangeToken(ctx context.Context, tokenHash string) (string, string, error) {
 	row, ok := m.emailChangeTokens[tokenHash]
@@ -527,15 +572,6 @@ func (m *MockQuery) InsertPasswordResetToken(ctx context.Context, userID, tokenH
 		expires time.Time
 		usedAt  *time.Time
 	}{userID: userID, expires: expiresAt}
-	// Track per-user/email count
-	if m.forgotPwSentCount == nil {
-		m.forgotPwSentCount = make(map[string]int)
-	}
-	for _, u := range m.users {
-		if u.ID == userID {
-			m.forgotPwSentCount[u.Email]++
-		}
-	}
 	return nil
 }
 func (m *MockQuery) ConsumePasswordResetToken(ctx context.Context, tokenHash string) (string, error) {
@@ -558,8 +594,14 @@ func (m *MockQuery) InvalidatePasswordResetTokensForUser(ctx context.Context, us
 	}
 	return nil
 }
-func (m *MockQuery) CountForgotPasswordEmailsInWindow(ctx context.Context, email string, since time.Time) (int, error) {
-	return m.forgotPwSentCount[email], nil
+func (m *MockQuery) CountForgotPasswordEmailsInWindow(ctx context.Context, emailAddr string, since time.Time) (int, error) {
+	n := 0
+	for _, s := range m.emailSends {
+		if s.Template == email.TemplatePasswordReset && s.ToAddress == emailAddr && !s.At.Before(since) {
+			n++
+		}
+	}
+	return n, nil
 }
 func (m *MockQuery) InsertRefreshToken(ctx context.Context, userID, tokenHash string, expiresAt time.Time) error {
 	if m.refreshTokens == nil {

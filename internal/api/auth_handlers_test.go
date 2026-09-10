@@ -24,10 +24,16 @@ import (
 // MockEmailSender records messages sent through Pipeline.Send for assertion.
 type mockEmailSender struct {
 	messages []email.Message
+	// queries, when set, receives a recordEmailSend call for each message so
+	// the mock can emulate the production email_send_log-backed counters.
+	queries *MockQuery
 }
 
 func (m *mockEmailSender) Send(_ context.Context, msg email.Message) error {
 	m.messages = append(m.messages, msg)
+	if m.queries != nil {
+		m.queries.recordEmailSend(msg.Template, msg.ToAddress)
+	}
 	return nil
 }
 
@@ -48,6 +54,9 @@ var _ email.EmailSender = (*mockEmailSender)(nil)
 
 func setupAuthRouter(queries *MockQuery, mc email.EmailSender) *chi.Mux {
 	r := chi.NewRouter()
+	if ms, ok := mc.(*mockEmailSender); ok && queries != nil {
+		ms.queries = queries
+	}
 	h := &api.AuthHandler{Queries: queries, EmailSender: mc}
 
 	r.Route("/auth", func(r chi.Router) {
@@ -422,6 +431,46 @@ func TestForgotPasswordRateLimit(t *testing.T) {
 	}
 }
 
+// TestForgotPasswordGoogleOnlyRateLimit pins the fix for the Google-only
+// bypass: the SSO-notice branch sends TemplatePasswordReset but writes no
+// password_reset_tokens row, so the counter must be send-based. Four requests
+// must yield at most three sends, and every response stays generic 200.
+func TestForgotPasswordGoogleOnlyRateLimit(t *testing.T) {
+	q := &MockQuery{}
+	mc := &mockEmailSender{}
+	r := setupAuthRouter(q, mc)
+
+	now := time.Now()
+	sub := "google-sub-rate-limit"
+	q.users = map[string]*db.User{
+		"gonly@example.com": {
+			ID:              "gonly-user",
+			Email:           "gonly@example.com",
+			GoogleSub:       &sub,
+			EmailVerifiedAt: &now,
+			CreatedAt:       now,
+			UpdatedAt:       now,
+		},
+	}
+
+	for i := 0; i < 4; i++ {
+		body, _ := json.Marshal(map[string]string{"email": "gonly@example.com"})
+		req, _ := http.NewRequest("POST", "/auth/forgot-password", bytes.NewReader(body))
+		rr := httptest.NewRecorder()
+		r.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("request %d: expected generic 200, got %d (%s)", i+1, rr.Code, rr.Body.String())
+		}
+		if !strings.Contains(rr.Body.String(), "If an account exists") {
+			t.Fatalf("request %d: expected generic body, got %s", i+1, rr.Body.String())
+		}
+	}
+	if got := mc.sent(email.TemplatePasswordReset); got != 3 {
+		t.Fatalf("google-only sends = %d, want 3 (4th suppressed by per-address cap)", got)
+	}
+}
+
 func TestResetPasswordWeakPassword(t *testing.T) {
 	r := setupAuthRouter(&MockQuery{}, &mockEmailSender{})
 	body, _ := json.Marshal(map[string]string{"password": "short"})
@@ -430,6 +479,55 @@ func TestResetPasswordWeakPassword(t *testing.T) {
 	r.ServeHTTP(rr, req)
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("expected 400, got %d", rr.Code)
+	}
+}
+
+// TestResetPassword_RevokesRefreshTokens confirms the password-reset path
+// wipes every refresh-token row for the user, not just bumps token_version.
+func TestResetPassword_RevokesRefreshTokens(t *testing.T) {
+	q := &MockQuery{}
+	mc := &mockEmailSender{}
+	r := setupAuthRouter(q, mc)
+
+	if rr := registerJSON(t, r, "reset@example.com", "Password1"); rr.Code != http.StatusCreated {
+		t.Fatalf("register: %d (%s)", rr.Code, rr.Body.String())
+	}
+	if len(q.refreshTokens) != 1 {
+		t.Fatalf("expected 1 refresh row after register, got %d", len(q.refreshTokens))
+	}
+
+	// Request a reset link, then extract the raw token from the email.
+	body, _ := json.Marshal(map[string]string{"email": "reset@example.com"})
+	req, _ := http.NewRequest("POST", "/auth/forgot-password", bytes.NewReader(body))
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("forgot-password: %d (%s)", rr.Code, rr.Body.String())
+	}
+	var rawReset string
+	for _, msg := range mc.messages {
+		if msg.Template != email.TemplatePasswordReset {
+			continue
+		}
+		if link, _ := msg.Variables["ResetURL"].(string); link != "" {
+			if idx := strings.Index(link, "token="); idx >= 0 {
+				rawReset = link[idx+len("token="):]
+			}
+		}
+	}
+	if rawReset == "" {
+		t.Fatal("no reset token captured from email")
+	}
+
+	resetBody, _ := json.Marshal(map[string]string{"password": "NewPass1"})
+	req2, _ := http.NewRequest("POST", "/auth/reset-password?token="+rawReset, bytes.NewReader(resetBody))
+	rr2 := httptest.NewRecorder()
+	r.ServeHTTP(rr2, req2)
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("reset-password: %d (%s)", rr2.Code, rr2.Body.String())
+	}
+	if len(q.refreshTokens) != 0 {
+		t.Fatalf("reset did not revoke sessions: %d refresh rows remain", len(q.refreshTokens))
 	}
 }
 
@@ -491,6 +589,48 @@ func TestResendVerificationRateLimit(t *testing.T) {
 	}
 	if rr := doResend(); rr.Code != http.StatusTooManyRequests {
 		t.Errorf("expected 429 on 4th issuance, got %d", rr.Code)
+	}
+}
+
+// TestResendVerificationEmailChangeRateLimit pins the fix for the wrong-counter
+// bypass: while an email change is active, ResendVerification writes
+// email_change_tokens, so its cap must be driven by CountEmailChangeResendsInWindow.
+// Four resends must allow three sends and reject the fourth with 429.
+func TestResendVerificationEmailChangeRateLimit(t *testing.T) {
+	q := &MockQuery{}
+	mc := &mockEmailSender{}
+	r := setupAuthRouter(q, mc)
+
+	if rr := registerJSON(t, r, "ec-resend@example.com", "Password1"); rr.Code != http.StatusCreated {
+		t.Fatalf("register: %d (%s)", rr.Code, rr.Body.String())
+	}
+	user := q.users["ec-resend@example.com"]
+	if user == nil {
+		t.Fatal("registered user missing")
+	}
+	// Prime an in-flight email change without counting it as a resend.
+	q.seedActiveEmailChange(user.ID, "ec-resend-new@example.com")
+	mc.reset()
+
+	access, _, _ := auth.GenerateTokens(user.ID)
+	doResend := func() *httptest.ResponseRecorder {
+		req, _ := http.NewRequest("POST", "/auth/resend-verification", nil)
+		req.Header.Set("Authorization", "Bearer "+access)
+		rr := httptest.NewRecorder()
+		r.ServeHTTP(rr, req)
+		return rr
+	}
+
+	for i := 0; i < 3; i++ {
+		if rr := doResend(); rr.Code != http.StatusOK {
+			t.Fatalf("resend %d: expected 200, got %d (%s)", i+1, rr.Code, rr.Body.String())
+		}
+	}
+	if rr := doResend(); rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("4th resend: expected 429, got %d (%s)", rr.Code, rr.Body.String())
+	}
+	if got := mc.sent(email.TemplateEmailVerification); got != 3 {
+		t.Fatalf("email-change resend sends = %d, want 3 (4th suppressed)", got)
 	}
 }
 
