@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"noumena/internal/cronutil"
 )
 
 // Tests for the daily quota-reset cron (billing change, task 10.2).
@@ -101,21 +103,21 @@ func TestStartQuotaCronExitsOnContextCancel(t *testing.T) {
 func TestUntilNextDailyUTC(t *testing.T) {
 	// Now = 2025-01-01 07:00 UTC; next 08:00 is in 1h.
 	now := time.Date(2025, 1, 1, 7, 0, 0, 0, time.UTC)
-	got := untilNextDailyUTC(now, 8, 0)
+	got := cronutil.UntilNextDailyUTC(now, 8, 0)
 	if got != time.Hour {
 		t.Errorf("want 1h, got %v", got)
 	}
 
 	// Now = 2025-01-01 08:00 UTC exactly; next is +24h (must be strictly after).
 	now = time.Date(2025, 1, 1, 8, 0, 0, 0, time.UTC)
-	got = untilNextDailyUTC(now, 8, 0)
+	got = cronutil.UntilNextDailyUTC(now, 8, 0)
 	if got != 24*time.Hour {
 		t.Errorf("want 24h, got %v", got)
 	}
 
 	// Now = 2025-01-01 09:00 UTC; next 08:00 is in 23h.
 	now = time.Date(2025, 1, 1, 9, 0, 0, 0, time.UTC)
-	got = untilNextDailyUTC(now, 8, 0)
+	got = cronutil.UntilNextDailyUTC(now, 8, 0)
 	if got != 23*time.Hour {
 		t.Errorf("want 23h, got %v", got)
 	}

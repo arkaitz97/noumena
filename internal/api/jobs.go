@@ -6,13 +6,14 @@ import (
 	"time"
 
 	"noumena/internal/config"
+	"noumena/internal/cronutil"
 	"noumena/internal/db"
 	"noumena/internal/email"
 )
 
 // StartTokenExpiryNotifier launches a daily ticker that scans for OAuth
 // tokens nearing expiry and emails their owner exactly once per cycle.
-func StartTokenExpiryNotifier(ctx context.Context, q db.DBQuery, mail email.Client, sched TokenExpirySchedule) {
+func StartTokenExpiryNotifier(ctx context.Context, q db.DBQuery, mail email.EmailSender, sched TokenExpirySchedule) {
 	if q == nil || mail == nil {
 		log.Println("[token-expiry] missing dependencies, job not started")
 		return
@@ -26,21 +27,9 @@ func StartTokenExpiryNotifier(ctx context.Context, q db.DBQuery, mail email.Clie
 		sched.Interval = 24 * time.Hour
 	}
 
-	go func() {
-		// Run once at boot for visibility, then on the schedule.
+	go cronutil.RunCron(ctx, sched.Interval, true, func(ctx context.Context) {
 		runTokenExpiryScan(ctx, q, mail)
-
-		t := time.NewTicker(sched.Interval)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				runTokenExpiryScan(ctx, q, mail)
-			}
-		}
-	}()
+	})
 }
 
 // TokenExpirySchedule controls the daily scan timing. Defaults are 06:00 UTC
@@ -50,7 +39,7 @@ type TokenExpirySchedule struct {
 	Interval time.Duration
 }
 
-func runTokenExpiryScan(ctx context.Context, q db.DBQuery, mail email.Client) {
+func runTokenExpiryScan(ctx context.Context, q db.DBQuery, mail email.EmailSender) {
 	warning := config.Default.TokenExpiryWarningDays
 	if warning <= 0 {
 		warning = 7
@@ -88,7 +77,16 @@ func runTokenExpiryScan(ctx context.Context, q db.DBQuery, mail email.Client) {
 			expires = *row.TokenExpiresAt
 		}
 		settingsURL := config.Default.AppBaseURL + "/settings/channels"
-		if err := mail.SendTokenExpiryEmail(user.Email, displayName, expires, settingsURL); err != nil {
+		if err := mail.Send(ctx, email.Message{
+			Template:       email.TemplateTokenExpiry,
+			ToAddress:      user.Email,
+			IdempotencyKey: email.IdempotencyKey(email.TemplateTokenExpiry, user.Email, displayName, expires.UTC().Format("2006-01-02")),
+			Variables: map[string]any{
+				"ChannelName": displayName,
+				"ExpiresAt":   expires.UTC().Format("January 2, 2006"),
+				"SettingsURL": settingsURL,
+			},
+		}); err != nil {
 			log.Printf("[token-expiry] send failed for tracking %s: %v", row.ID, err)
 			continue
 		}
@@ -111,18 +109,9 @@ func StartChannelPurgeJob(ctx context.Context, q db.DBQuery, interval time.Durat
 	if interval <= 0 {
 		interval = time.Hour
 	}
-	go func() {
-		t := time.NewTicker(interval)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				runChannelPurge(ctx, q)
-			}
-		}
-	}()
+	go cronutil.RunCron(ctx, interval, false, func(ctx context.Context) {
+		runChannelPurge(ctx, q)
+	})
 }
 
 func runChannelPurge(ctx context.Context, q db.DBQuery) {

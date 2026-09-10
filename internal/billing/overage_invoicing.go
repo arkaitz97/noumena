@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"time"
 
+	"noumena/internal/cronutil"
 	"noumena/internal/db"
 )
 
@@ -146,22 +147,11 @@ func StartOverageInvoicingCron(ctx context.Context, store OverageInvoicingStore,
 			case <-time.After(cfg.InitialDelay):
 			}
 		}
-		if err := InvoiceOverage(ctx, store, client, true); err != nil {
-			log.Printf("billing overage invoicing: run err=%v", err)
-		}
-
-		t := time.NewTicker(cfg.Interval)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				if err := InvoiceOverage(ctx, store, client, true); err != nil {
-					log.Printf("billing overage invoicing: run err=%v", err)
-				}
+		cronutil.RunCron(ctx, cfg.Interval, true, func(ctx context.Context) {
+			if err := InvoiceOverage(ctx, store, client, true); err != nil {
+				log.Printf("billing overage invoicing: run err=%v", err)
 			}
-		}
+		})
 	}()
 }
 

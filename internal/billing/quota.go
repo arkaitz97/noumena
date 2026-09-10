@@ -6,6 +6,7 @@ import (
 	"log"
 	"time"
 
+	"noumena/internal/cronutil"
 	"noumena/internal/db"
 	"noumena/internal/email"
 )
@@ -64,7 +65,6 @@ func StartQuotaCron(ctx context.Context, store QuotaCronStore, cfg QuotaCronConf
 	}
 
 	go func() {
-		// Optional initial delay — used by main.go to align with 08:00 UTC.
 		if cfg.InitialDelay > 0 {
 			select {
 			case <-ctx.Done():
@@ -72,18 +72,9 @@ func StartQuotaCron(ctx context.Context, store QuotaCronStore, cfg QuotaCronConf
 			case <-time.After(cfg.InitialDelay):
 			}
 		}
-		runQuotaCronOnce(ctx, store, cfg.PastDueGraceHours, cfg.Pipeline)
-
-		t := time.NewTicker(cfg.Interval)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				runQuotaCronOnce(ctx, store, cfg.PastDueGraceHours, cfg.Pipeline)
-			}
-		}
+		cronutil.RunCron(ctx, cfg.Interval, true, func(ctx context.Context) {
+			runQuotaCronOnce(ctx, store, cfg.PastDueGraceHours, cfg.Pipeline)
+		})
 	}()
 }
 
@@ -151,22 +142,10 @@ func sendGraceFinalEmail(ctx context.Context, p *email.Pipeline, u db.ExpiredGra
 	}
 }
 
-// untilNextDailyUTC returns the duration from now until the next occurrence
-// of (hour, minute) UTC. Useful for callers that want a once-a-day cron at
-// a fixed wall-clock time (default 08:00 UTC per spec 8.3).
-func untilNextDailyUTC(now time.Time, hour, minute int) time.Duration {
-	now = now.UTC()
-	next := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, time.UTC)
-	if !next.After(now) {
-		next = next.Add(24 * time.Hour)
-	}
-	return next.Sub(now)
-}
-
 // NextRunDelayUTC is the public helper used by main.go to align the first
 // run of the cron at 08:00 UTC.
 func NextRunDelayUTC(hour, minute int) time.Duration {
-	return untilNextDailyUTC(time.Now(), hour, minute)
+	return cronutil.UntilNextDailyUTC(time.Now(), hour, minute)
 }
 
 // Compile-time assertion that *db.SQLiteQuery satisfies QuotaCronStore.

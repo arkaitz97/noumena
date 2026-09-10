@@ -17,6 +17,7 @@ import (
 	"log"
 	"time"
 
+	"noumena/internal/cronutil"
 	"noumena/internal/db"
 	"noumena/internal/email"
 )
@@ -59,17 +60,9 @@ func StartTrialReminder(ctx context.Context, store TrialReminderStore, p *email.
 			case <-time.After(cfg.InitialDelay):
 			}
 		}
-		runTrialReminderOnce(ctx, store, p, cfg.LeadTime)
-		t := time.NewTicker(cfg.Interval)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				runTrialReminderOnce(ctx, store, p, cfg.LeadTime)
-			}
-		}
+		cronutil.RunCron(ctx, cfg.Interval, true, func(ctx context.Context) {
+			runTrialReminderOnce(ctx, store, p, cfg.LeadTime)
+		})
 	}()
 }
 

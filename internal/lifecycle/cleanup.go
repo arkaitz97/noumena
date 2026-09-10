@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"noumena/internal/cronutil"
 	"noumena/internal/db"
 )
 
@@ -67,7 +68,7 @@ func (c *CleanupCron) Stop() {
 func (c *CleanupCron) run(ctx context.Context) {
 	defer close(c.done)
 	for {
-		wait := untilNextDailyUTC(time.Now().UTC(), c.Hour, c.Minute)
+		wait := cronutil.UntilNextDailyUTC(time.Now().UTC(), c.Hour, c.Minute)
 		c.Logger.Printf("export_cleanup_sleep next_run_in=%s", wait)
 		select {
 		case <-ctx.Done():
@@ -114,15 +115,4 @@ func (c *CleanupCron) runOnce(ctx context.Context) {
 		}
 		c.Logger.Printf("export_cleanup_removed job=%s path=%s", r.ID, path)
 	}
-}
-
-// untilNextDailyUTC duplicates the helper in billing/quota.go to avoid
-// an import cycle with that package's bigger surface. The two
-// implementations are kept in sync by code review.
-func untilNextDailyUTC(now time.Time, hour, minute int) time.Duration {
-	target := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, time.UTC)
-	if !target.After(now) {
-		target = target.Add(24 * time.Hour)
-	}
-	return target.Sub(now)
 }
