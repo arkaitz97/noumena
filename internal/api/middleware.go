@@ -98,29 +98,3 @@ func RequireVerifiedEmail(q db.DBQuery) func(http.Handler) http.Handler {
 		})
 	}
 }
-
-// QuotaMiddleware checks if the user has exceeded their comment processing quota.
-func QuotaMiddleware(queries db.DBQuery) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			userID, ok := r.Context().Value(UserIDKey).(string)
-			if !ok {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
-			}
-
-			user, err := queries.GetUserByID(r.Context(), userID)
-			if err != nil || user == nil {
-				http.Error(w, "user not found", http.StatusNotFound)
-				return
-			}
-
-			if user.CommentsUsedThisPeriod >= user.CommentQuotaMonthly {
-				http.Error(w, "quota exceeded, please upgrade your billing plan", http.StatusPaymentRequired)
-				return
-			}
-
-			next.ServeHTTP(w, r)
-		})
-	}
-}

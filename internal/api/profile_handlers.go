@@ -38,13 +38,13 @@ var validPrimaryPlatforms = map[string]bool{
 }
 
 var validAudienceSizeBuckets = map[string]bool{
-	"under_1k":           true,
-	"1k_10k":             true,
-	"10k_50k":            true,
-	"50k_500k":           true,
-	"500k_1m":            true,
-	"over_1m":            true,
-	"prefer_not_to_say":  true,
+	"under_1k":          true,
+	"1k_10k":            true,
+	"10k_50k":           true,
+	"50k_500k":          true,
+	"500k_1m":           true,
+	"over_1m":           true,
+	"prefer_not_to_say": true,
 }
 
 var validCommentVolumeBuckets = map[string]bool{
@@ -167,7 +167,7 @@ func (h *ProfileHandler) GetProfile(w http.ResponseWriter, r *http.Request) {
 			"success_metric":               nil,
 			"role":                         nil,
 			"team_size_bucket":             nil,
-			"publishing_frequency_bucket": nil,
+			"publishing_frequency_bucket":  nil,
 			"insight_priorities":           []string{},
 			"current_workflow":             nil,
 			"biggest_pain":                 nil,

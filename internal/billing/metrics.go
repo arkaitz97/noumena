@@ -20,7 +20,6 @@ var billingMeter = otel.Meter("noumena/billing")
 
 var (
 	stripeWebhookTotal     metric.Int64Counter
-	quotaUsage             metric.Int64UpDownCounter
 	webhookDurationSeconds metric.Float64Histogram
 )
 
@@ -32,13 +31,6 @@ func init() {
 	)
 	if err != nil {
 		panic("noumena_stripe_webhook_total: " + err.Error())
-	}
-	quotaUsage, err = billingMeter.Int64UpDownCounter(
-		"noumena_quota_usage",
-		metric.WithDescription("Current comment quota usage by user and plan"),
-	)
-	if err != nil {
-		panic("noumena_quota_usage: " + err.Error())
 	}
 	webhookDurationSeconds, err = billingMeter.Float64Histogram(
 		"noumena_webhook_duration_seconds",
@@ -61,14 +53,6 @@ func RecordStripeWebhook(ctx context.Context, event, outcome string) {
 	stripeWebhookTotal.Add(ctx, 1, metric.WithAttributes(
 		attribute.String(telemetry.AttrEvent, event),
 		telemetry.Outcome(outcome),
-	))
-}
-
-// RecordQuotaUsage sets the quota usage gauge for a user.
-func RecordQuotaUsage(ctx context.Context, userID, plan string, used, limit int64) {
-	quotaUsage.Add(ctx, used, metric.WithAttributes(
-		attribute.String("user_id", userID),
-		attribute.String("plan", plan),
 	))
 }
 

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -77,8 +76,7 @@ func (c *opencodeClient) ProviderName() string { return "opencode" }
 func (c *opencodeClient) ModelName() string    { return c.model }
 
 // GenerateDigestRaw sends a digest prompt to the OpenCode chat completions
-// endpoint with retry-with-backoff (reuses the same transport and retry
-// logic as ClassifyBatch). Returns the raw model content string.
+// endpoint. Returns the raw model content string.
 func (c *opencodeClient) GenerateDigestRaw(ctx context.Context, prompt string) (string, error) {
 	reqBody := opencodeChatRequest{
 		Model: c.model,
@@ -94,28 +92,9 @@ func (c *opencodeClient) GenerateDigestRaw(ctx context.Context, prompt string) (
 	}
 
 	endpoint := c.baseURL + "/chat/completions"
-	backoff := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
-	var lastErr error
-	for attempt := 0; attempt < len(backoff)+1; attempt++ {
-		content, retryAfter, retryable, err := c.doOnceDigest(ctx, endpoint, bodyBytes)
-		if err == nil {
-			return content, nil
-		}
-		lastErr = err
-		if !retryable || attempt == len(backoff) {
-			break
-		}
-		wait := backoff[attempt]
-		if retryAfter > 0 {
-			wait = retryAfter
-		}
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-time.After(wait):
-		}
-	}
-	return "", fmt.Errorf("opencode: digest retries exhausted: %w", lastErr)
+	return retryTransient(ctx, "opencode: digest", func() (string, time.Duration, bool, error) {
+		return c.doOnceDigest(ctx, endpoint, bodyBytes)
+	})
 }
 
 // doOnceDigest performs a single HTTP attempt for digest generation.
@@ -178,10 +157,8 @@ type opencodeChatResponse struct {
 }
 
 // ClassifyBatch builds the classification prompt, POSTs it to the OpenCode
-// chat-completions endpoint, retries up to three times with 1s/2s/4s backoff
-// on transient HTTP 429 / 5xx (honoring Retry-After in seconds), and returns
-// the parsed []LLMResult. The response parser is shared with the OpenAI
-// client.
+// chat-completions endpoint, and returns the parsed []LLMResult. Retries are
+// handled by retryTransient (shared with OpenAI/Anthropic clients).
 func (c *opencodeClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, error) {
 	if len(comments) == 0 {
 		return nil, nil
@@ -202,28 +179,9 @@ func (c *opencodeClient) ClassifyBatch(ctx context.Context, comments []PromptCom
 	}
 
 	endpoint := c.baseURL + "/chat/completions"
-	backoff := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second}
-	var lastErr error
-	for attempt := 0; attempt < len(backoff)+1; attempt++ {
-		results, retryAfter, retryable, err := c.doOnce(ctx, endpoint, bodyBytes, len(comments))
-		if err == nil {
-			return results, nil
-		}
-		lastErr = err
-		if !retryable || attempt == len(backoff) {
-			break
-		}
-		wait := backoff[attempt]
-		if retryAfter > 0 {
-			wait = retryAfter
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(wait):
-		}
-	}
-	return nil, fmt.Errorf("opencode: all retries exhausted: %w", lastErr)
+	return retryTransient(ctx, "opencode", func() ([]LLMResult, time.Duration, bool, error) {
+		return c.doOnce(ctx, endpoint, bodyBytes, len(comments))
+	})
 }
 
 // doOnce performs a single HTTP attempt. It returns:
@@ -275,19 +233,4 @@ func (c *opencodeClient) doOnce(ctx context.Context, endpoint string, body []byt
 		return nil, 0, false, fmt.Errorf("opencode: parse: %w", perr)
 	}
 	return results, 0, false, nil
-}
-
-// parseRetryAfterSeconds returns the Retry-After value as a duration when the
-// header is a positive integer count of seconds. HTTP-date Retry-After values
-// are not honored (rare for this endpoint); callers fall back to the static
-// backoff schedule.
-func parseRetryAfterSeconds(h string) time.Duration {
-	h = strings.TrimSpace(h)
-	if h == "" {
-		return 0
-	}
-	if n, err := strconv.Atoi(h); err == nil && n > 0 {
-		return time.Duration(n) * time.Second
-	}
-	return 0
 }

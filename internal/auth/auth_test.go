@@ -19,11 +19,11 @@ func TestPasswordHashing(t *testing.T) {
 		t.Errorf("Hash should not equal the raw password")
 	}
 
-	if !auth.CheckPasswordHash(password, hash) {
+	if !auth.VerifyPassword(hash, password) {
 		t.Errorf("Failed to verify correct password")
 	}
 
-	if auth.CheckPasswordHash("WrongPassword!", hash) {
+	if auth.VerifyPassword(hash, "WrongPassword!") {
 		t.Errorf("Verified incorrect password")
 	}
 }

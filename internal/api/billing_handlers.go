@@ -46,13 +46,6 @@ type BillingHandler struct {
 	// emits TemplatePaymentFailed via the legacy interface (which the
 	// pipeline adapter routes to the new email pipeline). Nil in mock mode
 	// or when EMAIL_ENABLED is off.
-	EmailClient email.Client
-
-	// Pipeline is optional; when set (production w/ EMAIL_ENABLED=true),
-	// webhook + grace-expiry handlers emit transactional templates that
-	// have no legacy interface counterpart (payment_failed,
-	// payment_grace_final, trial_expiry). Nil otherwise — sends are
-	// skipped silently.
 	Pipeline *email.Pipeline
 }
 

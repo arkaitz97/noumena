@@ -293,4 +293,3 @@ func TestExportWorkerIncludesUserProfile(t *testing.T) {
 		t.Errorf("profile/profile.json not found in ZIP export")
 	}
 }
-

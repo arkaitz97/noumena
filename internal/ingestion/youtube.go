@@ -5,11 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
-
-	"golang.org/x/oauth2"
 )
 
 // ChannelInfo is the minimal YouTube channel metadata returned by
@@ -70,8 +69,8 @@ func FetchChannelInfo(ctx context.Context, accessToken string) (*ChannelInfo, er
 		if resp.StatusCode != http.StatusOK {
 			return false, 0, fmt.Errorf("youtube channels.list: HTTP %d", resp.StatusCode)
 		}
-		body = readAll(resp)
-		return false, 0, nil
+		body, err = io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		return false, 0, err
 	})
 	if err != nil {
 		return nil, err
@@ -96,21 +95,6 @@ func FetchChannelInfo(ctx context.Context, accessToken string) (*ChannelInfo, er
 		DisplayName: parsed.Items[0].Snippet.Title,
 		Title:       parsed.Items[0].Snippet.Title,
 	}, nil
-}
-
-// FetchComments is the ingestion-side comment fetcher. The full
-// implementation belongs to Spec 03; this stub pins the signature and lets
-// callers (and tests) wire it up. It always returns an empty slice today.
-//
-// The token argument is intentionally an *oauth2.Token so the eventual
-// implementation can use the standard oauth2 HTTP client to refresh the
-// access token transparently.
-func FetchComments(ctx context.Context, token *oauth2.Token, channelID string, since time.Time) ([]Comment, error) {
-	_ = ctx
-	_ = token
-	_ = channelID
-	_ = since
-	return nil, nil
 }
 
 // withBackoff runs op with exponential backoff: 1s, 2s, 4s, 8s, 16s. It
@@ -153,23 +137,4 @@ func parseRetryAfter(h string) time.Duration {
 		}
 	}
 	return 0
-}
-
-func readAll(resp *http.Response) []byte {
-	const max = 4 << 20 // 4 MiB cap
-	buf := make([]byte, 0, 4096)
-	tmp := make([]byte, 4096)
-	for {
-		n, err := resp.Body.Read(tmp)
-		if n > 0 {
-			if len(buf)+n > max {
-				return append(buf, tmp[:max-len(buf)]...)
-			}
-			buf = append(buf, tmp[:n]...)
-		}
-		if err != nil {
-			break
-		}
-	}
-	return buf
 }

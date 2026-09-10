@@ -202,8 +202,7 @@ func (c *RateLimitCleaner) run(ctx context.Context) {
 			if err != nil {
 				continue
 			}
-			if deleted > 0 {
-			}
+			_ = deleted
 		}
 	}
 }

@@ -367,7 +367,7 @@ func (p *Processor) logOverage(ctx context.Context, primary *db.User, batchLen i
 	}
 	preUsed := primary.CommentsUsedThisPeriod
 	postUsed := preUsed + batchLen
-	delta := postUsed - max2(primary.CommentQuotaMonthly, preUsed)
+	delta := postUsed - max(primary.CommentQuotaMonthly, preUsed)
 	if delta > 0 {
 		p.recordOverageDelta(ctx, primary, delta, preUsed, postUsed)
 	}
@@ -391,13 +391,6 @@ func overagePeriod(currentPeriodEnd *time.Time) (time.Time, time.Time) {
 		periodEnd = *currentPeriodEnd
 	}
 	return periodEnd.Add(-31 * 24 * time.Hour), periodEnd
-}
-
-func max2(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 // updateCommentSentiment persists the LLM sentiment score. The DBQuery

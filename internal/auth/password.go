@@ -35,11 +35,6 @@ func VerifyPassword(hash, password string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
 }
 
-// CheckPasswordHash is retained for backwards compatibility.
-func CheckPasswordHash(password, hash string) bool {
-	return VerifyPassword(hash, password)
-}
-
 // NeedsRehash reports whether the stored hash uses a bcrypt cost factor
 // below the currently configured cost. Callers should rehash on next
 // successful login when this returns true.

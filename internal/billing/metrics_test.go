@@ -88,31 +88,6 @@ func TestRecordStripeWebhookCoercesUnknownOutcome(t *testing.T) {
 	}
 }
 
-// TestRecordQuotaUsage verifies the quota_usage gauge records the
-// (user_id, plan) attributes with the correct value.
-func TestRecordQuotaUsage(t *testing.T) {
-	reader, restore := installManualReader(t)
-	defer restore()
-
-	ctx := context.Background()
-	RecordQuotaUsage(ctx, "user-1", "creator", 12000, 50000)
-	RecordQuotaUsage(ctx, "user-2", "studio", 200000, 250000)
-
-	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(ctx, &rm); err != nil {
-		t.Fatalf("Collect: %v", err)
-	}
-
-	got := sumInt64WithAttr(&rm, "noumena_quota_usage", "user_id", "user-1")
-	if got != 12000 {
-		t.Errorf("quota_usage{user-1}: want 12000, got %d", got)
-	}
-	got = sumInt64WithAttr(&rm, "noumena_quota_usage", "user_id", "user-2")
-	if got != 200000 {
-		t.Errorf("quota_usage{user-2}: want 200000, got %d", got)
-	}
-}
-
 // TestRecordWebhookDuration verifies the webhook_duration histogram
 // records the event attribute.
 func TestRecordWebhookDuration(t *testing.T) {
@@ -142,29 +117,7 @@ func TestRecordWebhookDuration(t *testing.T) {
 func TestNoOpBillingMetricsDoNotPanic(t *testing.T) {
 	ctx := context.Background()
 	RecordStripeWebhook(ctx, "invoice.payment_succeeded", telemetry.OutcomeSuccess)
-	RecordQuotaUsage(ctx, "user-1", "creator", 1000, 5000)
 	RecordWebhookDuration(ctx, "checkout.session.completed", 0.05)
-}
-
-func sumInt64WithAttr(rm *metricdata.ResourceMetrics, name, key, val string) int64 {
-	for _, sm := range rm.ScopeMetrics {
-		for _, m := range sm.Metrics {
-			if m.Name != name {
-				continue
-			}
-			s, ok := m.Data.(metricdata.Sum[int64])
-			if !ok {
-				continue
-			}
-			for _, dp := range s.DataPoints {
-				v, ex := dp.Attributes.Value(attribute.Key(key))
-				if ex && v.AsString() == val {
-					return dp.Value
-				}
-			}
-		}
-	}
-	return 0
 }
 
 func histSumFloat64WithAttr(rm *metricdata.ResourceMetrics, name, key, val string) (count uint64, sum float64) {

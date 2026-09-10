@@ -423,11 +423,7 @@ func parseTimeNull(s sql.NullString) time.Time {
 	if !s.Valid || s.String == "" {
 		return time.Time{}
 	}
-	t, err := time.Parse(time.RFC3339, s.String)
-	if err != nil {
-		return time.Time{}
-	}
-	return t
+	return parseTime(s.String)
 }
 
 // CreateUser is the legacy helper used by older callers. New code should use

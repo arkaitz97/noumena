@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -93,4 +94,17 @@ func httpClassifyOnce[T any](ctx context.Context, hc *http.Client, endpoint stri
 		return zero, 0, false, derr
 	}
 	return result, 0, false, nil
+}
+
+// parseRetryAfterSeconds returns the Retry-After value as a duration when the
+// header is a positive integer count of seconds. HTTP-date values are ignored.
+func parseRetryAfterSeconds(h string) time.Duration {
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return 0
+	}
+	if n, err := strconv.Atoi(h); err == nil && n > 0 {
+		return time.Duration(n) * time.Second
+	}
+	return 0
 }

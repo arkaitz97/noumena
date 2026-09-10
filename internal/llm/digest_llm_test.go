@@ -203,4 +203,3 @@ func TestBuildDigestPrompt_ProfileContext(t *testing.T) {
 		t.Errorf("prompt missing topics")
 	}
 }
-

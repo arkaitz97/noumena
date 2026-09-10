@@ -497,26 +497,12 @@ func fasterInterval(cur, floor int) int {
 	if cur <= floor {
 		return cur
 	}
-	return max2int(cur/2, floor)
+	return max(cur/2, floor)
 }
 
 // slowerInterval doubles cur, never above ceiling.
 func slowerInterval(cur, ceiling int) int {
-	return min2int(cur*2, ceiling)
-}
-
-func max2int(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func min2int(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
+	return min(cur*2, ceiling)
 }
 
 // discoverVideos picks the quota-cheapest video source for a job:

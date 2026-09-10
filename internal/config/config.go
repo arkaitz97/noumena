@@ -29,13 +29,9 @@ type Config struct {
 	EncryptionKeyPrevious []byte
 
 	// Google SSO (separate OAuth client from YouTube)
-	GoogleSSOClientID     string
-	GoogleSSOClientSecret string
-	GoogleSSORedirectURL  string
-	// GoogleSSOPopupRedirectURL is the SPA-side `/oauth/callback` URL used by
-	// the popup-based JSON OAuth flow (auth-google-popup-endpoints change).
-	// When unset it falls back to GoogleSSORedirectURL so single-redirect-uri
-	// deployments continue to work unchanged.
+	GoogleSSOClientID         string
+	GoogleSSOClientSecret     string
+	GoogleSSORedirectURL      string
 	GoogleSSOPopupRedirectURL string
 
 	// YouTube OAuth (separate Google OAuth client from Google SSO)
@@ -49,29 +45,19 @@ type Config struct {
 	OAuthStateTTL             time.Duration
 
 	// Comment-ingestion pipeline
-	IngestionWorkerEnabled       bool
-	IngestionTickInterval        time.Duration
-	IngestionPollIntervalMinutes int
-	IngestionMaxRetries          int
-	IngestionJobDeadline         time.Duration
-	IngestionMaxConcurrency      int
-	IngestionDeadLetterAlertTo   string
-	// YouTubeAPIKey enables key-based (OAuth-free) ingestion reads: when set,
-	// the worker skips per-user OAuth token acquisition for search.list /
-	// commentThreads.list / comments.list. Public-data only.
-	YouTubeAPIKey string
-	// YouTube quota budget (optimize-youtube-api-quota). YouTubeDailyQuotaUnits
-	// mirrors the project's daily Data API v3 quota (default 10,000 units);
-	// the client stops issuing requests once the local accounting hits the
-	// budget. The per-job ceilings cap how much of the daily budget a single
-	// channel job may consume.
-	YouTubeDailyQuotaUnits         int
-	IngestionMaxRequestsPerJob     int
-	IngestionMaxVideosPerJob       int
-	IngestionMaxThreadPagesPerJob  int
-	IngestionMaxReplyFetchesPerJob int
-	// Adaptive polling bounds: inactive channels back off from
-	// IngestionPollIntervalMinutes up to x IngestionPollIntervalMaxMultiplier.
+	IngestionWorkerEnabled             bool
+	IngestionTickInterval              time.Duration
+	IngestionPollIntervalMinutes       int
+	IngestionMaxRetries                int
+	IngestionJobDeadline               time.Duration
+	IngestionMaxConcurrency            int
+	IngestionDeadLetterAlertTo         string
+	YouTubeAPIKey                      string
+	YouTubeDailyQuotaUnits             int
+	IngestionMaxRequestsPerJob         int
+	IngestionMaxVideosPerJob           int
+	IngestionMaxThreadPagesPerJob      int
+	IngestionMaxReplyFetchesPerJob     int
 	IngestionPollIntervalMaxMultiplier int
 
 	// LLM batch-processing (llm-processing change)
@@ -97,36 +83,27 @@ type Config struct {
 	FeedQueryTimeout         time.Duration
 	CountQueryTimeout        time.Duration
 
-	// Billing (billing change). All Stripe-related values are required only
-	// when BillingEnabled = true. Load() validates this; see task 2.4.
-	BillingEnabled            bool
-	StripeSecretKey           string
-	StripeWebhookSecret       string
-	StripePriceCreatorMonthly string
-	StripePriceCreatorAnnual  string
-	StripePriceStudioMonthly  string
-	StripePriceStudioAnnual   string
-	StripePriceAgencyMonthly  string
-	StripePriceAgencyAnnual   string
-	BillingCheckoutSuccessURL string
-	BillingCheckoutCancelURL  string
-	// BillingOverageInvoicingEnabled gates the overage-invoicing cron
-	// (implement-missing-product-features 8.x). Default false: rollout in
-	// Stripe test mode only, per the change roadmap.
+	// Billing (billing change)
+	BillingEnabled                 bool
+	StripeSecretKey                string
+	StripeWebhookSecret            string
+	StripePriceCreatorMonthly      string
+	StripePriceCreatorAnnual       string
+	StripePriceStudioMonthly       string
+	StripePriceStudioAnnual        string
+	StripePriceAgencyMonthly       string
+	StripePriceAgencyAnnual        string
+	BillingCheckoutSuccessURL      string
+	BillingCheckoutCancelURL       string
 	BillingOverageInvoicingEnabled bool
 
-	// LLM provider failover (implement-missing-product-features 6.x).
-	// LLMPrimaryProvider is the default provider (opencode|openai|anthropic);
-	// LLMFallbackProvider empty means no fallback. Consumers: internal/llm.
+	// LLM provider failover
 	LLMPrimaryProvider  string
 	LLMFallbackProvider string
 
-	// Transactional email pipeline (data-lifecycle change). When EmailEnabled
-	// is false every call to email.Send is a logged no-op and no row is
-	// written to email_send_log; this is the documented rollout/rollback
-	// switch (design.md, Migration Plan).
+	// Transactional email pipeline
 	EmailEnabled     bool
-	EmailProvider    string // "smtp" today; reserved for future provider expansion
+	EmailProvider    string
 	EmailFromAddress string
 	EmailFromName    string
 	SMTPHost         string
@@ -136,11 +113,7 @@ type Config struct {
 	SMTPCmdTimeout   time.Duration
 	AppSupportEmail  string
 
-	// Lifecycle workers (data-lifecycle change). When LifecycleWorkersEnabled
-	// is false the deletion + export + cleanup goroutines are not started;
-	// the API endpoints can still be exposed (controlled separately by
-	// AccountLifecycleAPIEnabled) so users can enqueue jobs that workers will
-	// process once enabled.
+	// Lifecycle workers
 	LifecycleWorkersEnabled    bool
 	AccountLifecycleAPIEnabled bool
 	ExportStorageDir           string
@@ -150,44 +123,32 @@ type Config struct {
 	DeletionChunkSize          int
 	ExportPreDeleteTimeout     time.Duration
 
-	// OpenTelemetry (otel-instrumentation change). When OTELEnabled=false
-	// (the default) Init installs no-op providers and instrumentation call
-	// sites become zero-cost no-ops. When true, OTELExporterOTLPEndpoint
-	// MUST be non-empty; Load() validates this and returns a typed error
-	// otherwise.
+	// OpenTelemetry
 	OTELEnabled              bool
 	OTELExporterOTLPEndpoint string
 	OTELServiceName          string
 	OTELResourceAttributes   string
 
-	// Rate limiting (spec-gap-improvements). PostgreSQL-backed sliding window.
+	// Rate limiting
 	RateLimitEnabled         bool
 	RateLimitAuthMaxPerMin   int
 	RateLimitUnauthMaxPerMin int
 	RateLimitCleanupTick     time.Duration
 
-	// HTTP hardening (fix-crypto-http-hardening).
-	// TrustProxyHeader: when non-empty, the client IP is read from this
-	// single header (set by the reverse proxy) instead of client-supplied
-	// X-Forwarded-For. Empty means trust RemoteAddr only.
+	// HTTP hardening
 	TrustProxyHeader string
-	// MaxBodyBytes caps every request body (http.MaxBytesReader). The
-	// Stripe webhook keeps its own stricter cap.
-	MaxBodyBytes int64
-	// CSPHeader is the Content-Security-Policy sent on every response;
-	// empty disables the header.
-	CSPHeader string
+	MaxBodyBytes     int64
+	CSPHeader        string
 
-	// Cookie security. Secure cookies require HTTPS; set false for local HTTP dev.
+	// Cookie security
 	CookieSecure bool
 }
 
-// Default holds the process-wide configuration. Tests may override fields
-// directly. Production code should call Load() once during startup.
+// Default holds the process-wide configuration.
 var Default = &Config{
 	JWTSecret:                 []byte("dev-only-insecure-secret-change-me"),
 	JWTAccessTTL:              15 * time.Minute,
-	JWTRefreshTTL:             720 * time.Hour, // 30 days
+	JWTRefreshTTL:             720 * time.Hour,
 	BcryptCost:                12,
 	EmailVerificationTTL:      24 * time.Hour,
 	EmailVerificationRequired: true,
@@ -203,7 +164,6 @@ var Default = &Config{
 	IngestionMaxRetries:                5,
 	IngestionJobDeadline:               5 * time.Minute,
 	IngestionMaxConcurrency:            8,
-	IngestionDeadLetterAlertTo:         "",
 	YouTubeDailyQuotaUnits:             10000,
 	IngestionMaxRequestsPerJob:         150,
 	IngestionMaxVideosPerJob:           100,
@@ -211,8 +171,7 @@ var Default = &Config{
 	IngestionMaxReplyFetchesPerJob:     100,
 	IngestionPollIntervalMaxMultiplier: 8,
 
-	// LLM processor defaults from llm-processing/proposal.md.
-	LLMProcessorEnabled:       false, // gated until smoke-tested
+	LLMProcessorEnabled:       false,
 	LLMProcessorTickInterval:  10 * time.Second,
 	LLMProcessorBatchTimeout:  30 * time.Second,
 	LLMBatchSize:              50,
@@ -221,7 +180,6 @@ var Default = &Config{
 	OpenCodeBaseURL:           "https://api.opencode.local/v1",
 	OpenCodeModel:             "opencode/default",
 
-	// Insights API defaults from insights-api/proposal.md.
 	InsightsAPIEnabled:       false,
 	ExportDir:                "/var/lib/noumena/exports",
 	ExportSyncThreshold:      50000,
@@ -233,10 +191,6 @@ var Default = &Config{
 	FeedQueryTimeout:         2000 * time.Millisecond,
 	CountQueryTimeout:        1500 * time.Millisecond,
 
-	// data-lifecycle defaults. EmailEnabled and LifecycleWorkersEnabled are
-	// the rollout flags; they default off so deployments can land the schema
-	// migration first, then flip the flags after smoke-testing SMTP and the
-	// workers in isolation.
 	EmailEnabled:               false,
 	EmailProvider:              "smtp",
 	SMTPCmdTimeout:             10 * time.Second,
@@ -248,51 +202,31 @@ var Default = &Config{
 	DeletionChunkSize:          10000,
 	ExportPreDeleteTimeout:     12 * time.Hour,
 
-	// OpenTelemetry defaults. Disabled by default so existing deployments
-	// and `go test ./...` see no behavior change. OTELServiceName seeds the
-	// `service.name` resource attribute.
 	OTELEnabled:     false,
 	OTELServiceName: "noumena-api",
 
-	// Rate limiting defaults. 100 req/min authenticated, 10 req/min unauthenticated.
 	RateLimitEnabled:         false,
 	RateLimitAuthMaxPerMin:   100,
 	RateLimitUnauthMaxPerMin: 10,
 	RateLimitCleanupTick:     5 * time.Minute,
 
-	// HTTP hardening defaults (fix-crypto-http-hardening). No proxy header
-	// is trusted by default (RemoteAddr only), global body cap is 2 MiB,
-	// and a base CSP is emitted. Override with env vars.
 	TrustProxyHeader: "",
-	MaxBodyBytes:     2 << 20, // 2 MiB
+	MaxBodyBytes:     2 << 20,
 	CSPHeader:        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; media-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
+	CookieSecure:     true,
 
-	// Cookie security. Secure by default (HTTPS only); set COOKIE_SECURE=false for local HTTP dev.
-	CookieSecure: true,
-
-	// implement-missing-product-features defaults.
-	// Overage invoicing is a Stripe test-mode-only rollout: off by default.
 	BillingOverageInvoicingEnabled: false,
-	// LLM provider failover: OpenCode remains the sole default provider;
-	// LLMFallbackProvider empty = no fallback (backward compatible).
-	LLMPrimaryProvider:  "opencode",
-	LLMFallbackProvider: "",
+	LLMPrimaryProvider:             "opencode",
+	LLMFallbackProvider:            "",
 }
 
 // Load reads configuration from environment variables, applying defaults
 // where values are missing. It returns an error if any *required* value is
 // missing or malformed.
-//
-// JWT_SECRET safety is unconditional (not gated by strict): the server must
-// never boot with a missing, placeholder, or weak signing key — see
-// fix-auth-critical-security. strict=true additionally fails on other missing
-// required values (APP_BASE_URL, Google/YouTube OAuth config).
 func Load(strict bool) (*Config, error) {
-	c := *Default // copy of defaults
+	c := *Default
 
 	// --- Mandatory JWT signing secret --------------------------------------
-	// Unconditional: a forgeable signing key is a critical vulnerability, so
-	// validation happens regardless of STRICT_CONFIG.
 	secret := os.Getenv("JWT_SECRET")
 	if secret == "" {
 		return nil, fmt.Errorf("JWT_SECRET is required (generate one with: openssl rand -base64 32)")
@@ -304,17 +238,11 @@ func Load(strict bool) (*Config, error) {
 		return nil, fmt.Errorf("JWT_SECRET must be at least 32 bytes, got %d", len(secret))
 	}
 	c.JWTSecret = []byte(secret)
-	// Warning only: trivially low entropy (all one character) is technically
-	// valid length-wise but should never appear in a real deployment.
 	if strings.Trim(secret, secret[:1]) == "" {
 		log.Printf("WARN: JWT_SECRET has trivially low entropy (single repeated character); generate one with: openssl rand -base64 32")
 	}
 
 	// --- Mandatory encryption key -----------------------------------------
-	// ENCRYPTION_KEY encrypts OAuth tokens at rest. Unconditional (like
-	// JWT_SECRET): there is no hardcoded fallback, so the server must never
-	// boot without a real key — see fix-crypto-http-hardening. Values are
-	// used as raw AES key bytes, so a valid AES key size is required.
 	if err := validateEncryptionKey(os.Getenv("ENCRYPTION_KEY")); err != nil {
 		return nil, err
 	}
@@ -326,51 +254,31 @@ func Load(strict bool) (*Config, error) {
 		c.EncryptionKeyPrevious = []byte(prev)
 	}
 
+	// --- Auth / JWT -------------------------------------------------------
 	if v := os.Getenv("JWT_ACCESS_TTL"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return nil, fmt.Errorf("JWT_ACCESS_TTL: %w", err)
-		}
-		c.JWTAccessTTL = d
+		c.JWTAccessTTL, _ = envDuration("JWT_ACCESS_TTL", v)
 	}
-
 	if v := os.Getenv("JWT_REFRESH_TTL"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return nil, fmt.Errorf("JWT_REFRESH_TTL: %w", err)
-		}
-		c.JWTRefreshTTL = d
+		c.JWTRefreshTTL, _ = envDuration("JWT_REFRESH_TTL", v)
 	}
-
 	if v := os.Getenv("BCRYPT_COST"); v != "" {
-		n, err := strconv.Atoi(v)
+		n, err := envInt("BCRYPT_COST", v)
 		if err != nil {
-			return nil, fmt.Errorf("BCRYPT_COST: %w", err)
+			return nil, err
 		}
 		if n < 12 {
 			return nil, fmt.Errorf("BCRYPT_COST must be >= 12, got %d", n)
 		}
 		c.BcryptCost = n
 	}
-
 	if v := os.Getenv("EMAIL_VERIFICATION_TTL"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return nil, fmt.Errorf("EMAIL_VERIFICATION_TTL: %w", err)
-		}
-		c.EmailVerificationTTL = d
+		c.EmailVerificationTTL, _ = envDuration("EMAIL_VERIFICATION_TTL", v)
 	}
-
 	if v := os.Getenv("EMAIL_VERIFICATION_REQUIRED"); v != "" {
-		c.EmailVerificationRequired = v == "1" || v == "true" || v == "yes"
+		c.EmailVerificationRequired = truthy(v)
 	}
-
 	if v := os.Getenv("PASSWORD_RESET_TTL"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return nil, fmt.Errorf("PASSWORD_RESET_TTL: %w", err)
-		}
-		c.PasswordResetTTL = d
+		c.PasswordResetTTL, _ = envDuration("PASSWORD_RESET_TTL", v)
 	}
 
 	appBaseURL, appBaseURLSet := lookupEnv("APP_BASE_URL")
@@ -381,105 +289,52 @@ func Load(strict bool) (*Config, error) {
 		return nil, fmt.Errorf("APP_BASE_URL is required")
 	}
 
+	// --- Google SSO -------------------------------------------------------
 	c.GoogleSSOClientID = os.Getenv("GOOGLE_SSO_CLIENT_ID")
 	c.GoogleSSOClientSecret = os.Getenv("GOOGLE_SSO_CLIENT_SECRET")
 	c.GoogleSSORedirectURL = os.Getenv("GOOGLE_SSO_REDIRECT_URL")
-	// Popup-flow redirect URI (auth-google-popup-endpoints change). Defaults
-	// to the redirect-flow URI when unset so existing deployments are not
-	// required to register a second URI before the popup frontend ships.
 	c.GoogleSSOPopupRedirectURL = os.Getenv("GOOGLE_SSO_POPUP_REDIRECT_URL")
 	if c.GoogleSSOPopupRedirectURL == "" {
 		c.GoogleSSOPopupRedirectURL = c.GoogleSSORedirectURL
 	}
-
 	if strict {
 		if c.GoogleSSOClientID == "" || c.GoogleSSOClientSecret == "" || c.GoogleSSORedirectURL == "" {
 			return nil, fmt.Errorf("GOOGLE_SSO_CLIENT_ID, GOOGLE_SSO_CLIENT_SECRET, and GOOGLE_SSO_REDIRECT_URL are required")
 		}
 	}
 
+	// --- YouTube OAuth ----------------------------------------------------
 	c.YouTubeOAuthClientID = os.Getenv("YOUTUBE_OAUTH_CLIENT_ID")
 	c.YouTubeOAuthClientSecret = os.Getenv("YOUTUBE_OAUTH_CLIENT_SECRET")
 	c.YouTubeOAuthRedirectURL = os.Getenv("YOUTUBE_OAUTH_REDIRECT_URL")
-
 	if strict {
 		if c.YouTubeOAuthClientID == "" || c.YouTubeOAuthClientSecret == "" || c.YouTubeOAuthRedirectURL == "" {
 			return nil, fmt.Errorf("YOUTUBE_OAUTH_CLIENT_ID, YOUTUBE_OAUTH_CLIENT_SECRET, and YOUTUBE_OAUTH_REDIRECT_URL are required")
 		}
 	}
 
-	if v := os.Getenv("CHANNEL_DELETION_GRACE_HOURS"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 0 {
-			return nil, fmt.Errorf("CHANNEL_DELETION_GRACE_HOURS must be a non-negative integer")
-		}
-		c.ChannelDeletionGraceHours = n
-	}
-
-	if v := os.Getenv("TOKEN_EXPIRY_WARNING_DAYS"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 0 {
-			return nil, fmt.Errorf("TOKEN_EXPIRY_WARNING_DAYS must be a non-negative integer")
-		}
-		c.TokenExpiryWarningDays = n
-	}
-
+	// --- Channel-management -----------------------------------------------
+	c.ChannelDeletionGraceHours = envIntDef("CHANNEL_DELETION_GRACE_HOURS", c.ChannelDeletionGraceHours)
+	c.TokenExpiryWarningDays = envIntDef("TOKEN_EXPIRY_WARNING_DAYS", c.TokenExpiryWarningDays)
 	if v := os.Getenv("OAUTH_STATE_TTL"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return nil, fmt.Errorf("OAUTH_STATE_TTL: %w", err)
-		}
-		c.OAuthStateTTL = d
+		c.OAuthStateTTL, _ = envDuration("OAUTH_STATE_TTL", v)
 	}
 
-	if v := os.Getenv("INGESTION_WORKER_ENABLED"); v != "" {
-		c.IngestionWorkerEnabled = v == "1" || v == "true" || v == "yes"
-	}
+	// --- Ingestion pipeline -----------------------------------------------
+	c.IngestionWorkerEnabled = envBool(os.Getenv("INGESTION_WORKER_ENABLED"))
 	if v := os.Getenv("INGESTION_TICK_INTERVAL"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return nil, fmt.Errorf("INGESTION_TICK_INTERVAL: %w", err)
-		}
-		c.IngestionTickInterval = d
+		c.IngestionTickInterval, _ = envDuration("INGESTION_TICK_INTERVAL", v)
 	}
-	if v := os.Getenv("INGESTION_POLL_INTERVAL_MINUTES"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n <= 0 {
-			return nil, fmt.Errorf("INGESTION_POLL_INTERVAL_MINUTES must be a positive integer")
-		}
-		c.IngestionPollIntervalMinutes = n
-	}
-	if v := os.Getenv("INGESTION_MAX_RETRIES"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 0 {
-			return nil, fmt.Errorf("INGESTION_MAX_RETRIES must be a non-negative integer")
-		}
-		c.IngestionMaxRetries = n
-	}
+	c.IngestionPollIntervalMinutes = envIntDef("INGESTION_POLL_INTERVAL_MINUTES", c.IngestionPollIntervalMinutes)
+	c.IngestionMaxRetries = envIntDef("INGESTION_MAX_RETRIES", c.IngestionMaxRetries)
 	if v := os.Getenv("INGESTION_JOB_DEADLINE"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return nil, fmt.Errorf("INGESTION_JOB_DEADLINE: %w", err)
-		}
-		c.IngestionJobDeadline = d
+		c.IngestionJobDeadline, _ = envDuration("INGESTION_JOB_DEADLINE", v)
 	}
-	if v := os.Getenv("INGESTION_MAX_CONCURRENCY"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n <= 0 {
-			return nil, fmt.Errorf("INGESTION_MAX_CONCURRENCY must be a positive integer")
-		}
-		c.IngestionMaxConcurrency = n
-	}
+	c.IngestionMaxConcurrency = envIntDef("INGESTION_MAX_CONCURRENCY", c.IngestionMaxConcurrency)
 	c.IngestionDeadLetterAlertTo = os.Getenv("INGESTION_DEAD_LETTER_ALERT_TO")
 	c.YouTubeAPIKey = os.Getenv("YOUTUBE_API_KEY")
-	if v := os.Getenv("YOUTUBE_DAILY_QUOTA_UNITS"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 0 {
-			return nil, fmt.Errorf("YOUTUBE_DAILY_QUOTA_UNITS must be a non-negative integer")
-		}
-		c.YouTubeDailyQuotaUnits = n
-	}
-	for _, env := range []struct {
+	c.YouTubeDailyQuotaUnits = envIntDef("YOUTUBE_DAILY_QUOTA_UNITS", c.YouTubeDailyQuotaUnits)
+	for _, e := range []struct {
 		name string
 		dest *int
 	}{
@@ -489,40 +344,25 @@ func Load(strict bool) (*Config, error) {
 		{"INGESTION_MAX_REPLY_FETCHES_PER_JOB", &c.IngestionMaxReplyFetchesPerJob},
 		{"INGESTION_POLL_INTERVAL_MAX_MULTIPLIER", &c.IngestionPollIntervalMaxMultiplier},
 	} {
-		if v := os.Getenv(env.name); v != "" {
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 0 {
-				return nil, fmt.Errorf("%s must be a non-negative integer", env.name)
-			}
-			*env.dest = n
-		}
+		*e.dest = envIntDef(e.name, *e.dest)
 	}
 
-	// --- LLM processing ----------------------------------------------------
-	if v := os.Getenv("LLM_PROCESSOR_ENABLED"); v != "" {
-		c.LLMProcessorEnabled = v == "1" || v == "true" || v == "yes"
-	}
+	// --- LLM processing ---------------------------------------------------
+	c.LLMProcessorEnabled = envBool(os.Getenv("LLM_PROCESSOR_ENABLED"))
 	if v := os.Getenv("LLM_PROCESSOR_TICK_INTERVAL"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return nil, fmt.Errorf("LLM_PROCESSOR_TICK_INTERVAL: %w", err)
-		}
-		c.LLMProcessorTickInterval = d
+		c.LLMProcessorTickInterval, _ = envDuration("LLM_PROCESSOR_TICK_INTERVAL", v)
 	}
 	if v := os.Getenv("LLM_PROCESSOR_BATCH_TIMEOUT"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil || d <= 0 {
+		d, err := envDuration("LLM_PROCESSOR_BATCH_TIMEOUT", v)
+		if err != nil {
+			return nil, err
+		}
+		if d <= 0 {
 			return nil, fmt.Errorf("LLM_PROCESSOR_BATCH_TIMEOUT must be a positive duration")
 		}
 		c.LLMProcessorBatchTimeout = d
 	}
-	if v := os.Getenv("LLM_BATCH_SIZE"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n <= 0 {
-			return nil, fmt.Errorf("LLM_BATCH_SIZE must be a positive integer")
-		}
-		c.LLMBatchSize = n
-	}
+	c.LLMBatchSize = envIntDef("LLM_BATCH_SIZE", c.LLMBatchSize)
 	if v := os.Getenv("LLM_CONFIDENCE_THRESHOLD"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil || f < 0 || f > 1 {
@@ -531,11 +371,7 @@ func Load(strict bool) (*Config, error) {
 		c.LLMConfidenceThreshold = f
 	}
 	if v := os.Getenv("LLM_PROCESSOR_SHUTDOWN_GRACE"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return nil, fmt.Errorf("LLM_PROCESSOR_SHUTDOWN_GRACE: %w", err)
-		}
-		c.LLMProcessorShutdownGrace = d
+		c.LLMProcessorShutdownGrace, _ = envDuration("LLM_PROCESSOR_SHUTDOWN_GRACE", v)
 	}
 	c.OpenCodeAPIKey = os.Getenv("OPENCODE_API_KEY")
 	if v := os.Getenv("OPENCODE_BASE_URL"); v != "" {
@@ -545,78 +381,34 @@ func Load(strict bool) (*Config, error) {
 		c.OpenCodeModel = v
 	}
 
-	// --- LLM provider failover (implement-missing-product-features 6.4) ----
-	// LLM_PRIMARY defaults to "opencode" (sole provider today); LLM_FALLBACK
-	// empty = no failover. Values validated by the LLM package consumers.
+	// --- LLM provider failover --------------------------------------------
 	if v := os.Getenv("LLM_PRIMARY"); v != "" {
 		c.LLMPrimaryProvider = v
 	}
 	c.LLMFallbackProvider = os.Getenv("LLM_FALLBACK")
 
-	// --- Insights API ------------------------------------------------------
-	if v := os.Getenv("INSIGHTS_API_ENABLED"); v != "" {
-		c.InsightsAPIEnabled = v == "1" || v == "true" || v == "yes"
-	}
+	// --- Insights API -----------------------------------------------------
+	c.InsightsAPIEnabled = envBool(os.Getenv("INSIGHTS_API_ENABLED"))
 	if v := os.Getenv("EXPORT_DIR"); v != "" {
 		c.ExportDir = v
 	}
-	if v := os.Getenv("EXPORT_SYNC_THRESHOLD"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n <= 0 {
-			return nil, fmt.Errorf("EXPORT_SYNC_THRESHOLD must be a positive integer")
-		}
-		c.ExportSyncThreshold = n
-	}
-	if v := os.Getenv("EXPORT_TTL_HOURS"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n <= 0 {
-			return nil, fmt.Errorf("EXPORT_TTL_HOURS must be a positive integer")
-		}
-		c.ExportTTLHours = n
-	}
+	c.ExportSyncThreshold = envIntDef("EXPORT_SYNC_THRESHOLD", c.ExportSyncThreshold)
+	c.ExportTTLHours = envIntDef("EXPORT_TTL_HOURS", c.ExportTTLHours)
 	if v := os.Getenv("EXPORT_WORKER_TICK_INTERVAL"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return nil, fmt.Errorf("EXPORT_WORKER_TICK_INTERVAL: %w", err)
-		}
-		c.ExportWorkerTickInterval = d
+		c.ExportWorkerTickInterval, _ = envDuration("EXPORT_WORKER_TICK_INTERVAL", v)
 	}
-	if v := os.Getenv("EXPORT_WORKER_ENABLED"); v != "" {
-		c.ExportWorkerEnabled = v == "1" || v == "true" || v == "yes"
-	}
-	if v := os.Getenv("FEED_DEFAULT_LIMIT"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n <= 0 {
-			return nil, fmt.Errorf("FEED_DEFAULT_LIMIT must be a positive integer")
-		}
-		c.FeedDefaultLimit = n
-	}
-	if v := os.Getenv("FEED_MAX_LIMIT"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n <= 0 {
-			return nil, fmt.Errorf("FEED_MAX_LIMIT must be a positive integer")
-		}
-		c.FeedMaxLimit = n
-	}
+	c.ExportWorkerEnabled = envBool(os.Getenv("EXPORT_WORKER_ENABLED"))
+	c.FeedDefaultLimit = envIntDef("FEED_DEFAULT_LIMIT", c.FeedDefaultLimit)
+	c.FeedMaxLimit = envIntDef("FEED_MAX_LIMIT", c.FeedMaxLimit)
 	if v := os.Getenv("FEED_QUERY_TIMEOUT"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return nil, fmt.Errorf("FEED_QUERY_TIMEOUT: %w", err)
-		}
-		c.FeedQueryTimeout = d
+		c.FeedQueryTimeout, _ = envDuration("FEED_QUERY_TIMEOUT", v)
 	}
 	if v := os.Getenv("COUNT_QUERY_TIMEOUT"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return nil, fmt.Errorf("COUNT_QUERY_TIMEOUT: %w", err)
-		}
-		c.CountQueryTimeout = d
+		c.CountQueryTimeout, _ = envDuration("COUNT_QUERY_TIMEOUT", v)
 	}
 
-	// --- Billing (billing change) -----------------------------------------
-	if v := os.Getenv("BILLING_ENABLED"); v != "" {
-		c.BillingEnabled = v == "1" || v == "true" || v == "yes"
-	}
+	// --- Billing ----------------------------------------------------------
+	c.BillingEnabled = envBool(os.Getenv("BILLING_ENABLED"))
 	c.StripeSecretKey = os.Getenv("STRIPE_SECRET_KEY")
 	c.StripeWebhookSecret = os.Getenv("STRIPE_WEBHOOK_SECRET")
 	c.StripePriceCreatorMonthly = os.Getenv("STRIPE_PRICE_CREATOR_MONTHLY")
@@ -627,11 +419,8 @@ func Load(strict bool) (*Config, error) {
 	c.StripePriceAgencyAnnual = os.Getenv("STRIPE_PRICE_AGENCY_ANNUAL")
 	c.BillingCheckoutSuccessURL = os.Getenv("BILLING_CHECKOUT_SUCCESS_URL")
 	c.BillingCheckoutCancelURL = os.Getenv("BILLING_CHECKOUT_CANCEL_URL")
-	if v := os.Getenv("BILLING_OVERAGE_INVOICING_ENABLED"); v != "" {
-		c.BillingOverageInvoicingEnabled = v == "1" || v == "true" || v == "yes"
-	}
+	c.BillingOverageInvoicingEnabled = envBool(os.Getenv("BILLING_OVERAGE_INVOICING_ENABLED"))
 
-	// Task 2.4: when billing is enabled all Stripe vars are mandatory.
 	if c.BillingEnabled {
 		required := map[string]string{
 			"STRIPE_SECRET_KEY":            c.StripeSecretKey,
@@ -652,13 +441,8 @@ func Load(strict bool) (*Config, error) {
 		}
 	}
 
-	// --- Transactional email (data-lifecycle change) ----------------------
-	// Tasks 2.1, 2.3. Required-when-enabled validation mirrors the billing
-	// pattern above so misconfigured deployments fail fast at startup rather
-	// than at first email send.
-	if v := os.Getenv("EMAIL_ENABLED"); v != "" {
-		c.EmailEnabled = v == "1" || v == "true" || v == "yes"
-	}
+	// --- Transactional email ----------------------------------------------
+	c.EmailEnabled = envBool(os.Getenv("EMAIL_ENABLED"))
 	if v := os.Getenv("EMAIL_PROVIDER"); v != "" {
 		c.EmailProvider = v
 	}
@@ -675,8 +459,11 @@ func Load(strict bool) (*Config, error) {
 	c.SMTPUsername = os.Getenv("SMTP_USERNAME")
 	c.SMTPPassword = os.Getenv("SMTP_PASSWORD")
 	if v := os.Getenv("SMTP_CMD_TIMEOUT"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil || d <= 0 {
+		d, err := envDuration("SMTP_CMD_TIMEOUT", v)
+		if err != nil {
+			return nil, err
+		}
+		if d <= 0 {
 			return nil, fmt.Errorf("SMTP_CMD_TIMEOUT must be a positive duration (e.g. 10s)")
 		}
 		c.SMTPCmdTimeout = d
@@ -684,8 +471,6 @@ func Load(strict bool) (*Config, error) {
 	c.AppSupportEmail = os.Getenv("APP_SUPPORT_EMAIL")
 
 	if c.EmailEnabled {
-		// EMAIL_PROVIDER=smtp is the only supported provider today; reject
-		// unknown values rather than silently no-op.
 		if c.EmailProvider != "smtp" {
 			return nil, fmt.Errorf("EMAIL_ENABLED=true but EMAIL_PROVIDER=%q is unsupported (only \"smtp\")", c.EmailProvider)
 		}
@@ -707,70 +492,33 @@ func Load(strict bool) (*Config, error) {
 		}
 	}
 
-	// --- Lifecycle workers + account API (data-lifecycle change) ----------
-	// Tasks 2.2, 2.4.
-	if v := os.Getenv("LIFECYCLE_WORKERS_ENABLED"); v != "" {
-		c.LifecycleWorkersEnabled = v == "1" || v == "true" || v == "yes"
-	}
-	if v := os.Getenv("ACCOUNT_LIFECYCLE_API_ENABLED"); v != "" {
-		c.AccountLifecycleAPIEnabled = v == "1" || v == "true" || v == "yes"
-	}
+	// --- Lifecycle workers + account API -----------------------------------
+	c.LifecycleWorkersEnabled = envBool(os.Getenv("LIFECYCLE_WORKERS_ENABLED"))
+	c.AccountLifecycleAPIEnabled = envBool(os.Getenv("ACCOUNT_LIFECYCLE_API_ENABLED"))
 	if v := os.Getenv("EXPORT_STORAGE_DIR"); v != "" {
 		c.ExportStorageDir = v
 	}
 	c.ExportSignedURLSecret = os.Getenv("EXPORT_SIGNED_URL_SECRET")
-	if v := os.Getenv("EXPORT_LINK_TTL_DAYS"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n <= 0 {
-			return nil, fmt.Errorf("EXPORT_LINK_TTL_DAYS must be a positive integer")
-		}
-		c.ExportLinkTTLDays = n
-	}
-	if v := os.Getenv("DELETION_REVERSIBLE_HOURS"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 0 {
-			return nil, fmt.Errorf("DELETION_REVERSIBLE_HOURS must be a non-negative integer")
-		}
-		c.DeletionReversibleHours = n
-	}
-	if v := os.Getenv("DELETION_CHUNK_SIZE"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n <= 0 {
-			return nil, fmt.Errorf("DELETION_CHUNK_SIZE must be a positive integer")
-		}
-		c.DeletionChunkSize = n
-	}
+	c.ExportLinkTTLDays = envIntDef("EXPORT_LINK_TTL_DAYS", c.ExportLinkTTLDays)
+	c.DeletionReversibleHours = envIntDef("DELETION_REVERSIBLE_HOURS", c.DeletionReversibleHours)
+	c.DeletionChunkSize = envIntDef("DELETION_CHUNK_SIZE", c.DeletionChunkSize)
 	if v := os.Getenv("EXPORT_PRE_DELETE_TIMEOUT"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return nil, fmt.Errorf("EXPORT_PRE_DELETE_TIMEOUT: %w", err)
-		}
-		c.ExportPreDeleteTimeout = d
+		c.ExportPreDeleteTimeout, _ = envDuration("EXPORT_PRE_DELETE_TIMEOUT", v)
 	}
 
 	if c.LifecycleWorkersEnabled {
-		// Required when workers run: signing secret (export download URLs)
-		// and a writable storage dir. The API endpoints alone can be
-		// enabled without these set, but the workers cannot operate.
 		if c.ExportSignedURLSecret == "" {
 			return nil, fmt.Errorf("LIFECYCLE_WORKERS_ENABLED=true but EXPORT_SIGNED_URL_SECRET is unset")
 		}
 		if c.ExportStorageDir == "" {
 			return nil, fmt.Errorf("LIFECYCLE_WORKERS_ENABLED=true but EXPORT_STORAGE_DIR is unset")
 		}
-		// The deletion/export workers always emit transactional email
-		// (deletion_scheduled, export_ready, deletion_completed); operating
-		// the workers without the email pipeline would silently drop those
-		// notifications, so we reject the misconfiguration up front.
 		if !c.EmailEnabled {
 			return nil, fmt.Errorf("LIFECYCLE_WORKERS_ENABLED=true requires EMAIL_ENABLED=true")
 		}
 	}
 
-	// --- OpenTelemetry (otel-instrumentation change) ---------------------
-	// Parsed last so any future required-when-enabled validation can refer
-	// to other already-parsed fields. Defaults preserve zero-config local
-	// dev: OTEL_ENABLED=false, no OTLP traffic.
+	// --- OpenTelemetry ----------------------------------------------------
 	c.OTELEnabled = truthy(os.Getenv("OTEL_ENABLED"))
 	c.OTELExporterOTLPEndpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
 	c.OTELServiceName = envOr("OTEL_SERVICE_NAME", "noumena-api")
@@ -779,33 +527,15 @@ func Load(strict bool) (*Config, error) {
 		return nil, fmt.Errorf("OTEL_ENABLED=true but OTEL_EXPORTER_OTLP_ENDPOINT is unset")
 	}
 
-	// --- Rate limiting (spec-gap-improvements) ----------------------------
-	if v := os.Getenv("RATE_LIMIT_ENABLED"); v != "" {
-		c.RateLimitEnabled = v == "1" || v == "true" || v == "yes"
-	}
-	if v := os.Getenv("RATE_LIMIT_AUTH_MAX_PER_MIN"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n <= 0 {
-			return nil, fmt.Errorf("RATE_LIMIT_AUTH_MAX_PER_MIN must be a positive integer")
-		}
-		c.RateLimitAuthMaxPerMin = n
-	}
-	if v := os.Getenv("RATE_LIMIT_UNAUTH_MAX_PER_MIN"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n <= 0 {
-			return nil, fmt.Errorf("RATE_LIMIT_UNAUTH_MAX_PER_MIN must be a positive integer")
-		}
-		c.RateLimitUnauthMaxPerMin = n
-	}
+	// --- Rate limiting ----------------------------------------------------
+	c.RateLimitEnabled = envBool(os.Getenv("RATE_LIMIT_ENABLED"))
+	c.RateLimitAuthMaxPerMin = envIntDef("RATE_LIMIT_AUTH_MAX_PER_MIN", c.RateLimitAuthMaxPerMin)
+	c.RateLimitUnauthMaxPerMin = envIntDef("RATE_LIMIT_UNAUTH_MAX_PER_MIN", c.RateLimitUnauthMaxPerMin)
 	if v := os.Getenv("RATE_LIMIT_CLEANUP_TICK"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return nil, fmt.Errorf("RATE_LIMIT_CLEANUP_TICK: %w", err)
-		}
-		c.RateLimitCleanupTick = d
+		c.RateLimitCleanupTick, _ = envDuration("RATE_LIMIT_CLEANUP_TICK", v)
 	}
 
-	// --- HTTP hardening (fix-crypto-http-hardening) ----------------------
+	// --- HTTP hardening ---------------------------------------------------
 	c.TrustProxyHeader = os.Getenv("TRUST_PROXY_HEADER")
 	if v := os.Getenv("MAX_BODY_BYTES"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
@@ -817,14 +547,53 @@ func Load(strict bool) (*Config, error) {
 	if v := os.Getenv("SECURITY_CSP"); v != "" {
 		c.CSPHeader = v
 	}
-
-	if v := os.Getenv("COOKIE_SECURE"); v != "" {
-		c.CookieSecure = v == "1" || v == "true" || v == "yes"
-	}
+	c.CookieSecure = envBool(os.Getenv("COOKIE_SECURE"))
 
 	Default = &c
 	return &c, nil
 }
+
+// ---------------------------------------------------------------------------
+// Env helpers
+// ---------------------------------------------------------------------------
+
+// envDuration parses v as a time.Duration. Returns (duration, nil) on success
+// or (0, error) on parse failure. The caller passes the pre-fetched env value
+// so os.Getenv calls stay in Load() for the env-parity test.
+func envDuration(key, v string) (time.Duration, error) {
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", key, err)
+	}
+	return d, nil
+}
+
+// envInt parses v as int. Returns (value, nil) on success or (0, error) on
+// parse failure. Use for fields with custom validation (e.g. BCRYPT_COST >= 12).
+func envInt(key, v string) (int, error) {
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", key, err)
+	}
+	return n, nil
+}
+
+// envIntDef parses v as int; on parse failure returns the default.
+// Use for fields where a bad env value should not crash startup.
+func envIntDef(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+// envBool reports whether v means "on" (1|true|yes).
+func envBool(v string) bool { return v == "1" || v == "true" || v == "yes" }
 
 // lookupEnv returns the environment value when set and non-empty.
 func lookupEnv(key string) (string, bool) {
@@ -843,12 +612,9 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-// validAESKeySizes are the byte lengths accepted for ENCRYPTION_KEY
-// (AES-128/192/256).
+// validAESKeySizes are the byte lengths accepted for ENCRYPTION_KEY.
 var validAESKeySizes = map[int]bool{16: true, 24: true, 32: true}
 
-// validateEncryptionKey rejects empty or invalid-size AES keys. The env
-// value is used as raw key bytes (16/24/32 bytes for AES-128/192/256).
 func validateEncryptionKey(key string) error {
 	if key == "" {
 		return fmt.Errorf("ENCRYPTION_KEY is required (generate one with: openssl rand -base64 24; 16/24/32-byte raw value)")
@@ -860,7 +626,7 @@ func validateEncryptionKey(key string) error {
 }
 
 // EnsureExportDir validates that the configured EXPORT_DIR exists and is
-// writable, creating it with mode 0700 if missing. Task 2.2.
+// writable, creating it with mode 0700 if missing.
 func EnsureExportDir(path string) error {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -875,7 +641,6 @@ func EnsureExportDir(path string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("EXPORT_DIR %q is not a directory", path)
 	}
-	// Probe writability with a unique tempfile.
 	probe, err := os.CreateTemp(path, ".noumena-write-probe-*")
 	if err != nil {
 		return fmt.Errorf("EXPORT_DIR %q is not writable: %w", path, err)

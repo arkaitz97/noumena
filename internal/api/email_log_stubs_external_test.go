@@ -106,4 +106,3 @@ func (m *MockQuery) GetUserProfile(context.Context, string) (*db.UserProfile, er
 func (m *MockQuery) UpsertUserProfile(_ context.Context, p *db.UserProfile) (*db.UserProfile, error) {
 	return p, nil
 }
-

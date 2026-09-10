@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -918,7 +919,7 @@ func (c *YouTubeClient) doGETUnmetered(ctx context.Context, accessToken, path st
 	}
 	defer resp.Body.Close()
 
-	body := readAll(resp)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 
 	if resp.StatusCode == http.StatusOK {
 		return body, nil
