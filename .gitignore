@@ -46,6 +46,11 @@ test-results/
 .opencode/package-lock.json
 .opencode/bun.lock
 
+# Agent/tool local configs
+.claude/
+.codex/
+.cursor/
+
 # OS and editor files
 .DS_Store
 Thumbs.db
