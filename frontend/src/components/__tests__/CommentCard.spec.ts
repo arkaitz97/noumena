@@ -61,6 +61,8 @@ describe('CommentCard', () => {
       },
     })
     expect(wrapper.text()).toContain('1 insight')
+    expect(wrapper.text()).toContain('Make a tutorial')
+    expect(wrapper.text()).toContain('85% confidence')
   })
 
   it('links the channel name and video title to youtube', () => {
@@ -83,6 +85,21 @@ describe('CommentCard', () => {
   it('omits the video link when video context is missing', () => {
     const wrapper = mount(CommentCard, {
       props: { comment: makeComment({ video_id: null, video_title: null }), isStarred: false },
+    })
+    expect(wrapper.find('a[href^="https://www.youtube.com/watch"]').exists()).toBe(false)
+  })
+
+  it('omits the video link when hideVideo prop is true', () => {
+    const wrapper = mount(CommentCard, {
+      props: {
+        comment: makeComment({
+          platform_channel_id: 'UC123',
+          video_id: 'v456',
+          video_title: 'My video',
+        }),
+        isStarred: false,
+        hideVideo: true,
+      },
     })
     expect(wrapper.find('a[href^="https://www.youtube.com/watch"]').exists()).toBe(false)
   })

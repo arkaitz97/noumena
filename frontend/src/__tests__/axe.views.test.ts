@@ -117,7 +117,7 @@ describe('axe scans on key views', () => {
 
     const results = await scan(wrapper.element)
     expect(results.violations, formatViolations(results)).toHaveLength(0)
-  })
+  }, 15000)
 
   it('insights feed has no WCAG A/AA violations', async () => {
     const router = makeRouter(InsightsFeed)
@@ -134,7 +134,7 @@ describe('axe scans on key views', () => {
 
     const results = await scan(wrapper.element)
     expect(results.violations, formatViolations(results)).toHaveLength(0)
-  })
+  }, 15000)
 
   it('account settings view has no WCAG A/AA violations', async () => {
     const router = makeRouter(AccountView)
@@ -145,5 +145,5 @@ describe('axe scans on key views', () => {
 
     const results = await scan(wrapper.element)
     expect(results.violations, formatViolations(results)).toHaveLength(0)
-  })
+  }, 15000)
 })

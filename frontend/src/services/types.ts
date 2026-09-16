@@ -108,6 +108,8 @@ export interface Comment {
 export interface FeedFilters {
   channels: string[]
   categories: Category[]
+  categories_specified?: boolean
+  intent?: 'all' | 'ideas' | 'actionable' | null
   insight_type: InsightType | null
   date_from: string | null
   date_to: string | null
@@ -122,7 +124,7 @@ export interface FeedResponse {
   has_more: boolean
 }
 
-export type WindowKey = '7d' | '30d' | '90d'
+export type WindowKey = '7d' | '30d' | '90d' | 'custom' | 'all'
 
 export interface InsightDistributionItem {
   type: InsightType
@@ -324,4 +326,3 @@ export interface CreatorProfile {
   created_at?: string | null
   updated_at?: string | null
 }
-

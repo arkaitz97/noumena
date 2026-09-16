@@ -80,7 +80,7 @@ describe('feed store pagination offsets', () => {
     // Next page must start at server offset 20 (row c20), not 19 (row c19
     // — already rendered) and not 18.
     await feed.loadMoreSaved()
-    expect(commentsApi.saved).toHaveBeenLastCalledWith(filters, { offset: 20, limit: 20 })
+    expect(commentsApi.saved).toHaveBeenLastCalledWith(feed.savedFilters, { offset: 20, limit: 20 })
     const ids = feed.savedComments.map((c) => c.id)
     expect(new Set(ids).size).toBe(ids.length)
     expect(ids).toContain('c20')

@@ -32,10 +32,8 @@ function drillQuery(type: string): Record<string, string> {
 <template>
   <Card class="@container">
     <div class="flex items-center justify-between mb-3">
-      <div>
-        <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Actionable insights</p>
-        <p class="text-sm font-semibold text-zinc-900 dark:text-zinc-100 mt-0.5">{{ totalInsights }} total</p>
-      </div>
+      <h2 class="text-xs font-semibold text-zinc-900 dark:text-white">Actionable insights</h2>
+      <span class="text-xs font-medium text-zinc-500 dark:text-zinc-400 font-mono tabular-nums">{{ totalInsights }} total</span>
     </div>
 
     <div v-if="loading" class="space-y-2">

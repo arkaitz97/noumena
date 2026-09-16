@@ -9,8 +9,8 @@
 // Pollers: feed at 60 s, insights at 5 min — both visibility-gated.
 
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { Download, MessageSquare, X } from 'lucide-vue-next'
-import { useRoute } from 'vue-router'
+import { ChevronRight, Download, ExternalLink, MessageSquare, X } from 'lucide-vue-next'
+import { useRoute, useRouter } from 'vue-router'
 import { useFeedStore } from '../../stores/feed'
 import { useInsightsStore } from '../../stores/insights'
 import { useChannelsStore } from '../../stores/channels'
@@ -21,10 +21,13 @@ import { useWorkspaceRole } from '../../composables/useWorkspaceRole'
 import { CATEGORIES, HIGH_SIGNAL_CATEGORIES, type Category } from '../../lib/categories'
 import { shortDate } from '../../lib/relativeTime'
 import type { ExportFormat, FeedFilters, InsightType, WindowKey } from '../../services/types'
+import type { FeedScope } from '../../lib/feedScope'
+import { DEFAULT_FEED_FILTERS, parseFeedScope } from '../../lib/feedScope'
+import { presetFilters, type FeedIntent } from '../../lib/intentTabs'
 import Card from '../../components/Card.vue'
 import CommentCard from '../../components/CommentCard.vue'
 import FilterBar from '../../components/FilterBar.vue'
-import ActionableInsightsPanel from '../../components/ActionableInsightsPanel.vue'
+import FeedIntentTabs from '../../components/FeedIntentTabs.vue'
 import InsightTypeDistributionChart from '../../components/InsightTypeDistributionChart.vue'
 import SentimentChart from '../../components/SentimentChart.vue'
 import ToxicityShield from '../../components/ToxicityShield.vue'
@@ -36,6 +39,7 @@ const feed = useFeedStore()
 const insights = useInsightsStore()
 const channels = useChannelsStore()
 const route = useRoute()
+const router = useRouter()
 const { canExport } = useWorkspaceRole()
 
 const VALID_SORTS: FeedFilters['sort'][] = ['newest', 'oldest']
@@ -52,7 +56,7 @@ const VALID_INSIGHT_TYPES: InsightType[] = [
   'content_format_request', 'other',
 ]
 
-const RANGE_DAYS: Record<WindowKey, number> = { '7d': 7, '30d': 30, '90d': 90 }
+const RANGE_DAYS: Partial<Record<WindowKey, number>> = { '7d': 7, '30d': 30, '90d': 90 }
 
 // Preset ranges materialise into date_from/date_to; the URL carries only the
 // dates, not the range. Reverse-map the span back to its window so a reload
@@ -66,19 +70,24 @@ function rangeFromQuery(query: Record<string, unknown>): WindowKey | null {
 }
 
 const range = ref<WindowKey>(rangeFromQuery(route.query) ?? '7d')
+const intent = ref<FeedIntent>((asString(route.query.intent) as FeedIntent) || 'all')
+const viewMode = ref<'stream' | 'video'>((asString(route.query.view) as 'stream' | 'video') || 'stream')
+const collapsedVideos = ref(new Set<string>())
 
 const serialiseFilters = (f: FeedFilters): Record<string, string> => {
   const q: Record<string, string> = {}
   if (f.channels.length > 0) q.channels = f.channels.join(',')
   const sortedCats = [...f.categories].sort().join(',')
   const defaultCats = [...HIGH_SIGNAL_CATEGORIES].sort().join(',')
-  if (sortedCats !== defaultCats) q.categories = f.categories.join(',')
+  if (f.categories_specified || sortedCats !== defaultCats) q.categories = f.categories.join(',')
   if (f.insight_type) q.insight_type = f.insight_type
   if (f.date_from) q.date_from = f.date_from
   if (f.date_to) q.date_to = f.date_to
   if (f.search) q.search = f.search
   if (f.include_toxic) q.include_toxic = '1'
   if (f.sort && f.sort !== 'newest') q.sort = f.sort
+  if (intent.value !== 'all') q.intent = intent.value
+  if (viewMode.value === 'video') q.view = 'video'
   return q
 }
 
@@ -87,11 +96,12 @@ const parseFilters = (query: Record<string, unknown>): Partial<FeedFilters> => {
   const channelsRaw = asString(query.channels)
   if (channelsRaw) out.channels = channelsRaw.split(',').filter(Boolean)
   const catsRaw = asString(query.categories)
-  if (catsRaw) {
+  if (catsRaw !== null) {
     out.categories = catsRaw
       .split(',')
       .filter((c): c is Category => (CATEGORIES as readonly string[]).includes(c))
   }
+  if (Object.prototype.hasOwnProperty.call(query, 'categories')) out.categories_specified = true
   const insightType = asString(query.insight_type)
   if (insightType && (VALID_INSIGHT_TYPES as readonly string[]).includes(insightType)) {
     out.insight_type = insightType as InsightType
@@ -109,6 +119,64 @@ const parseFilters = (query: Record<string, unknown>): Partial<FeedFilters> => {
   return out
 }
 
+const groupedComments = computed(() => {
+  // Ponytail ceiling: grouping only covers loaded pages; server-side grouping is upgrade path for huge feeds.
+  const groups = new Map<string, typeof feed.comments>()
+  for (const comment of feed.comments) {
+    const key = comment.video_id || 'unknown'
+    const group = groups.get(key) ?? []
+    group.push(comment)
+    groups.set(key, group)
+  }
+  return [...groups.entries()].map(([id, comments]) => ({
+    id,
+    title: comments[0]?.video_title || 'Unknown video',
+    videoId: comments[0]?.video_id,
+    comments,
+    insightCount: comments.reduce((count, comment) => count + (comment.actionable_insights?.length ?? 0), 0),
+  }))
+})
+
+function selectIntent(next: FeedIntent): void {
+  hasScrolled = false
+  intent.value = next
+  feed.applyFilters({ ...presetFilters(next), intent: next === 'questions' || next === 'critique' ? 'all' : next })
+  void feed.fetchFeed({ reset: true })
+  void router.replace({ query: serialiseFilters(feed.filters) })
+}
+
+function selectTopic(topic: string): void {
+  onUpdateFilters({ search: topic })
+}
+
+function selectInsightType(type: InsightType): void {
+  onUpdateFilters({ insight_type: type })
+}
+
+function toggleVideo(id: string): void {
+  if (collapsedVideos.value.has(id)) collapsedVideos.value.delete(id)
+  else collapsedVideos.value.add(id)
+}
+
+const commentIndexMap = computed(() => {
+  const map = new Map<string, number>()
+  feed.comments.forEach((c, i) => map.set(c.id, i))
+  return map
+})
+
+const allCollapsed = computed(() => {
+  if (groupedComments.value.length === 0) return false
+  return groupedComments.value.every((g) => collapsedVideos.value.has(g.id))
+})
+
+function toggleAllVideos(): void {
+  if (allCollapsed.value) {
+    collapsedVideos.value.clear()
+  } else {
+    collapsedVideos.value = new Set(groupedComments.value.map((g) => g.id))
+  }
+}
+
 useFilterUrlSync<FeedFilters>({
   get: () => feed.filters,
   apply: (partial) => feed.applyFilters(partial),
@@ -123,31 +191,43 @@ watch(
   () => route.query,
   (q) => {
     if (JSON.stringify(q) === JSON.stringify(serialiseFilters(feed.filters))) return
-    const nextRange = rangeFromQuery(q as Record<string, unknown>)
-    if (nextRange && nextRange !== range.value) range.value = nextRange
-    feed.applyFilters(parseFilters(q as Record<string, unknown>))
+    const hydrated = parseFeedScope(q as Record<string, unknown>, DEFAULT_FEED_FILTERS())
+    range.value = hydrated.range
+    intent.value = hydrated.intent === 'ideas' || hydrated.intent === 'actionable' ? hydrated.intent : 'all'
+    viewMode.value = asString(q.view) === 'video' ? 'video' : 'stream'
+    feed.applyFilters(hydrated)
     void feed.fetchFeed({ reset: true })
   },
 )
 
 function onUpdateFilters(partial: Partial<FeedFilters>): void {
+  hasScrolled = false
   feed.applyFilters(partial)
   void feed.fetchFeed({ reset: true })
 }
 
 function onResetFilters(): void {
+  hasScrolled = false
   feed.resetFilters()
+  intent.value = 'all'
+  range.value = '7d'
+  viewMode.value = 'stream'
   void feed.fetchFeed({ reset: true })
 }
 
 // Widgets follow the FilterBar: one channel (first selected), the screen
 // range, and — for the actionable panel — the insight-type filter.
-const widgetChannelId = computed(() => feed.filters.channels[0] ?? null)
-const rangeDays = computed(() => RANGE_DAYS[range.value])
+const widgetScope = computed<FeedScope>(() => ({
+  ...feed.filters,
+  intent: (intent.value === 'ideas' || intent.value === 'actionable' ? intent.value : 'all') as FeedScope['intent'],
+  range: range.value,
+  view: viewMode.value,
+}))
+const rangeDays = computed(() => RANGE_DAYS[range.value] ?? 30)
 const toxicityWindow = computed<WindowKey>(() => range.value)
 
 async function refreshInsights(force = false): Promise<void> {
-  await insights.fetchActionableInsights(widgetChannelId.value ?? undefined, range.value, { force })
+  await insights.fetchActionableInsights(widgetScope.value, range.value, { force })
 }
 
 // Sentiment trend — the backend accepts an optional channel_id: with a
@@ -155,18 +235,18 @@ async function refreshInsights(force = false): Promise<void> {
 // it aggregates across every tracked channel (global trend).
 // `fetchSentiment` is guarded for test doubles that predate the action.
 async function refreshSentiment(force = false): Promise<void> {
-  await insights.fetchSentiment?.(widgetChannelId.value ?? undefined, rangeDays.value, { force })
+  await insights.fetchSentiment?.(widgetScope.value, rangeDays.value, { force })
 }
 
 function refreshRangeWidgets(force: boolean): void {
   void refreshInsights(force)
-  void insights.fetchToxicity(widgetChannelId.value ?? undefined, toxicityWindow.value, { force })
-  void insights.fetchTrends(widgetChannelId.value ?? undefined, rangeDays.value, { force })
+  void insights.fetchToxicity(widgetScope.value, toxicityWindow.value, { force })
+  void insights.fetchTrends(widgetScope.value, rangeDays.value, { force })
 }
 
 watch(range, () => refreshRangeWidgets(false))
 
-watch(widgetChannelId, () => {
+watch(widgetScope, () => {
   refreshRangeWidgets(true)
   void refreshSentiment(true)
 })
@@ -187,13 +267,24 @@ async function submitExport(): Promise<void> {
 
 const sentinel = ref<HTMLElement | null>(null)
 let observer: IntersectionObserver | null = null
+let hasScrolled = false
+
+function onUserScroll(): void {
+  hasScrolled = true
+}
 
 function setupObserver(): void {
   if (!sentinel.value || typeof IntersectionObserver === 'undefined') return
+  if (typeof window !== 'undefined') {
+    window.addEventListener('scroll', onUserScroll, { passive: true, once: true })
+    window.addEventListener('wheel', onUserScroll, { passive: true, once: true })
+    window.addEventListener('touchmove', onUserScroll, { passive: true, once: true })
+  }
   observer = new IntersectionObserver(
     (entries) => {
       for (const entry of entries) {
-        if (entry.isIntersecting && feed.hasMore && !feed.loadingMore && !feed.loading) {
+        const canTrigger = hasScrolled || (typeof window !== 'undefined' && window.scrollY > 0)
+        if (entry.isIntersecting && canTrigger && feed.hasMore && !feed.loadingMore && !feed.loading) {
           void feed.loadMore()
         }
       }
@@ -204,6 +295,11 @@ function setupObserver(): void {
 }
 
 function teardownObserver(): void {
+  if (typeof window !== 'undefined') {
+    window.removeEventListener('scroll', onUserScroll)
+    window.removeEventListener('wheel', onUserScroll)
+    window.removeEventListener('touchmove', onUserScroll)
+  }
   if (observer) {
     observer.disconnect()
     observer = null
@@ -238,6 +334,14 @@ function navigateUp() {
   focusedIndex.value = Math.max(focusedIndex.value - 1, 0)
 }
 
+watch(focusedIndex, (idx) => {
+  if (idx < 0) return
+  const cards = document.querySelectorAll('[data-comment-card]')
+  if (cards[idx]) {
+    cards[idx].scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+  }
+})
+
 const { helpVisible } = useKeyboardShortcuts({
   onStar: starFocused,
   onNavigateDown: navigateDown,
@@ -247,12 +351,11 @@ const { helpVisible } = useKeyboardShortcuts({
 
 onMounted(async () => {
   void channels.fetchAll()
-  void feed.fetchFeed({ reset: true })
   refreshRangeWidgets(true)
   void insights.fetchLatestDigest({ force: true })
   void refreshSentiment(true)
 
-  await Promise.resolve()
+  await feed.fetchFeed({ reset: true })
   setupObserver()
 })
 
@@ -264,9 +367,9 @@ onBeforeUnmount(() => {
 usePolling(() => feed.fetchFeed({ reset: true }), 60_000)
 usePolling(async () => {
   await Promise.all([
-    insights.fetchActionableInsights(widgetChannelId.value ?? undefined, range.value, { force: true }),
-    insights.fetchToxicity(widgetChannelId.value ?? undefined, toxicityWindow.value, { force: true }),
-    insights.fetchTrends(widgetChannelId.value ?? undefined, rangeDays.value, { force: true }),
+    insights.fetchActionableInsights(widgetScope.value, range.value, { force: true }),
+    insights.fetchToxicity(widgetScope.value, toxicityWindow.value, { force: true }),
+    insights.fetchTrends(widgetScope.value, rangeDays.value, { force: true }),
     refreshSentiment(true),
   ])
 }, 5 * 60_000)
@@ -275,8 +378,7 @@ usePolling(async () => {
 <template>
   <div class="max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8">
     <PageHeader
-      class="mb-8"
-      eyebrow="Signals"
+      class="mb-6"
       title="Insights feed"
       subtitle="Real-time signals across your channels."
     >
@@ -292,7 +394,7 @@ usePolling(async () => {
       </template>
     </PageHeader>
 
-    <div class="mb-8">
+    <div class="mb-6 space-y-4">
       <FilterBar
         ref="filterBarRef"
         :filters="feed.filters"
@@ -304,52 +406,43 @@ usePolling(async () => {
         @export="canExport && (exportOpen = true)"
         @reset="onResetFilters"
       />
+      <div class="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-200 dark:border-white/10 pb-1.5">
+        <FeedIntentTabs :active="intent" @select="selectIntent" />
+        <div class="flex items-center gap-2 pb-1 sm:pb-0">
+          <button
+            v-if="viewMode === 'video' && groupedComments.length > 1"
+            type="button"
+            class="text-xs font-medium text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200 transition-colors px-2 py-1 rounded-md hover:bg-zinc-100 dark:hover:bg-white/5"
+            @click="toggleAllVideos"
+          >
+            {{ allCollapsed ? 'Expand all' : 'Collapse all' }}
+          </button>
+          <div class="inline-flex items-center p-0.5 rounded-lg bg-zinc-100 dark:bg-white/5 ring-1 ring-zinc-950/5 dark:ring-white/10" role="group" aria-label="Feed view">
+            <button
+              type="button"
+              :aria-pressed="viewMode === 'stream'"
+              class="rounded-md px-2.5 py-1 text-xs font-medium transition-all duration-150 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/70"
+              :class="viewMode === 'stream' ? 'bg-white text-zinc-900 shadow-sm dark:bg-zinc-800 dark:text-white font-semibold' : 'text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200'"
+              @click="viewMode = 'stream'; router.replace({ query: serialiseFilters(feed.filters) })"
+            >
+              Stream
+            </button>
+            <button
+              type="button"
+              :aria-pressed="viewMode === 'video'"
+              class="rounded-md px-2.5 py-1 text-xs font-medium transition-all duration-150 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/70"
+              :class="viewMode === 'video' ? 'bg-white text-zinc-900 shadow-sm dark:bg-zinc-800 dark:text-white font-semibold' : 'text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200'"
+              @click="viewMode = 'video'; router.replace({ query: serialiseFilters(feed.filters) })"
+            >
+              Group by Video
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
 
     <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
-      <aside class="order-1 lg:order-2 lg:col-span-1 space-y-4">
-        <Card class="flex items-center gap-4">
-          <ToxicityShield :data="insights.toxicity" :window-key="toxicityWindow" compact />
-          <div>
-            <p class="eyebrow">Toxicity shield</p>
-            <p class="text-[11px] text-zinc-500 dark:text-zinc-400 mt-1.5">
-              {{ insights.toxicity ? `${insights.toxicity.filtered_comments.toLocaleString()} filtered` : '—' }}
-            </p>
-          </div>
-        </Card>
-
-        <div class="hidden lg:block space-y-4">
-          <SentimentChart :data="insights.sentiment" />
-
-          <InsightTypeDistributionChart
-            v-if="insights.actionableInsights && (insights.actionableInsights.distribution?.length ?? 0) > 0"
-            :distribution="insights.actionableInsights.distribution"
-          />
-
-          <section
-            v-if="insights.trends && insights.trends.top_topics.length > 0"
-            class="space-y-0"
-          >
-            <Card padding="none" class="p-5">
-              <p class="eyebrow mb-4">Top topics</p>
-              <div class="flex flex-wrap gap-1.5">
-                <span
-                  v-for="t in insights.trends.top_topics.slice(0, 12)"
-                  :key="t.topic"
-                  class="inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium bg-zinc-50 dark:bg-white/5 text-zinc-700 dark:text-zinc-300 ring-1 ring-inset ring-zinc-500/10 dark:ring-white/10 transition-colors hover:bg-brand-50 dark:hover:bg-brand-400/10 hover:text-brand-700 dark:hover:text-brand-300"
-                >
-                  {{ t.topic }}
-                  <span class="ml-1.5 text-zinc-400 dark:text-zinc-500 font-mono tabular-nums">{{ t.count }}</span>
-                </span>
-              </div>
-            </Card>
-          </section>
-
-          <WeeklyDigestCard :digest="insights.latestDigest" :loading="insights.loadingDigest" />
-        </div>
-      </aside>
-
-      <div class="order-2 lg:order-1 lg:col-span-3 space-y-4">
+      <div class="order-1 lg:order-1 lg:col-span-3 space-y-4">
         <!-- Export result surface (fix-frontend-plumbing) -->
         <div
           v-if="feed.exportJob"
@@ -395,8 +488,6 @@ usePolling(async () => {
           </p>
         </div>
 
-        <ActionableInsightsPanel :data="insights.actionableInsights" :type-filter="feed.filters.insight_type" />
-
         <div v-if="feed.isInitialLoad" class="space-y-3" role="status" aria-label="Loading comments">
           <div
             v-for="i in 4"
@@ -416,13 +507,51 @@ usePolling(async () => {
         </div>
 
         <TransitionGroup v-else tag="div" name="comment-list" class="space-y-3">
-          <CommentCard
-            v-for="(c, idx) in feed.comments"
-            :key="c.id"
-            :comment="c"
-            :is-focused="idx === focusedIndex"
-            @toggle-star="(id, next) => (next ? feed.starComment(id) : feed.unstarComment(id))"
-          />
+          <template v-if="viewMode === 'stream'">
+            <CommentCard v-for="(c, idx) in feed.comments" :key="c.id" :comment="c" :is-focused="idx === focusedIndex" @toggle-star="(id, next) => (next ? feed.starComment(id) : feed.unstarComment(id))" />
+          </template>
+          <section v-for="group in groupedComments" v-else :key="group.id" class="space-y-3">
+            <div class="flex items-center justify-between gap-3 rounded-xl bg-zinc-50 dark:bg-white/5 ring-1 ring-zinc-950/5 dark:ring-white/10 px-4 py-2.5 transition-colors duration-150">
+              <button
+                type="button"
+                class="flex-1 text-left min-w-0 flex items-center gap-2.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/70 rounded-lg p-0.5 group"
+                :aria-expanded="!collapsedVideos.has(group.id)"
+                @click="toggleVideo(group.id)"
+              >
+                <ChevronRight
+                  class="w-4 h-4 text-zinc-400 group-hover:text-zinc-700 dark:group-hover:text-zinc-200 transition-transform duration-200 shrink-0"
+                  :class="!collapsedVideos.has(group.id) ? 'rotate-90' : ''"
+                  aria-hidden="true"
+                />
+                <span class="truncate text-sm font-semibold text-zinc-900 dark:text-white">{{ group.title }}</span>
+                <span class="shrink-0 inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium bg-zinc-200/60 dark:bg-white/10 text-zinc-600 dark:text-zinc-300 tabular-nums">
+                  {{ group.comments.length }} comments · {{ group.insightCount }} insights
+                </span>
+              </button>
+              <a
+                v-if="group.videoId"
+                :href="`https://www.youtube.com/watch?v=${group.videoId}`"
+                target="_blank"
+                rel="noopener"
+                class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium text-zinc-500 dark:text-zinc-400 hover:text-brand-600 dark:hover:text-brand-400 hover:bg-zinc-100 dark:hover:bg-white/5 transition-colors shrink-0"
+                @click.stop
+                aria-label="Open video on YouTube"
+              >
+                <span>Open video</span>
+                <ExternalLink class="w-3.5 h-3.5" aria-hidden="true" />
+              </a>
+            </div>
+            <div v-if="!collapsedVideos.has(group.id)" class="space-y-3">
+              <CommentCard
+                v-for="c in group.comments"
+                :key="c.id"
+                :comment="c"
+                :is-focused="commentIndexMap.get(c.id) === focusedIndex"
+                :hide-video="true"
+                @toggle-star="(id, next) => (next ? feed.starComment(id) : feed.unstarComment(id))"
+              />
+            </div>
+          </section>
         </TransitionGroup>
 
         <div ref="sentinel" class="h-10 flex items-center justify-center">
@@ -433,7 +562,58 @@ usePolling(async () => {
         </div>
       </div>
 
-      </div>
+      <aside class="order-2 lg:order-2 lg:col-span-1 space-y-4">
+        <Card class="p-5 space-y-5">
+          <div class="flex items-center gap-3.5">
+            <ToxicityShield :data="insights.toxicity" :window-key="toxicityWindow" compact />
+            <div>
+              <h2 class="text-xs font-semibold text-zinc-900 dark:text-white">Toxicity shield</h2>
+              <p class="text-[11px] text-zinc-500 dark:text-zinc-400 mt-0.5">
+                {{ insights.toxicity ? `${insights.toxicity.filtered_comments.toLocaleString()} filtered` : '—' }}
+              </p>
+            </div>
+          </div>
+
+          <div class="hidden lg:block space-y-5 pt-4 border-t border-zinc-100 dark:border-white/5">
+            <SentimentChart :data="insights.sentiment" flat />
+
+            <div
+              v-if="insights.actionableInsights && (insights.actionableInsights.distribution?.length ?? 0) > 0"
+              class="pt-4 border-t border-zinc-100 dark:border-white/5"
+            >
+              <InsightTypeDistributionChart
+                :distribution="insights.actionableInsights.distribution"
+                flat
+                @select-type="selectInsightType"
+              />
+            </div>
+
+            <div
+              v-if="insights.trends && insights.trends.top_topics.length > 0"
+              class="pt-4 border-t border-zinc-100 dark:border-white/5 space-y-2.5"
+            >
+              <h2 class="text-xs font-semibold text-zinc-900 dark:text-white">Top topics</h2>
+              <div class="flex flex-wrap gap-1.5">
+                <button
+                  v-for="t in insights.trends.top_topics.slice(0, 12)"
+                  :key="t.topic"
+                  class="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium bg-zinc-50 dark:bg-white/5 text-zinc-600 dark:text-zinc-300 ring-1 ring-inset ring-zinc-500/10 dark:ring-white/10 transition-colors hover:bg-brand-50 dark:hover:bg-brand-400/10 hover:text-brand-700 dark:hover:text-brand-300"
+                  type="button"
+                  @click="selectTopic(t.topic)"
+                >
+                  {{ t.topic }}
+                  <span class="ml-1 text-zinc-400 dark:text-zinc-500 font-mono tabular-nums">{{ t.count }}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </Card>
+
+        <div class="hidden lg:block">
+          <WeeklyDigestCard :digest="insights.latestDigest" :loading="insights.loadingDigest" />
+        </div>
+      </aside>
+    </div>
 
     <Teleport to="body">
       <div v-if="exportOpen" class="fixed z-50 inset-0 overflow-y-auto" role="dialog" aria-modal="true">

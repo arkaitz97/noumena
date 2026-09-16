@@ -103,7 +103,6 @@ onBeforeUnmount(() => {
 <template>
   <div class="max-w-5xl mx-auto py-8 px-4 sm:px-6 lg:px-8 space-y-8">
     <PageHeader
-      eyebrow="Plan"
       title="Billing & subscription"
       subtitle="Manage your plan, payment method, and invoices."
     />

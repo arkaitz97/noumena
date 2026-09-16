@@ -15,14 +15,13 @@ export const CATEGORIES = [
 
 export type Category = typeof CATEGORIES[number]
 
-/** Categories surfaced by default in the feed (the high-signal seven). */
+/** Categories surfaced by default in the feed. Keep aligned with API. */
 export const HIGH_SIGNAL_CATEGORIES: Category[] = [
   'question',
   'content_idea',
   'collaboration_ask',
   'praise',
   'constructive_criticism',
-  'other',
 ]
 
 /** Categories gated behind the `include_toxic` toggle. */

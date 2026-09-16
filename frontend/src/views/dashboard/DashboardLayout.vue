@@ -236,7 +236,6 @@ function dismissTokenExpiry() {
       </div>
 
       <nav class="flex-1 px-3 py-5 space-y-1">
-        <p class="eyebrow px-3 pb-2">Workspace</p>
         <RouterLink
           v-for="item in navItems"
           :key="item.to"
@@ -337,7 +336,7 @@ function dismissTokenExpiry() {
           </transition>
         </div>
 
-        <p class="px-3 font-mono text-[11px] text-zinc-400 dark:text-zinc-600 tracking-wide">© {{ new Date().getFullYear() }} Noumena</p>
+        <p class="px-3 text-[11px] text-zinc-400 dark:text-zinc-500">© {{ new Date().getFullYear() }} Noumena</p>
       </div>
     </aside>
 

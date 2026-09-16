@@ -104,7 +104,6 @@ onMounted(async () => {
 <template>
   <div class="max-w-5xl mx-auto py-8 px-4 sm:px-6 lg:px-8 space-y-8">
     <PageHeader
-      eyebrow="Sources"
       title="Connected channels"
       subtitle="Manage your tracked channels, pause processing, or remove channels you no longer need."
     >

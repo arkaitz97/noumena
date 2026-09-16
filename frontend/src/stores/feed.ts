@@ -7,7 +7,6 @@ import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { AxiosError } from 'axios'
 import * as commentsApi from '../services/comments'
-import { HIGH_SIGNAL_CATEGORIES } from '../lib/categories'
 import { toast } from '../lib/toast'
 import type {
   ApiErrorBody,
@@ -16,21 +15,9 @@ import type {
   ExportJob,
   FeedFilters,
 } from '../services/types'
+import { DEFAULT_FEED_FILTERS, DEFAULT_SAVED_FILTERS } from '../lib/feedScope'
 
 const PAGE_SIZE = 20
-
-function defaultFilters(): FeedFilters {
-  return {
-    channels: [],
-    categories: [...HIGH_SIGNAL_CATEGORIES],
-    insight_type: null,
-    date_from: null,
-    date_to: null,
-    search: '',
-    include_toxic: false,
-    sort: 'newest',
-  }
-}
 
 function feedTimeoutCode(err: unknown): string | null {
   if (!(err instanceof AxiosError)) return null
@@ -41,7 +28,8 @@ function feedTimeoutCode(err: unknown): string | null {
 
 export const useFeedStore = defineStore('feed', () => {
   // ---- shared filter state ----
-  const filters = ref<FeedFilters>(defaultFilters())
+  const filters = ref<FeedFilters>(DEFAULT_FEED_FILTERS())
+  const savedFilters = ref<FeedFilters>(DEFAULT_SAVED_FILTERS())
 
   // ---- /dashboard feed ----
   const comments = ref<Comment[]>([])
@@ -106,11 +94,18 @@ export const useFeedStore = defineStore('feed', () => {
   }
 
   function resetFilters(): void {
-    filters.value = defaultFilters()
+    filters.value = DEFAULT_FEED_FILTERS()
   }
+
+  function applySavedFilters(partial: Partial<FeedFilters>): void { savedFilters.value = { ...savedFilters.value, ...partial } }
+  function resetSavedFilters(): void { savedFilters.value = DEFAULT_SAVED_FILTERS() }
+
+  let feedRequestId = 0
+  let savedRequestId = 0
 
   async function fetchFeed(opts: { reset?: boolean } = {}): Promise<void> {
     const reset = opts.reset ?? true
+    const reqId = ++feedRequestId
     if (reset) {
       loading.value = true
     } else {
@@ -119,16 +114,22 @@ export const useFeedStore = defineStore('feed', () => {
     try {
       const offset = reset ? 0 : feedOffset.value
       const res = await commentsApi.feed(filters.value, { offset, limit: PAGE_SIZE })
+      if (reqId !== feedRequestId) {
+        return
+      }
       if (reset) {
         comments.value = res.comments
         feedOffset.value = res.comments.length
       } else {
-        comments.value = [...comments.value, ...res.comments]
+        const existingIds = new Set(comments.value.map((c) => c.id))
+        const unique = res.comments.filter((c) => !existingIds.has(c.id))
+        comments.value = [...comments.value, ...unique]
         feedOffset.value += res.comments.length
       }
       total.value = res.total
       hasMore.value = res.has_more
     } catch (err) {
+      if (reqId !== feedRequestId) return
       const code = feedTimeoutCode(err)
       if (code === 'feed_query_timeout') {
         toast.error('That query took too long. Try narrowing your filters.')
@@ -137,8 +138,10 @@ export const useFeedStore = defineStore('feed', () => {
         toast.error('Failed to load comments. Please try again.')
       }
     } finally {
-      loading.value = false
-      loadingMore.value = false
+      if (reqId === feedRequestId) {
+        loading.value = false
+        loadingMore.value = false
+      }
     }
   }
 
@@ -149,6 +152,7 @@ export const useFeedStore = defineStore('feed', () => {
 
   async function fetchSaved(opts: { reset?: boolean } = {}): Promise<void> {
     const reset = opts.reset ?? true
+    const reqId = ++savedRequestId
     if (reset) {
       savedLoading.value = true
     } else {
@@ -156,21 +160,27 @@ export const useFeedStore = defineStore('feed', () => {
     }
     try {
       const offset = reset ? 0 : savedOffset.value
-      const res = await commentsApi.saved(filters.value, { offset, limit: PAGE_SIZE })
+      const res = await commentsApi.saved(savedFilters.value, { offset, limit: PAGE_SIZE })
+      if (reqId !== savedRequestId) return
       if (reset) {
         savedComments.value = res.comments
         savedOffset.value = res.comments.length
       } else {
-        savedComments.value = [...savedComments.value, ...res.comments]
+        const existingIds = new Set(savedComments.value.map((c) => c.id))
+        const unique = res.comments.filter((c) => !existingIds.has(c.id))
+        savedComments.value = [...savedComments.value, ...unique]
         savedOffset.value += res.comments.length
       }
       savedTotal.value = res.total
       savedHasMore.value = res.has_more
     } catch {
+      if (reqId !== savedRequestId) return
       toast.error('Failed to load saved comments. Please try again.')
     } finally {
-      savedLoading.value = false
-      savedLoadingMore.value = false
+      if (reqId === savedRequestId) {
+        savedLoading.value = false
+        savedLoadingMore.value = false
+      }
     }
   }
 
@@ -257,8 +267,11 @@ export const useFeedStore = defineStore('feed', () => {
   return {
     // filters
     filters,
+    savedFilters,
     applyFilters,
     resetFilters,
+    applySavedFilters,
+    resetSavedFilters,
     // feed
     comments,
     total,

@@ -25,6 +25,33 @@ test.describe('feed rendering', () => {
 })
 
 test.describe('filters', () => {
+  test('Ideas intent includes category and insight matches', async ({ page, mockState }) => {
+    await gotoAs(page, mockState, 'verified', '/dashboard')
+    await page.getByRole('tab', { name: 'Ideas' }).click()
+    await expect(page).toHaveURL(/intent=ideas/)
+    await expect(page.getByText('You should make a follow-up covering undervolting settings.')).toBeVisible()
+  })
+
+  test('explicit Actionable intent excludes comments without insights', async ({ page, mockState }) => {
+    await gotoAs(page, mockState, 'verified', '/dashboard')
+    await page.getByRole('tab', { name: 'Actionable' }).click()
+    await expect(page).toHaveURL(/intent=actionable/)
+    await expect(page.getByText(SOURDOUGH_COMMENT)).toHaveCount(0)
+  })
+
+  test('intent tabs filter comments and sync to URL', async ({ page, mockState }) => {
+    await gotoAs(page, mockState, 'verified', '/dashboard')
+    await page.getByRole('tab', { name: 'Questions' }).click()
+    await expect(page).toHaveURL(/intent=questions/)
+  })
+
+  test('group by video toggles grouped headers', async ({ page, mockState }) => {
+    await gotoAs(page, mockState, 'verified', '/dashboard')
+    await page.getByRole('button', { name: 'Group by Video' }).click()
+    await expect(page).toHaveURL(/view=video/)
+    await expect(page.getByText(/comments · .* insights/).first()).toBeVisible()
+  })
+
   test('search narrows the list and syncs to the URL', async ({ page, mockState }) => {
     await gotoAs(page, mockState, 'verified', '/dashboard')
     await expect(page.getByText(GPU_COMMENT)).toBeVisible()
@@ -55,7 +82,7 @@ test.describe('filters', () => {
     await expect(page.getByText(GPU_COMMENT)).toBeVisible()
 
     await openFilters(page)
-    await page.getByRole('button', { name: 'Video Ideas' }).click()
+    await page.getByRole('button', { name: 'Video Ideas', exact: true }).click()
 
     await expect(page.getByText('You should make a follow-up covering undervolting settings.')).toBeVisible()
     await expect(page.getByText(GPU_COMMENT)).toHaveCount(0)
@@ -84,6 +111,13 @@ test.describe('filters', () => {
 
     await expect(page.getByText(GPU_COMMENT)).toBeVisible()
     await expect(page).toHaveURL(/\/dashboard$/)
+  })
+
+  test('explicit empty categories keeps feed empty', async ({ page, mockState }) => {
+    await gotoAs(page, mockState, 'verified', '/dashboard?categories=')
+
+    await expect(page.getByText('No comments match these filters.')).toBeVisible()
+    await expect(page.getByText(GPU_COMMENT)).toHaveCount(0)
   })
 
   test('filter state survives navigation away and back (URL round-trip)', async ({ page, mockState }) => {

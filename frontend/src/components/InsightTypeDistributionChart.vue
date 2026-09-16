@@ -2,9 +2,14 @@
 import { computed } from 'vue'
 import type { InsightDistributionItem, InsightType } from '../services/types'
 
-const props = defineProps<{
-  distribution: InsightDistributionItem[]
-}>()
+const props = withDefaults(
+  defineProps<{
+    distribution: InsightDistributionItem[]
+    flat?: boolean
+  }>(),
+  { flat: false },
+)
+const emit = defineEmits<{ (event: 'select-type', type: InsightType): void }>()
 
 const INSIGHT_TYPE_COLORS: Record<InsightType, string> = {
   video_idea: '#93b4e8',
@@ -37,8 +42,16 @@ const maxCount = computed(() => {
 </script>
 
 <template>
-  <div class="@container bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl p-4 @sm:p-5">
-    <p class="text-xs font-medium text-zinc-500 uppercase tracking-wider mb-3">Insight distribution</p>
+  <div
+    class="@container"
+    :class="flat ? '' : 'bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl p-4 @sm:p-5'"
+  >
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="text-xs font-semibold text-zinc-900 dark:text-white">Insight distribution</h2>
+      <span v-if="sorted.length > 0" class="text-[11px] text-zinc-500 dark:text-zinc-400">
+        Top insight type: <strong class="font-medium text-zinc-700 dark:text-zinc-300">{{ INSIGHT_TYPE_LABELS[sorted[0].type] }}</strong>
+      </span>
+    </div>
 
     <div v-if="sorted.length === 0" class="h-32 flex items-center justify-center text-xs text-zinc-400">
       No data yet
@@ -48,7 +61,11 @@ const maxCount = computed(() => {
       <div
         v-for="item in sorted"
         :key="item.type"
-        class="flex items-center gap-2 @xs:gap-2.5 @sm:gap-3"
+        class="flex items-center gap-2 @xs:gap-2.5 @sm:gap-3 cursor-pointer rounded-md px-1 py-0.5 hover:bg-zinc-50 dark:hover:bg-white/5"
+        role="button"
+        tabindex="0"
+        @click="emit('select-type', item.type)"
+        @keydown.enter="emit('select-type', item.type)"
       >
         <span class="text-[11px] @xs:text-xs text-zinc-600 dark:text-zinc-400 w-24 @xs:w-28 @sm:w-32 truncate text-right">{{ INSIGHT_TYPE_LABELS[item.type] }}</span>
         <div class="flex-1 h-4 bg-zinc-100 dark:bg-zinc-800 rounded-full overflow-hidden">

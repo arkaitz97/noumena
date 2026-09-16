@@ -58,13 +58,21 @@ function applyFeedQuery(comments: Comment[], query: URLSearchParams): Comment[] 
   let out = [...comments]
   const channels = query.get('channels')?.split(',').filter(Boolean) ?? []
   if (channels.length > 0) out = out.filter((c) => channels.includes(c.channel_id))
+  const hasCategories = query.has('categories')
   const categories = query.get('categories')?.split(',').filter(Boolean) ?? []
+  if (hasCategories && categories.length === 0) return []
   if (categories.length > 0) out = out.filter((c) => c.category !== null && categories.includes(c.category))
   const insightType = query.get('insight_type')
   if (insightType) {
     out = out.filter((c) =>
       (c.actionable_insights ?? []).some((i) => i.type === insightType),
     )
+  }
+  const intent = query.get('intent')
+  if (intent === 'ideas') {
+    out = out.filter((c) => c.category === 'content_idea' || (c.actionable_insights ?? []).some((i) => i.type === 'video_idea'))
+  } else if (intent === 'actionable') {
+    out = out.filter((c) => (c.actionable_insights ?? []).length > 0)
   }
   const search = (query.get('search') ?? '').trim().toLowerCase()
   if (search) {

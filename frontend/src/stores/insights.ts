@@ -15,6 +15,7 @@ import type {
   WeeklyDigest,
   WindowKey,
 } from '../services/types'
+import type { FeedScope } from '../lib/feedScope'
 
 const CACHE_MS = 5 * 60 * 1000
 
@@ -48,11 +49,11 @@ export const useInsightsStore = defineStore('insights', () => {
   const sentiment = ref<SentimentData | null>(null)
 
   async function fetchActionableInsights(
-    channelId?: string,
+    channelId?: string | FeedScope,
     windowKey: WindowKey = '7d',
     opts: { force?: boolean } = {},
   ): Promise<InsightAggregatesResponse | null> {
-    const key = cacheKey(channelId, windowKey)
+    const key = cacheKey(typeof channelId === 'string' ? channelId : JSON.stringify(channelId), windowKey)
     if (!opts.force) {
       const hit = fresh(insightsByKey.value[key])
       if (hit) {
@@ -70,12 +71,25 @@ export const useInsightsStore = defineStore('insights', () => {
     }
   }
 
+  async function fetchScope(scope: FeedScope, force = false): Promise<void> {
+    actionableInsights.value = null
+    toxicity.value = null
+    trends.value = null
+    sentiment.value = null
+    await Promise.all([
+      fetchActionableInsights(scope, scope.range as WindowKey, { force }),
+      fetchToxicity(scope, scope.range as WindowKey, { force }),
+      fetchTrends(scope, 7, { force }),
+      fetchSentiment(scope, 7, { force }),
+    ])
+  }
+
   async function fetchToxicity(
-    channelId?: string,
+    channelId?: string | FeedScope,
     windowKey: WindowKey = '7d',
     opts: { force?: boolean } = {},
   ): Promise<ToxicityResponse | null> {
-    const key = cacheKey(channelId, windowKey)
+    const key = cacheKey(typeof channelId === 'string' ? channelId : JSON.stringify(channelId), windowKey)
     if (!opts.force) {
       const hit = fresh(toxicityByKey.value[key])
       if (hit) {
@@ -94,11 +108,11 @@ export const useInsightsStore = defineStore('insights', () => {
   }
 
   async function fetchTrends(
-    channelId?: string,
+    channelId?: string | FeedScope,
     days = 7,
     opts: { force?: boolean } = {},
   ): Promise<TrendsResponse | null> {
-    const key = cacheKey(channelId, `d${days}`)
+    const key = cacheKey(typeof channelId === 'string' ? channelId : JSON.stringify(channelId), `d${days}`)
     if (!opts.force) {
       const hit = fresh(trendsByKey.value[key])
       if (hit) {
@@ -122,11 +136,11 @@ export const useInsightsStore = defineStore('insights', () => {
   // gated 503s and other errors keep the previous value instead of clearing
   // the chart.
   async function fetchSentiment(
-    channelId?: string,
+    channelId?: string | FeedScope,
     days = 7,
     opts: { force?: boolean } = {},
   ): Promise<SentimentData | null> {
-    const key = cacheKey(channelId ?? 'all', `d${days}`)
+    const key = cacheKey(typeof channelId === 'string' ? channelId : JSON.stringify(channelId ?? 'all'), `d${days}`)
     if (!opts.force) {
       const hit = fresh(sentimentByKey.value[key])
       if (hit) {
@@ -170,5 +184,6 @@ export const useInsightsStore = defineStore('insights', () => {
     fetchTrends,
     fetchSentiment,
     fetchLatestDigest,
+    fetchScope,
   }
 })

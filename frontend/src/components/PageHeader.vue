@@ -2,7 +2,7 @@
 // PageHeader — eyebrow + title + subtitle with the staggered rise-in, shared
 // by all DashboardLayout screens. #actions holds right-aligned controls (md+).
 defineProps<{
-  eyebrow: string
+  eyebrow?: string
   title: string
   subtitle?: string
 }>()
@@ -11,7 +11,7 @@ defineProps<{
 <template>
   <div class="md:flex md:items-end md:justify-between">
     <div class="flex-1 min-w-0">
-      <p class="eyebrow rise mb-2">{{ eyebrow }}</p>
+      <p v-if="eyebrow" class="eyebrow rise mb-2">{{ eyebrow }}</p>
       <h1 class="rise d2 text-display-sm font-bold text-zinc-900 dark:text-white">
         {{ title }}
       </h1>

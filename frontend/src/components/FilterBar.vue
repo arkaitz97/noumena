@@ -116,6 +116,7 @@ function setDatePreset(p: DatePreset): void {
     from.setDate(from.getDate() - days)
     emit('update:filters', { date_from: localIso(from), date_to: localIso(today) })
   } else if (p === 'custom') {
+    emit('update:range', 'custom')
     const from = new Date(today)
     from.setDate(from.getDate() - 30)
     emit('update:filters', {
@@ -123,6 +124,7 @@ function setDatePreset(p: DatePreset): void {
       date_to: props.filters.date_to ?? localIso(today),
     })
   } else {
+    emit('update:range', 'all')
     emit('update:filters', { date_from: null, date_to: null })
   }
 }
@@ -227,7 +229,7 @@ function doReset(): void {
           @input="onSearchInput"
           placeholder="Search comments…"
           aria-label="Search comments"
-          class="appearance-none block w-full pl-9 pr-4 py-2 border border-zinc-200 dark:border-white/10 rounded-xl shadow-sm placeholder-zinc-400 dark:placeholder-zinc-500 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500/30 focus:border-brand-500/70 transition-all duration-200 ease-snappy bg-zinc-50/50 focus:bg-white dark:bg-zinc-800 dark:focus:bg-zinc-800 text-zinc-900 dark:text-zinc-100"
+          class="appearance-none block w-full h-9 pl-9 pr-4 border border-zinc-200 dark:border-white/10 rounded-xl shadow-sm placeholder-zinc-400 dark:placeholder-zinc-500 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500/30 focus:border-brand-500/70 transition-all duration-200 ease-snappy bg-zinc-50/50 focus:bg-white dark:bg-zinc-800 dark:focus:bg-zinc-800 text-zinc-900 dark:text-zinc-100"
         />
       </div>
 
@@ -236,7 +238,7 @@ function doReset(): void {
           type="button"
           @click="toggleDateMenu"
           :aria-expanded="dateOpen"
-          class="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm font-medium text-zinc-700 dark:text-zinc-200 bg-white dark:bg-zinc-800/60 border border-zinc-200 dark:border-white/10 hover:border-zinc-300 hover:bg-zinc-50 dark:hover:border-white/20 dark:hover:bg-zinc-800 transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900"
+          class="inline-flex items-center gap-1.5 h-9 px-3 rounded-xl text-sm font-medium text-zinc-700 dark:text-zinc-200 bg-white dark:bg-zinc-800/60 border border-zinc-200 dark:border-white/10 hover:border-zinc-300 hover:bg-zinc-50 dark:hover:border-white/20 dark:hover:bg-zinc-800 transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900"
           aria-label="Select date range"
         >
           <Calendar class="w-4 h-4 text-zinc-400 dark:text-zinc-500" />
@@ -282,7 +284,7 @@ function doReset(): void {
             All time
           </button>
           <div class="my-1 border-t border-zinc-100 dark:border-white/5" />
-          <p class="px-3 pt-1 pb-1.5 text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Custom range</p>
+          <h4 class="px-3 pt-2 pb-1 text-xs font-semibold text-zinc-900 dark:text-zinc-100">Custom range</h4>
           <div class="px-3 pb-2 flex flex-wrap items-center gap-2">
             <input
               type="date"
@@ -310,14 +312,14 @@ function doReset(): void {
           type="button"
           @click="toggleFiltersMenu"
           :aria-expanded="filtersOpen"
-          class="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm font-medium text-zinc-700 dark:text-zinc-200 bg-white dark:bg-zinc-800/60 border border-zinc-200 dark:border-white/10 hover:border-zinc-300 hover:bg-zinc-50 dark:hover:border-white/20 dark:hover:bg-zinc-800 transition-all duration-200 ease-snappy active:scale-[0.98] focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900"
+          class="inline-flex items-center gap-1.5 h-9 px-3 rounded-xl text-sm font-medium text-zinc-700 dark:text-zinc-200 bg-white dark:bg-zinc-800/60 border border-zinc-200 dark:border-white/10 hover:border-zinc-300 hover:bg-zinc-50 dark:hover:border-white/20 dark:hover:bg-zinc-800 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900"
           aria-label="Toggle filters"
         >
           <SlidersHorizontal class="w-4 h-4" />
           <span class="hidden @sm:inline">Filters</span>
           <span
             v-if="activeCount > 0"
-            class="inline-flex items-center justify-center min-w-5 h-5 px-1 rounded-full text-[11px] font-semibold bg-brand-600 text-white"
+            class="inline-flex items-center justify-center min-w-5 h-5 px-1 rounded-full text-[11px] font-semibold tabular-nums bg-brand-600 text-white"
             aria-hidden="true"
           >{{ activeCount }}</span>
         </button>
@@ -326,7 +328,7 @@ function doReset(): void {
           class="fixed inset-x-3 bottom-3 max-h-[65vh] overflow-y-auto rounded-xl bg-white dark:bg-zinc-900 shadow-pop ring-1 ring-zinc-950/5 dark:ring-white/10 p-4 space-y-4 z-30 @sm:absolute @sm:inset-auto @sm:right-0 @sm:top-full @sm:mt-2 @sm:w-80 @sm:max-h-none @sm:overflow-visible @sm:origin-top-right"
         >
           <div v-if="channels.length > 0">
-            <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider mb-2">Channels</p>
+            <h4 class="text-xs font-semibold text-zinc-900 dark:text-zinc-100 mb-2">Channels</h4>
             <div class="flex flex-wrap gap-1.5">
               <button
                 v-for="c in channels"
@@ -335,7 +337,7 @@ function doReset(): void {
                 @click="toggleChannel(c.id)"
                 :aria-pressed="filters.channels.includes(c.id)"
                 :class="[
-                  'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium ring-1 ring-inset transition-all duration-200 ease-snappy',
+                  'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium ring-1 ring-inset transition-colors',
                   filters.channels.includes(c.id)
                     ? 'bg-zinc-900 text-white ring-zinc-900 dark:bg-zinc-100 dark:text-zinc-900 dark:ring-zinc-100'
                     : 'bg-white text-zinc-700 ring-zinc-200 hover:bg-zinc-100/70 dark:bg-zinc-800 dark:text-zinc-300 dark:ring-white/10 dark:hover:bg-white/5',
@@ -348,7 +350,7 @@ function doReset(): void {
 
           <div>
             <div class="flex items-center justify-between mb-2">
-              <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">Categories</p>
+              <h4 class="text-xs font-semibold text-zinc-900 dark:text-zinc-100">Categories</h4>
               <label v-if="isFeed" class="inline-flex items-center gap-1.5 text-xs text-zinc-600 dark:text-zinc-300 cursor-pointer">
                 <input
                   type="checkbox"
@@ -367,7 +369,7 @@ function doReset(): void {
                 @click="toggleCategory(c)"
                 :aria-pressed="isCategoryActive(c)"
                 :class="[
-                  'inline-flex items-center px-2.5 py-1 rounded-md text-xs font-semibold tracking-wide ring-1 ring-inset transition-all duration-200 ease-snappy',
+                  'inline-flex items-center px-2.5 py-1 rounded-md text-xs font-semibold tracking-wide ring-1 ring-inset transition-colors',
                   isCategoryActive(c) ? CATEGORY_COLORS[c] : 'bg-white text-zinc-500 ring-zinc-200 hover:bg-zinc-100/70 dark:bg-zinc-800 dark:text-zinc-400 dark:ring-white/10 dark:hover:bg-white/5',
                 ]"
               >
@@ -377,14 +379,14 @@ function doReset(): void {
           </div>
 
           <div v-if="isFeed">
-            <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider mb-2">Insight type</p>
+            <h4 class="text-xs font-semibold text-zinc-900 dark:text-zinc-100 mb-2">Insight type</h4>
             <div class="flex flex-wrap gap-1.5">
               <button
                 type="button"
                 @click="setInsightType(null)"
                 :aria-pressed="filters.insight_type === null"
                 :class="[
-                  'inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium ring-1 ring-inset transition-all duration-200 ease-snappy',
+                  'inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium ring-1 ring-inset transition-colors',
                   filters.insight_type === null
                     ? 'bg-zinc-900 text-white ring-zinc-900 dark:bg-zinc-100 dark:text-zinc-900 dark:ring-zinc-100'
                     : 'bg-white text-zinc-700 ring-zinc-200 hover:bg-zinc-100/70 dark:bg-zinc-800 dark:text-zinc-300 dark:ring-white/10 dark:hover:bg-white/5',
@@ -399,7 +401,7 @@ function doReset(): void {
                 @click="setInsightType(t)"
                 :aria-pressed="filters.insight_type === t"
                 :class="[
-                  'inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium ring-1 ring-inset transition-all duration-200 ease-snappy',
+                  'inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium ring-1 ring-inset transition-colors',
                   filters.insight_type === t
                     ? 'bg-brand-600 text-white ring-brand-600'
                     : 'bg-white text-zinc-700 ring-zinc-200 hover:bg-zinc-100/70 dark:bg-zinc-800 dark:text-zinc-300 dark:ring-white/10 dark:hover:bg-white/5',
@@ -411,7 +413,7 @@ function doReset(): void {
           </div>
 
           <div v-if="isFeed">
-            <p class="text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider mb-2">Sort order</p>
+            <h4 class="text-xs font-semibold text-zinc-900 dark:text-zinc-100 mb-2">Sort order</h4>
             <div class="inline-flex rounded-lg border border-zinc-200/70 dark:border-white/5 overflow-hidden" role="group" aria-label="Sort order">
               <button
                 v-for="s in (['newest', 'oldest'] as const)"
@@ -419,7 +421,7 @@ function doReset(): void {
                 type="button"
                 @click="setSort(s)"
                 :aria-pressed="filters.sort === s"
-                class="px-3 py-1.5 text-xs font-medium transition-all duration-200 ease-snappy focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60"
+                class="px-3 py-1.5 text-xs font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60"
                 :class="filters.sort === s
                   ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900'
                   : 'bg-white text-zinc-600 hover:bg-zinc-100/70 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-white/5'"

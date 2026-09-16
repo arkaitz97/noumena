@@ -11,9 +11,13 @@
 import { computed } from 'vue'
 import type { SentimentData } from '../services/insights'
 
-const props = defineProps<{
-  data: SentimentData | null
-}>()
+const props = withDefaults(
+  defineProps<{
+    data?: SentimentData | null
+    flat?: boolean
+  }>(),
+  { data: null, flat: false },
+)
 
 const series = computed(() => props.data?.series ?? [])
 const activeDays = computed(() => props.data?.days ?? 7)
@@ -82,9 +86,12 @@ function scoreColor(score: number): string {
 </script>
 
 <template>
-  <div class="@container bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl p-4 @sm:p-5">
+  <div
+    class="@container"
+    :class="flat ? '' : 'bg-white dark:bg-zinc-900 shadow-sm ring-1 ring-zinc-950/5 dark:ring-zinc-100/10 rounded-xl p-4 @sm:p-5'"
+  >
     <div class="flex items-center justify-between gap-3 mb-3">
-      <p class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Sentiment trend</p>
+      <h2 class="text-xs font-semibold text-zinc-900 dark:text-white">Sentiment trend</h2>
     </div>
 
     <div v-if="series.length === 0" class="h-32 flex items-center justify-center text-xs text-zinc-400">

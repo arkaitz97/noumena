@@ -357,7 +357,6 @@ function downloadRecent(j: ExportJob): void {
 <template>
   <div class="max-w-5xl mx-auto py-8 px-4 sm:px-6 lg:px-8 space-y-8">
     <PageHeader
-      eyebrow="Profile"
       title="Account"
       subtitle="Manage your profile, preferences, and account lifecycle."
     />

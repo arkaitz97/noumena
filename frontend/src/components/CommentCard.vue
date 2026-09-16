@@ -6,11 +6,19 @@ import { categoryColor, categoryLabel } from '../lib/categories'
 import { insightTypeColor, insightTypeLabel } from '../lib/insightTypes'
 import { relative } from '../lib/relativeTime'
 
-const props = defineProps<{
-  comment: Comment
-  isStarred?: boolean
-  isFocused?: boolean
-}>()
+const props = withDefaults(
+  defineProps<{
+    comment: Comment
+    isStarred?: boolean
+    isFocused?: boolean
+    hideVideo?: boolean
+  }>(),
+  {
+    isStarred: undefined,
+    isFocused: false,
+    hideVideo: false,
+  },
+)
 
 const emit = defineEmits<{ (e: 'toggle-star', id: string, next: boolean): void }>()
 
@@ -28,7 +36,7 @@ const visibleBody = computed(() =>
 )
 
 const insights = computed<Insight[]>(() => props.comment.actionable_insights ?? [])
-const hasInsights = computed(() => insights.value.length > 0)
+const primaryInsight = computed(() => [...insights.value].sort((a, b) => b.confidence - a.confidence)[0] ?? null)
 
 const author = computed(() =>
   props.comment.author_handle || props.comment.author_display_name || 'anonymous',
@@ -54,14 +62,60 @@ function onToggleStar(): void {
 
 <template>
   <article
+    data-comment-card
     class="@container bg-white dark:bg-zinc-900 shadow-card ring-1 ring-zinc-950/5 dark:ring-white/10 rounded-xl p-5 hover:shadow-pop transition-shadow duration-200 relative overflow-hidden"
-    :class="isFocused ? 'ring-2 ring-brand-500 dark:ring-brand-400 shadow-md' : ''"
+    :class="[
+      isFocused ? 'ring-2 ring-brand-500 dark:ring-brand-400 shadow-md' : '',
+    ]"
   >
     <div>
+      <div v-if="primaryInsight" class="mb-3 pb-3 border-b border-zinc-100 dark:border-white/5">
+        <div class="flex items-center justify-between gap-2 mb-1.5">
+          <div class="flex items-center gap-2 min-w-0">
+            <span class="inline-flex rounded px-1.5 py-0.5 text-[10px] font-semibold ring-1 ring-inset" :class="insightTypeColor(primaryInsight.type)">
+              {{ insightTypeLabel(primaryInsight.type) }}
+            </span>
+            <span class="text-[10px] tabular-nums text-zinc-400 dark:text-zinc-500">
+              {{ Math.round(primaryInsight.confidence * 100) }}% confidence
+            </span>
+            <span v-if="insights.length > 0" class="text-[10px] text-zinc-400 dark:text-zinc-500">
+              · {{ insights.length }} insight{{ insights.length > 1 ? 's' : '' }}
+            </span>
+          </div>
+          <button
+            v-if="insights.length > 1"
+            type="button"
+            class="text-[11px] font-medium text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200 focus:outline-none focus-visible:underline shrink-0"
+            :aria-expanded="insightsExpanded"
+            :aria-controls="insightListId"
+            @click="insightsExpanded = !insightsExpanded"
+          >
+            {{ insightsExpanded ? 'Hide additional' : `+${insights.length - 1} more` }}
+          </button>
+        </div>
+        <p class="text-sm font-semibold text-zinc-900 dark:text-white leading-snug">{{ primaryInsight.description }}</p>
+
+        <div v-if="insightsExpanded && insights.length > 1" :id="insightListId" class="mt-2.5 space-y-2 pt-2 border-t border-zinc-100 dark:border-white/5">
+          <div
+            v-for="(insight, i) in insights.slice(1)"
+            :key="i"
+            class="space-y-0.5 text-xs text-zinc-600 dark:text-zinc-300"
+          >
+            <div class="flex items-center gap-2">
+              <span class="inline-flex rounded px-1.5 py-0.5 text-[10px] font-medium ring-1 ring-inset" :class="insightTypeColor(insight.type)">
+                {{ insightTypeLabel(insight.type) }}
+              </span>
+              <span class="text-[10px] text-zinc-400 tabular-nums">{{ Math.round(insight.confidence * 100) }}%</span>
+            </div>
+            <p>{{ insight.description }}</p>
+          </div>
+        </div>
+      </div>
+
       <div class="flex items-start justify-between gap-2">
-        <div class="flex flex-wrap items-center gap-2 min-w-0">
+        <div class="flex flex-wrap items-center gap-x-2 gap-y-1 min-w-0">
           <p class="text-sm font-semibold text-zinc-900 dark:text-white truncate max-w-[140px] @xs:max-w-[200px] @sm:max-w-none">{{ author }}</p>
-          <span class="text-zinc-300 dark:text-zinc-600">•</span>
+          <span class="text-zinc-300 dark:text-zinc-600 text-xs">•</span>
           <a
             v-if="channelUrl"
             :href="channelUrl"
@@ -72,19 +126,22 @@ function onToggleStar(): void {
             {{ channelLabel }}
           </a>
           <span v-else class="text-xs font-medium text-zinc-500 dark:text-zinc-400 truncate max-w-[120px] @xs:max-w-[180px] @sm:max-w-none">{{ channelLabel }}</span>
-          <span v-if="videoUrl" class="text-zinc-300 dark:text-zinc-600">•</span>
-          <a
-            v-if="videoUrl"
-            :href="videoUrl"
-            target="_blank"
-            rel="noopener"
-            class="inline-flex items-center gap-1 text-xs font-medium text-zinc-500 dark:text-zinc-400 truncate underline-offset-2 hover:underline hover:text-zinc-900 dark:hover:text-zinc-100 max-w-[140px] @xs:max-w-[220px] @sm:max-w-none"
-          >
-            <Play class="w-3 h-3 shrink-0" aria-hidden="true" />
-            <span class="truncate">{{ videoLabel }}</span>
-          </a>
-          <span v-if="postedAt" class="text-zinc-300 dark:text-zinc-600">•</span>
-          <p v-if="postedAt" class="text-xs text-zinc-500 dark:text-zinc-400">{{ postedAt }}</p>
+          <template v-if="videoUrl && !hideVideo">
+            <span class="text-zinc-300 dark:text-zinc-600 text-xs">•</span>
+            <a
+              :href="videoUrl"
+              target="_blank"
+              rel="noopener"
+              class="inline-flex items-center gap-1 text-xs font-medium text-zinc-500 dark:text-zinc-400 truncate underline-offset-2 hover:underline hover:text-zinc-900 dark:hover:text-zinc-100 max-w-[140px] @xs:max-w-[220px] @sm:max-w-none"
+            >
+              <Play class="w-3 h-3 shrink-0" aria-hidden="true" />
+              <span class="truncate">{{ videoLabel }}</span>
+            </a>
+          </template>
+          <template v-if="postedAt">
+            <span class="text-zinc-300 dark:text-zinc-600 text-xs">•</span>
+            <p class="text-xs text-zinc-500 dark:text-zinc-400">{{ postedAt }}</p>
+          </template>
           <span
             v-if="isProcessing"
             class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-50 dark:bg-amber-400/10 text-amber-700 dark:text-amber-300 ring-1 ring-inset ring-amber-600/20 dark:ring-amber-400/20"
@@ -97,10 +154,10 @@ function onToggleStar(): void {
           :aria-pressed="isStarred"
           :aria-label="isStarred ? 'Unstar comment' : 'Star comment'"
           @click="onToggleStar"
-          class="flex items-center justify-center h-11 w-11 rounded-lg transition-all duration-200 active:scale-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60 shrink-0"
-          :class="isStarred ? 'text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-950/30' : 'text-zinc-400 hover:text-amber-400 hover:bg-zinc-100/80 dark:hover:bg-white/5'"
+          class="flex items-center justify-center h-9 w-9 rounded-lg transition-all duration-200 active:scale-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-900 shrink-0"
+          :class="isStarred ? 'text-amber-500 hover:text-amber-600 hover:bg-amber-100/60 dark:text-amber-400 dark:hover:bg-amber-400/10' : 'text-zinc-400 hover:text-amber-500 hover:bg-zinc-100 dark:hover:bg-white/5'"
         >
-          <Star class="h-5 w-5" :fill="isStarred ? 'currentColor' : 'none'" />
+          <Star class="h-4.5 w-4.5" :fill="isStarred ? 'currentColor' : 'none'" />
         </button>
       </div>
 
@@ -116,11 +173,11 @@ function onToggleStar(): void {
         </button>
       </p>
 
-      <div class="flex flex-wrap items-center gap-2">
+      <div v-if="comment.category || comment.topic" class="flex flex-wrap items-center gap-1.5">
         <span
           v-if="comment.category"
           :class="[
-            'inline-flex items-center px-2.5 py-1 rounded-md text-xs font-semibold tracking-wide ring-1 ring-inset',
+            'inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium ring-1 ring-inset',
             categoryColor(comment.category),
           ]"
         >
@@ -128,45 +185,10 @@ function onToggleStar(): void {
         </span>
         <span
           v-if="comment.topic"
-          class="inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium bg-zinc-50 dark:bg-white/5 text-zinc-700 dark:text-zinc-300 ring-1 ring-inset ring-zinc-500/10 dark:ring-white/10 truncate max-w-[140px] @xs:max-w-[200px] @sm:max-w-none"
+          class="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium bg-zinc-50 dark:bg-white/5 text-zinc-600 dark:text-zinc-300 ring-1 ring-inset ring-zinc-500/10 dark:ring-white/10 truncate max-w-[140px] @xs:max-w-[200px] @sm:max-w-none"
         >
           {{ comment.topic }}
         </span>
-        <button
-          v-if="hasInsights"
-          type="button"
-          class="-m-2 p-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60 rounded-lg"
-          :aria-expanded="insightsExpanded"
-          :aria-controls="insightListId"
-          @click="insightsExpanded = !insightsExpanded"
-        >
-          <span
-            class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium bg-brand-50 dark:bg-brand-950/40 text-brand-700 dark:text-brand-300 ring-1 ring-inset ring-brand-600/20 dark:ring-brand-500/30 hover:bg-brand-100 dark:hover:bg-brand-900/50 transition-colors"
-          >
-            {{ insights.length }} insight{{ insights.length > 1 ? 's' : '' }}
-          </span>
-        </button>
-      </div>
-
-      <div v-if="hasInsights && insightsExpanded" :id="insightListId" class="mt-3 space-y-2 border-t border-zinc-200/70 dark:border-white/5 pt-3">
-        <div
-          v-for="(insight, i) in insights"
-          :key="i"
-          class="flex flex-col gap-1"
-        >
-          <div class="flex items-center gap-2">
-            <span
-              :class="[
-                'inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium ring-1 ring-inset',
-                insightTypeColor(insight.type),
-              ]"
-            >
-              {{ insightTypeLabel(insight.type) }}
-            </span>
-            <span class="text-[10px] text-zinc-500 dark:text-zinc-400 font-mono tabular-nums">{{ Math.round(insight.confidence * 100) }}%</span>
-          </div>
-          <p class="text-xs text-zinc-700 dark:text-zinc-300">{{ insight.description }}</p>
-        </div>
       </div>
     </div>
   </article>

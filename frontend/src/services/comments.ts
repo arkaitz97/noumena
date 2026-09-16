@@ -21,7 +21,8 @@ export interface FeedPageOpts {
 function filtersToParams(filters: Partial<FeedFilters>): Record<string, string> {
   const out: Record<string, string> = {}
   if (filters.channels && filters.channels.length > 0) out.channels = filters.channels.join(',')
-  if (filters.categories && filters.categories.length > 0) out.categories = filters.categories.join(',')
+	if (filters.categories) out.categories = filters.categories.join(',')
+	if (filters.intent && filters.intent !== 'all') out.intent = filters.intent
   if (filters.insight_type) out.insight_type = filters.insight_type
   if (filters.date_from) out.date_from = filters.date_from
   if (filters.date_to) out.date_to = filters.date_to
