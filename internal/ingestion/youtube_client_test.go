@@ -187,10 +187,7 @@ func TestYouTubeClient_ReplyMapping(t *testing.T) {
 		Items: []commentThreadItem{
 			{
 				ID: "T1",
-				Snippet: struct {
-					TopLevelComment ytComment `json:"topLevelComment"`
-					TotalReplyCount int       `json:"totalReplyCount"`
-				}{
+				Snippet: commentThreadSnippet{
 					TopLevelComment: ytComment{
 						ID: "abc",
 						Snippet: commentSnippet{
@@ -262,10 +259,7 @@ func TestYouTubeClient_TopLevelCommentDepth(t *testing.T) {
 		Items: []commentThreadItem{
 			{
 				ID: "T1",
-				Snippet: struct {
-					TopLevelComment ytComment `json:"topLevelComment"`
-					TotalReplyCount int       `json:"totalReplyCount"`
-				}{
+				Snippet: commentThreadSnippet{
 					TopLevelComment: ytComment{
 						ID: "top-1",
 						Snippet: commentSnippet{
@@ -305,10 +299,7 @@ func TestYouTubeClient_ReplyDepthMapping(t *testing.T) {
 		Items: []commentThreadItem{
 			{
 				ID: tlcID,
-				Snippet: struct {
-					TopLevelComment ytComment `json:"topLevelComment"`
-					TotalReplyCount int       `json:"totalReplyCount"`
-				}{
+				Snippet: commentThreadSnippet{
 					TopLevelComment: ytComment{
 						ID: tlcID,
 						Snippet: commentSnippet{
@@ -439,6 +430,39 @@ func TestYouTubeClient_ListReplies_ParentIdExtraction(t *testing.T) {
 	}
 }
 
+func TestYouTubeClient_ChannelRowsWithoutVideoAreExcluded(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"items":[
+			{"snippet":{"videoId":"v1","topLevelComment":{"id":"video-comment","snippet":{"publishedAt":"2025-01-01T10:00:00Z","videoId":"v1"}}}},
+			{"snippet":{"topLevelComment":{"id":"channel-comment","snippet":{"publishedAt":"2025-01-01T10:00:00Z"}}}}
+		]}`))
+	}))
+	defer srv.Close()
+
+	c := &YouTubeClient{HTTP: srv.Client(), BaseURL: srv.URL}
+	next := c.ListChannelCommentThreadsPaged(context.Background(), "tok", "channel", "", nil)
+	thread, ok, err := next()
+	if err != nil || !ok || thread.CommentID != "video-comment" {
+		t.Fatalf("expected only video-associated row, got %+v ok=%v err=%v", thread, ok, err)
+	}
+	if _, ok, err := next(); err != nil || ok {
+		t.Fatalf("expected channel-only row to be excluded, ok=%v err=%v", ok, err)
+	}
+}
+
+func TestYouTubeClient_InlineReplyPreservesActualParent(t *testing.T) {
+	items := []commentThreadItem{{
+		Snippet: commentThreadSnippet{TopLevelComment: ytComment{ID: "top", Snippet: commentSnippet{PublishedAt: "2025-01-01T10:00:00Z", VideoID: "v1"}}},
+		Replies: &struct{ Comments []ytComment `json:"comments"` }{Comments: []ytComment{{
+			ID: "nested", Snippet: commentSnippet{ParentID: "reply-parent", PublishedAt: "2025-01-01T11:00:00Z", VideoID: "v1"},
+		}}},
+	}}
+	threads := threadsFromItems(items)
+	if len(threads) != 2 || threads[1].ParentCommentID == nil || *threads[1].ParentCommentID != "reply-parent" {
+		t.Fatalf("inline reply parent was not preserved: %+v", threads)
+	}
+}
+
 // --- uploads-playlist discovery (optimize-youtube-api-quota) ---------------
 
 func TestYouTubeClient_ResolveUploadsPlaylist(t *testing.T) {
@@ -544,10 +568,7 @@ func TestYouTubeClient_ThreadReplyCountsPreserved(t *testing.T) {
 		Items: []commentThreadItem{
 			{
 				ID: "T1",
-				Snippet: struct {
-					TopLevelComment ytComment `json:"topLevelComment"`
-					TotalReplyCount int       `json:"totalReplyCount"`
-				}{
+				Snippet: commentThreadSnippet{
 					TopLevelComment: ytComment{ID: "top", Snippet: commentSnippet{
 						AuthorDisplayName: "A", TextDisplay: "t", PublishedAt: "2025-01-01T10:00:00Z",
 					}},

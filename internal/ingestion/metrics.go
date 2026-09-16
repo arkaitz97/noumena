@@ -33,6 +33,8 @@ var (
 	youtubeQuotaUnitsTotal metric.Int64Counter
 	youtubeSuppressedTotal metric.Int64Counter
 	youtubeDiscoveryTotal  metric.Int64Counter
+	checkpointEventsTotal  metric.Int64Counter
+	checkpointAgeSeconds   metric.Float64Histogram
 )
 
 func init() {
@@ -86,6 +88,23 @@ func init() {
 	); err != nil {
 		panic("noumena_youtube_discovery_total: " + err.Error())
 	}
+	if checkpointEventsTotal, err = ingestionMeter.Int64Counter("noumena_ingestion_checkpoint_events_total", metric.WithDescription("Durable checkpoint and reconciliation events")); err != nil {
+		panic("noumena_ingestion_checkpoint_events_total: " + err.Error())
+	}
+	if checkpointAgeSeconds, err = ingestionMeter.Float64Histogram("noumena_ingestion_checkpoint_age_seconds", metric.WithDescription("Age of durable ingestion checkpoints when resumed"), metric.WithUnit("s")); err != nil {
+		panic("noumena_ingestion_checkpoint_age_seconds: " + err.Error())
+	}
+}
+
+func recordCheckpointEvent(ctx context.Context, event string) {
+	checkpointEventsTotal.Add(ctx, 1, metric.WithAttributes(platformAttr, attribute.String("event", event)))
+}
+
+func recordCheckpointAge(ctx context.Context, updatedAt time.Time) {
+	if updatedAt.IsZero() {
+		return
+	}
+	checkpointAgeSeconds.Record(ctx, time.Since(updatedAt).Seconds(), metric.WithAttributes(platformAttr))
 }
 
 // platformAttr is the canonical platform attribute. Today we only run

@@ -91,11 +91,25 @@ type PlatformChannel struct {
 // posted_at persisted; page checkpoint = commentThreads token to resume
 // from; status = 'active' or 'skipped' for permanently un-fetchable videos).
 type VideoSyncState struct {
-	PlatformChannelID  string
-	VideoID            string
-	CommentWatermarkAt *time.Time
-	PageCheckpoint     *string
-	Status             string
+	PlatformChannelID   string
+	VideoID             string
+	CommentWatermarkAt  *time.Time
+	PageCheckpoint      *string
+	Status              string
+	ReplyPageCheckpoint *string
+	RemoteReplyCount    int
+	LastReplyCheckedAt  *time.Time
+}
+
+type ChannelSyncCheckpoint struct {
+	PlatformChannelID string
+	Phase             string
+	PageToken         *string
+	Boundary          *time.Time
+	CurrentVideoID    *string
+	Status            string
+	ErrorMessage      *string
+	UpdatedAt         time.Time
 }
 
 // IngestionJob is a row in the ingestion_jobs queue.

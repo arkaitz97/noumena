@@ -74,8 +74,19 @@ func parseFeedFilters(r *http.Request, cfg *config.Config) (db.FeedFilters, erro
 	if v := q.Get("channels"); v != "" {
 		f.Channels = splitCSV(v)
 	}
-	if v := q.Get("categories"); v != "" {
-		f.Categories = splitCSV(v)
+	if v, ok := q["categories"]; ok {
+		value := ""
+		if len(v) > 0 {
+			value = v[0]
+		}
+		f.Categories = splitCSV(value)
+		f.CategoriesSpecified = true
+	}
+	if v := q.Get("intent"); v != "" {
+		if v != "all" && v != "ideas" && v != "actionable" {
+			return f, errors.New("invalid intent")
+		}
+		f.Intent = v
 	}
 	if v := q.Get("insight_type"); v != "" {
 		f.InsightType = v
@@ -91,6 +102,9 @@ func parseFeedFilters(r *http.Request, cfg *config.Config) (db.FeedFilters, erro
 		t, err := parseDateOrTime(v)
 		if err != nil {
 			return f, errors.New("invalid date_to")
+		}
+		if len(v) == len("2006-01-02") {
+			t = t.AddDate(0, 0, 1)
 		}
 		f.DateTo = &t
 	}
@@ -424,7 +438,8 @@ type insightsAggregate struct {
 }
 
 func (h *InsightsHandler) buildAggregate(ctx context.Context, userID string, channelID *string, days int) (insightsAggregate, error) {
-	top, dist, err := h.queryTopAndDistribution(ctx, userID, channelID, windowStart(days))
+	filters := aggregateFilters(channelID, days)
+	top, dist, err := h.queryTopAndDistribution(ctx, userID, filters)
 	if err != nil {
 		return insightsAggregate{}, err
 	}
@@ -432,12 +447,20 @@ func (h *InsightsHandler) buildAggregate(ctx context.Context, userID string, cha
 		Distribution: orEmptyDist(dist), TopInsights: orEmptyTop(top), TotalInsights: sumCounts(dist)}, nil
 }
 
-func (h *InsightsHandler) queryTopAndDistribution(ctx context.Context, userID string, channelID *string, since time.Time) ([]db.TopInsight, []db.InsightTypeCount, error) {
-	top, err := h.Queries.GetTopInsights(ctx, userID, channelID, since, 50)
+func aggregateFilters(channelID *string, days int) db.FeedFilters {
+	f := db.FeedFilters{Categories: db.HighSignalCategories, CategoriesSpecified: true, DateFrom: ptrTime(windowStart(days))}
+	if channelID != nil { f.Channels = []string{*channelID} }
+	return f
+}
+
+func ptrTime(t time.Time) *time.Time { return &t }
+
+func (h *InsightsHandler) queryTopAndDistribution(ctx context.Context, userID string, filters db.FeedFilters) ([]db.TopInsight, []db.InsightTypeCount, error) {
+	top, err := h.Queries.GetTopInsights(ctx, userID, filters, 50)
 	if err != nil {
 		return nil, nil, err
 	}
-	dist, err := h.Queries.GetInsightDistribution(ctx, userID, channelID, since)
+	dist, err := h.Queries.GetInsightDistribution(ctx, userID, filters)
 	return top, dist, err
 }
 
@@ -475,7 +498,7 @@ func (h *InsightsHandler) TopInsights(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	days := parseWindowDays(r.URL.Query(), 30)
-	insights, err := h.Queries.GetTopInsights(r.Context(), userID, channelID, windowStart(days), 10)
+	insights, err := h.Queries.GetTopInsights(r.Context(), userID, aggregateFilters(channelID, days), 10)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "aggregate_failed")
 		return
@@ -507,7 +530,7 @@ func (h *InsightsHandler) InsightDistribution(w http.ResponseWriter, r *http.Req
 		return
 	}
 	days := parseWindowDays(r.URL.Query(), 30)
-	dist, err := h.Queries.GetInsightDistribution(r.Context(), userID, channelID, windowStart(days))
+	dist, err := h.Queries.GetInsightDistribution(r.Context(), userID, aggregateFilters(channelID, days))
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "aggregate_failed")
 		return

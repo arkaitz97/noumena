@@ -47,6 +47,10 @@ type WorkerDB interface {
 	InsertComments(ctx context.Context, comments []*db.Comment) (int, error)
 }
 
+type transactionalIngestionDB interface {
+	CommitCommentsAndCheckpoint(context.Context, []*db.Comment, *db.ChannelSyncCheckpoint) (int, error)
+}
+
 // SyncStateDB is the optional DB surface for quota-optimization state
 // (optimize-youtube-api-quota): the uploads-playlist cache, per-video
 // incremental checkpoints, and the adaptive poll interval. Workers fall
@@ -56,6 +60,13 @@ type SyncStateDB interface {
 	SetPollInterval(ctx context.Context, platformChannelID string, minutes int) error
 	GetVideoSyncState(ctx context.Context, platformChannelID, videoID string) (*db.VideoSyncState, error)
 	UpsertVideoSyncState(ctx context.Context, st *db.VideoSyncState) error
+}
+
+type DurableCheckpointDB interface {
+	GetChannelSyncCheckpoint(context.Context, string, string) (*db.ChannelSyncCheckpoint, error)
+	AdvanceChannelSyncCheckpoint(context.Context, *db.ChannelSyncCheckpoint) error
+	CompleteChannelSyncCheckpoint(context.Context, string, string) error
+	PauseChannelSyncCheckpoint(context.Context, string, string, string) error
 }
 
 // DeadLetterAlerter is invoked exactly once when a job is dead-lettered.
@@ -229,6 +240,8 @@ func (w *Worker) processJob(parent context.Context, job *db.IngestionJob) {
 // runJobStateMachine is the per-channel job lifecycle — lock, load, ingest,
 // settle — and returns the telemetry outcome for the run.
 func (w *Worker) runJobStateMachine(parent, jobCtx context.Context, job *db.IngestionJob) string {
+	log.Printf("worker: starting ingestion job=%s type=%s channel=%s", job.ID, job.JobType, job.PlatformChannelID)
+
 	// 1. Acquire per-channel advisory lock.
 	acquired, release, err := AcquireChannelLock(jobCtx, w.Pool, job.PlatformChannelID)
 	if err != nil {
@@ -255,6 +268,7 @@ func (w *Worker) runJobStateMachine(parent, jobCtx context.Context, job *db.Inge
 		return telemetry.OutcomeError
 	}
 	if pc.Platform != "youtube" {
+		log.Printf("worker: skipping non-youtube channel platform=%s channel=%s", pc.Platform, job.PlatformChannelID)
 		// Mark completed; we don't currently support other platforms.
 		_ = w.DB.MarkJobCompleted(parent, job.ID)
 		return telemetry.OutcomeSuccess
@@ -321,11 +335,19 @@ func (w *Worker) publishedAfterWindow(ctx context.Context, pc *db.PlatformChanne
 
 // completeJob records the success bookkeeping and adapts the poll cadence.
 func (w *Worker) completeJob(parent context.Context, job *db.IngestionJob, pc *db.PlatformChannel, stats ingestStats) {
+	if checkpointDB, ok := w.DB.(DurableCheckpointDB); ok {
+		phase := job.JobType
+		if phase == "backfill" || phase == "poll" {
+			_ = checkpointDB.CompleteChannelSyncCheckpoint(parent, pc.ID, phase)
+		}
+	}
 	if err := w.DB.MarkJobCompleted(parent, job.ID); err != nil {
 		log.Printf("worker: mark completed job=%s: %v", job.ID, err)
 	}
 	_ = w.DB.ResetIngestionError(parent, job.PlatformChannelID)
 	_ = w.DB.UpdateLastSyncedAt(parent, job.PlatformChannelID, time.Now())
+	log.Printf("worker: completed ingestion job=%s type=%s channel=%s (videos=%d comments=%d pages=%d reply_walks=%d)",
+		job.ID, job.JobType, job.PlatformChannelID, stats.videos, stats.comments, stats.pages, stats.replyWalks)
 	w.adaptPollInterval(parent, pc, stats)
 }
 
@@ -378,6 +400,7 @@ func (w *Worker) stopAtCeiling(parent context.Context, job *db.IngestionJob, cei
 	_ = w.DB.MarkJobCompleted(parent, job.ID)
 	log.Printf("worker: job ceiling kind=%s limit=%d job=%s channel=%s — remainder deferred to next tick",
 		ceiling.Kind, ceiling.Limit, job.ID, job.PlatformChannelID)
+	recordCheckpointEvent(parent, "incomplete_ceiling_stop")
 	return telemetry.OutcomeSuccess
 }
 
@@ -516,7 +539,8 @@ func (w *Worker) discoverVideos(ctx context.Context, pc *db.PlatformChannel, acc
 	}
 	if pc.UploadsPlaylistID != nil && *pc.UploadsPlaylistID != "" {
 		recordYoutubeDiscovery(ctx, "playlist")
-		return w.Client.ListUploads(ctx, accessTok, *pc.UploadsPlaylistID, stopBefore), nil
+		log.Printf("worker: discovering videos via cached uploads playlist %s channel=%s", *pc.UploadsPlaylistID, pc.ID)
+		return w.listUploadsFromCheckpoint(ctx, accessTok, pc.ID, *pc.UploadsPlaylistID, stopBefore), nil
 	}
 	playlistID, err := w.Client.ResolveUploadsPlaylist(ctx, accessTok, pc.PlatformChannelID)
 	if err != nil {
@@ -529,10 +553,37 @@ func (w *Worker) discoverVideos(ctx context.Context, pc *db.PlatformChannel, acc
 		recordYoutubeDiscovery(ctx, "search_fallback")
 		return w.Client.ListVideos(ctx, accessTok, pc.PlatformChannelID, publishedAfter), nil
 	}
+	log.Printf("worker: resolved uploads playlist %s for channel=%s", playlistID, pc.ID)
 	pc.UploadsPlaylistID = &playlistID
 	w.cacheUploadsPlaylist(ctx, pc.ID, playlistID)
 	recordYoutubeDiscovery(ctx, "playlist")
-	return w.Client.ListUploads(ctx, accessTok, playlistID, stopBefore), nil
+	return w.listUploadsFromCheckpoint(ctx, accessTok, pc.ID, playlistID, stopBefore), nil
+}
+
+func (w *Worker) listUploadsFromCheckpoint(ctx context.Context, accessTok, channelID, playlistID string, stopBefore time.Time) func() (VideoRef, bool, error) {
+	start := ""
+	var checkpointDB DurableCheckpointDB
+	if sdb, ok := w.DB.(DurableCheckpointDB); ok {
+		checkpointDB = sdb
+		if cp, err := sdb.GetChannelSyncCheckpoint(ctx, channelID, "backfill"); err == nil && cp != nil && cp.Status != "complete" && cp.PageToken != nil {
+			start = *cp.PageToken
+			recordCheckpointAge(ctx, cp.UpdatedAt)
+			recordCheckpointEvent(ctx, "resumed_page")
+		}
+	}
+	return w.Client.ListUploadsPaged(ctx, accessTok, playlistID, stopBefore, start, func(fetched, _ string) {
+		if checkpointDB == nil {
+			return
+		}
+		cp := &db.ChannelSyncCheckpoint{PlatformChannelID: channelID, Phase: "backfill", Status: "in_progress"}
+		// Keep current page as replay boundary. A video ceiling can stop
+		// halfway through the buffered page; advancing to next would skip
+		// remaining uploads. Replay is safe through comment upserts.
+		cp.PageToken = &fetched
+		if err := checkpointDB.AdvanceChannelSyncCheckpoint(ctx, cp); err != nil {
+			log.Printf("worker: save backfill checkpoint channel=%s: %v", channelID, err)
+		}
+	})
 }
 
 // isAuthOrLimitError reports the errors whose meaning a fallback walk would
@@ -573,11 +624,17 @@ func (s ingestStats) newContent() bool { return s.videos > 0 || s.comments > 0 }
 // interrupted walk resumes instead of restarting, and prunes requests to
 // threads that actually have missing replies.
 func (w *Worker) runIngestion(jobCtx, persistCtx context.Context, pc *db.PlatformChannel, accessTok string, publishedAfter *time.Time, job *db.IngestionJob) (ingestStats, error) {
+	if job.JobType != "backfill" && pc.LastSyncedAt != nil {
+		return w.runChannelPoll(jobCtx, persistCtx, pc, accessTok)
+	}
+
 	var stats ingestStats
 	var pa time.Time
 	if publishedAfter != nil {
 		pa = *publishedAfter
 	}
+	log.Printf("worker: starting video discovery channel=%s job=%s type=%s (stop_before=%s)",
+		pc.ID, job.ID, job.JobType, pa.UTC().Format(time.RFC3339))
 	nextVideo, err := w.discoverVideos(jobCtx, pc, accessTok, pa, job)
 	if err != nil {
 		return stats, err
@@ -591,16 +648,28 @@ func (w *Worker) runIngestion(jobCtx, persistCtx context.Context, pc *db.Platfor
 	var walk *walkState
 
 	flush := func() error {
-		if len(batch) == 0 {
+		if len(batch) == 0 && (walk == nil || walk.checkpoint == "") {
 			return nil
 		}
-		n, err := w.DB.InsertComments(persistCtx, batch)
+		var checkpoint *db.ChannelSyncCheckpoint
+		if walk != nil {
+			token := walk.checkpoint
+			checkpoint = &db.ChannelSyncCheckpoint{PlatformChannelID: pc.ID, Phase: job.JobType, Status: "in_progress", PageToken: &token, CurrentVideoID: &walk.videoID}
+		}
+		var n int
+		var err error
+		if txdb, ok := w.DB.(transactionalIngestionDB); ok {
+			n, err = txdb.CommitCommentsAndCheckpoint(persistCtx, batch, checkpoint)
+		} else {
+			n, err = w.DB.InsertComments(persistCtx, batch)
+		}
 		if err != nil {
 			return fmt.Errorf("insert comments: %w", err)
 		}
 		// otel-instrumentation §10.5: increment by the count
 		// actually persisted (InsertComments may dedupe).
 		recordCommentsIngested(persistCtx, n)
+		log.Printf("worker: persisted %d comments (batch=%d) channel=%s", n, len(batch), pc.ID)
 		// Backfill must not advance the channel watermark mid-run: a partial
 		// walk (video/page/reply ceiling or deadline) would otherwise promote
 		// the channel to polling and strand the un-scanned older videos.
@@ -630,6 +699,9 @@ func (w *Worker) runIngestion(jobCtx, persistCtx context.Context, pc *db.Platfor
 	// finishVideo persists the final watermark and clears the page
 	// checkpoint — the walk is complete, nothing to resume.
 	finishVideo := func() {
+		if walk != nil {
+			log.Printf("worker: finished comments for video=%s channel=%s", walk.videoID, pc.ID)
+		}
 		if !hasSDB || walk == nil {
 			return
 		}
@@ -663,12 +735,11 @@ func (w *Worker) runIngestion(jobCtx, persistCtx context.Context, pc *db.Platfor
 		if w.MaxVideosPerJob > 0 && stats.videos >= w.MaxVideosPerJob {
 			return stats, &JobBudgetExceededError{Kind: "videos", Limit: w.MaxVideosPerJob}
 		}
-		// Backfill keeps the old server-side window: videos older than the
-		// backfill horizon were never fetched via search.list either.
-		if job.JobType == "backfill" && !v.PublishedAt.IsZero() && v.PublishedAt.Before(pa) {
-			continue
-		}
+		// Backfill eligibility is based on comment PostedAt below, not video
+		// publish time. Evergreen videos can receive recent comments.
 		stats.videos++
+		log.Printf("worker: discovered video id=%s title=%q published_at=%s channel=%s",
+			v.ID, v.Title, v.PublishedAt.UTC().Format(time.RFC3339), pc.ID)
 
 		walk = &walkState{videoID: v.ID}
 		if hasSDB {
@@ -681,9 +752,13 @@ func (w *Worker) runIngestion(jobCtx, persistCtx context.Context, pc *db.Platfor
 			}
 			if walk.checkpoint != "" {
 				log.Printf("worker: resuming video=%s channel=%s from page checkpoint", v.ID, pc.ID)
+				recordCheckpointEvent(jobCtx, "resumed_page")
 			}
 		}
 		resumeFrom := walk.checkpoint
+		if resumeFrom == "" {
+			log.Printf("worker: fetching comments for video=%s channel=%s", v.ID, pc.ID)
+		}
 		pageCeilHit := false
 		nextThread := w.Client.ListCommentThreadsPaged(jobCtx, accessTok, v.ID, resumeFrom, func(fetchedWith, nextToken string) {
 			walk.checkpoint = fetchedWith
@@ -707,6 +782,7 @@ func (w *Worker) runIngestion(jobCtx, persistCtx context.Context, pc *db.Platfor
 					// Permanent: video owner disabled comments. Skip the
 					// video, keep the rest of the ingestion run intact.
 					log.Printf("worker: skip video=%s channel=%s: comments disabled", v.ID, job.PlatformChannelID)
+					recordCheckpointEvent(persistCtx, "skipped_scope_row")
 					if hasSDB {
 						skipped := &db.VideoSyncState{PlatformChannelID: pc.ID, VideoID: v.ID, Status: "skipped"}
 						if err := sdb.UpsertVideoSyncState(persistCtx, skipped); err != nil {
@@ -754,6 +830,9 @@ func (w *Worker) runIngestion(jobCtx, persistCtx context.Context, pc *db.Platfor
 			// when totalReplyCount exceeds the embedded count, so zero- and
 			// fully-inline threads cost nothing extra.
 			if t.ParentCommentID == nil && t.ReplyDepth == 0 && t.TotalReplyCount > t.EmbeddedReplyCount {
+				missing := t.TotalReplyCount - t.EmbeddedReplyCount
+				log.Printf("worker: fetching %d deep replies for comment=%s video=%s channel=%s", missing, t.CommentID, v.ID, pc.ID)
+				recordCheckpointEvent(jobCtx, "reply_reconciliation")
 				if w.MaxReplyFetchesPerJob > 0 && stats.replyWalks >= w.MaxReplyFetchesPerJob {
 					if err := flush(); err != nil {
 						return stats, err
@@ -768,7 +847,10 @@ func (w *Worker) runIngestion(jobCtx, persistCtx context.Context, pc *db.Platfor
 					}
 					r, rok, rerr := nextReply()
 					if rerr != nil {
-						break
+						if ferr := flush(); ferr != nil {
+							return stats, ferr
+						}
+						return stats, rerr
 					}
 					if !rok {
 						break
@@ -809,7 +891,233 @@ func (w *Worker) runIngestion(jobCtx, persistCtx context.Context, pc *db.Platfor
 		finishVideo()
 		walk = nil
 	}
+	log.Printf("worker: finished ingestion run channel=%s job=%s (videos=%d comments=%d pages=%d reply_walks=%d)",
+		pc.ID, job.ID, stats.videos, stats.comments, stats.pages, stats.replyWalks)
 	return stats, flush()
+}
+
+// runChannelPoll streams recent comment threads across the entire channel ordered newest-first.
+// It stops when encountering comments older than pc.LastSyncedAt, resolves missing video titles
+// via videos.list in batches of up to 50, and persists comments and updated sync watermarks.
+func (w *Worker) runChannelPoll(jobCtx, persistCtx context.Context, pc *db.PlatformChannel, accessTok string) (ingestStats, error) {
+	var stats ingestStats
+	var watermark time.Time
+	if pc.LastSyncedAt != nil {
+		watermark = *pc.LastSyncedAt
+	}
+	wmStr := "none"
+	if !watermark.IsZero() {
+		wmStr = watermark.UTC().Format(time.RFC3339)
+	}
+	log.Printf("worker: starting channel comment poll channel=%s watermark=%s", pc.ID, wmStr)
+
+	batch := make([]*db.Comment, 0, commentBatchSize)
+	videoTitles := make(map[string]string)
+	resolvedVideos := make(map[string]bool)
+	var maxPostedAt time.Time
+	pageCeilHit := false
+	resumeToken := ""
+	var pendingCheckpoint *db.ChannelSyncCheckpoint
+	var checkpointDB DurableCheckpointDB
+	if sdb, ok := w.DB.(DurableCheckpointDB); ok {
+		checkpointDB = sdb
+		if cp, err := sdb.GetChannelSyncCheckpoint(persistCtx, pc.ID, "poll"); err == nil && cp != nil && cp.Status != "complete" && cp.PageToken != nil {
+			resumeToken = *cp.PageToken
+			recordCheckpointAge(persistCtx, cp.UpdatedAt)
+			recordCheckpointEvent(persistCtx, "resumed_page")
+		}
+	}
+
+	resolveMissingTitles := func(comments []*db.Comment) error {
+		var needed []string
+		for _, c := range comments {
+			if c.VideoID == nil || *c.VideoID == "" {
+				continue
+			}
+			vid := *c.VideoID
+			if (c.VideoTitle == nil || *c.VideoTitle == "") && !resolvedVideos[vid] {
+				resolvedVideos[vid] = true
+				needed = append(needed, vid)
+			}
+		}
+		if len(needed) > 0 {
+			log.Printf("worker: resolving titles for %d videos channel=%s", len(needed), pc.ID)
+			titles, err := w.Client.GetVideoTitles(jobCtx, accessTok, needed)
+			if err != nil {
+				if isAuthOrLimitError(err) {
+					return err
+				}
+				log.Printf("worker: failed to get video titles: %v", err)
+			} else {
+				log.Printf("worker: resolved %d video titles channel=%s", len(titles), pc.ID)
+				for vid, title := range titles {
+					videoTitles[vid] = title
+				}
+			}
+		}
+		for _, c := range comments {
+			if c.VideoID != nil && (c.VideoTitle == nil || *c.VideoTitle == "") {
+				if title, ok := videoTitles[*c.VideoID]; ok && title != "" {
+					c.VideoTitle = &title
+				}
+			}
+		}
+		return nil
+	}
+
+	flush := func() error {
+		if len(batch) == 0 && pendingCheckpoint == nil {
+			return nil
+		}
+		if err := resolveMissingTitles(batch); err != nil {
+			return err
+		}
+		var n int
+		var err error
+		if txdb, ok := w.DB.(transactionalIngestionDB); ok {
+			n, err = txdb.CommitCommentsAndCheckpoint(persistCtx, batch, pendingCheckpoint)
+		} else {
+			n, err = w.DB.InsertComments(persistCtx, batch)
+		}
+		if err != nil {
+			return fmt.Errorf("insert comments: %w", err)
+		}
+		recordCommentsIngested(persistCtx, n)
+		log.Printf("worker: persisted %d comments (batch=%d) channel=%s", n, len(batch), pc.ID)
+		if !maxPostedAt.IsZero() {
+			_ = w.DB.UpdateLastSyncedAt(persistCtx, pc.ID, maxPostedAt)
+		}
+		batch = batch[:0]
+		pendingCheckpoint = nil
+		return nil
+	}
+
+	nextThread := w.Client.ListChannelCommentThreadsPaged(jobCtx, accessTok, pc.PlatformChannelID, resumeToken, func(fetchedWith, nextToken string) {
+		stats.pages++
+		if checkpointDB != nil {
+			// Commit with comments after page consumption. Replaying this page is
+			// safe; advancing here could skip comments on a crash.
+			pendingCheckpoint = &db.ChannelSyncCheckpoint{PlatformChannelID: pc.ID, Phase: "poll", Status: "in_progress", PageToken: &fetchedWith}
+		}
+		if w.MaxThreadPagesPerJob > 0 && stats.pages >= w.MaxThreadPagesPerJob && nextToken != "" {
+			pageCeilHit = true
+		}
+	})
+
+	for {
+		if jobCtx.Err() != nil {
+			if err := flush(); err != nil {
+				return stats, err
+			}
+			return stats, jobCtx.Err()
+		}
+
+		t, ok, err := nextThread()
+		if err != nil {
+			var cde *CommentsDisabledError
+			if errors.As(err, &cde) {
+				log.Printf("worker: channel %s comments disabled", pc.PlatformChannelID)
+				break
+			}
+			if ferr := flush(); ferr != nil {
+				return stats, ferr
+			}
+			if checkpointDB != nil {
+				_ = checkpointDB.PauseChannelSyncCheckpoint(persistCtx, pc.ID, "poll", err.Error())
+			}
+			return stats, err
+		}
+		if !ok {
+			break
+		}
+
+		// Watermark check: top-level threads are ordered newest-first.
+		// Stop walking when we reach a top-level thread published before the watermark.
+		oldTopLevel := t.ParentCommentID == nil && !watermark.IsZero() && !t.PostedAt.IsZero() && t.PostedAt.Before(watermark)
+		needsReplyReconciliation := oldTopLevel && t.ReplyDepth == 0 && t.TotalReplyCount > t.EmbeddedReplyCount
+		if oldTopLevel && !needsReplyReconciliation {
+			log.Printf("worker: channel poll reached watermark (%s) at comment posted_at=%s channel=%s",
+				watermark.UTC().Format(time.RFC3339), t.PostedAt.UTC().Format(time.RFC3339), pc.ID)
+			break
+		}
+		if !needsReplyReconciliation && !watermark.IsZero() && !t.PostedAt.IsZero() && t.PostedAt.Before(watermark) {
+			continue
+		}
+
+		c := t.ToDBComment(pc.ID)
+		batch = append(batch, c)
+		stats.comments++
+		if t.PostedAt.After(maxPostedAt) {
+			maxPostedAt = t.PostedAt
+		}
+		if len(batch) >= commentBatchSize {
+			if err := flush(); err != nil {
+				return stats, err
+			}
+		}
+
+		// Deep replies: gate on MISSING replies only
+		if t.ParentCommentID == nil && t.ReplyDepth == 0 && t.TotalReplyCount > t.EmbeddedReplyCount {
+			missing := t.TotalReplyCount - t.EmbeddedReplyCount
+			log.Printf("worker: fetching %d deep replies for comment=%s channel=%s", missing, t.CommentID, pc.ID)
+			recordCheckpointEvent(jobCtx, "reply_reconciliation")
+			if w.MaxReplyFetchesPerJob > 0 && stats.replyWalks >= w.MaxReplyFetchesPerJob {
+				if err := flush(); err != nil {
+					return stats, err
+				}
+				return stats, &JobBudgetExceededError{Kind: "replies", Limit: w.MaxReplyFetchesPerJob}
+			}
+			stats.replyWalks++
+			nextReply := w.Client.ListReplies(jobCtx, accessTok, t.CommentID)
+			for {
+				if jobCtx.Err() != nil {
+					break
+				}
+				r, rok, rerr := nextReply()
+				if rerr != nil {
+					if ferr := flush(); ferr != nil {
+						return stats, ferr
+					}
+					return stats, rerr
+				}
+				if !rok {
+					break
+				}
+				if !watermark.IsZero() && !r.PostedAt.IsZero() && r.PostedAt.Before(watermark) {
+					continue
+				}
+				r.VideoID = t.VideoID
+				rc := r.ToDBComment(pc.ID)
+				batch = append(batch, rc)
+				stats.comments++
+				if r.PostedAt.After(maxPostedAt) {
+					maxPostedAt = r.PostedAt
+				}
+				if len(batch) >= commentBatchSize {
+					if err := flush(); err != nil {
+						return stats, err
+					}
+				}
+			}
+		}
+
+		if pageCeilHit {
+			if err := flush(); err != nil {
+				return stats, err
+			}
+			return stats, &JobBudgetExceededError{Kind: "pages", Limit: w.MaxThreadPagesPerJob}
+		}
+	}
+
+	log.Printf("worker: finished channel comment poll channel=%s (comments=%d pages=%d reply_walks=%d)",
+		pc.ID, stats.comments, stats.pages, stats.replyWalks)
+	if err := flush(); err != nil {
+		return stats, err
+	}
+	if checkpointDB != nil {
+		_ = checkpointDB.CompleteChannelSyncCheckpoint(persistCtx, pc.ID, "poll")
+	}
+	return stats, nil
 }
 
 // failJob routes a generic error to MarkJobFailed or MarkJobDeadLettered

@@ -7,6 +7,48 @@ import (
 	"time"
 )
 
+// CommitCommentsAndCheckpoint makes replay boundaries durable with their
+// comment batch. A failed transaction leaves both at their prior position.
+func (q *SQLiteQuery) CommitCommentsAndCheckpoint(ctx context.Context, comments []*Comment, checkpoint *ChannelSyncCheckpoint) (int, error) {
+	tx, err := q.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	inserted := 0
+	for _, c := range comments {
+		res, err := tx.ExecContext(ctx, `INSERT INTO comments (id, platform_channel_id, platform_comment_id, parent_comment_id, reply_depth, author_handle, body, posted_at, video_id, video_title, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now')) ON CONFLICT (platform_channel_id, platform_comment_id) DO UPDATE SET video_id=COALESCE(excluded.video_id, comments.video_id), video_title=COALESCE(excluded.video_title, comments.video_title)`, generateUUID(), c.PlatformChannelID, c.PlatformCommentID, c.ParentCommentID, c.ReplyDepth, c.AuthorHandle, c.Body, formatTime(c.PostedAt), c.VideoID, c.VideoTitle)
+		if err != nil {
+			_ = tx.Rollback()
+			return inserted, err
+		}
+		n, _ := res.RowsAffected()
+		inserted += int(n)
+	}
+	if checkpoint != nil {
+		var token, boundary, video, msg any
+		if checkpoint.PageToken != nil {
+			token = *checkpoint.PageToken
+		}
+		if checkpoint.Boundary != nil {
+			boundary = checkpoint.Boundary.UTC().Format(time.RFC3339)
+		}
+		if checkpoint.CurrentVideoID != nil {
+			video = *checkpoint.CurrentVideoID
+		}
+		if checkpoint.ErrorMessage != nil {
+			msg = *checkpoint.ErrorMessage
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO channel_sync_checkpoints(platform_channel_id,phase,page_token,boundary,current_video_id,status,error_message,updated_at) VALUES(?,?,?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%SZ','now')) ON CONFLICT(platform_channel_id,phase) DO UPDATE SET page_token=excluded.page_token,boundary=excluded.boundary,current_video_id=excluded.current_video_id,status=excluded.status,error_message=excluded.error_message,updated_at=excluded.updated_at`, checkpoint.PlatformChannelID, checkpoint.Phase, token, boundary, video, checkpoint.Status, msg); err != nil {
+			_ = tx.Rollback()
+			return inserted, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return inserted, err
+	}
+	return inserted, nil
+}
+
 func (q *SQLiteQuery) GetCommentFeed(ctx context.Context, userID string, limit, offset int) ([]*Comment, error) {
 	query := `
 		SELECT c.id, c.platform_channel_id, c.platform_comment_id, c.parent_comment_id, c.reply_depth, c.author_handle, c.body, c.posted_at, c.category, c.actionable_insights, c.topic, c.confidence, c.processed_at, c.created_at

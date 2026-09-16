@@ -48,10 +48,10 @@ type InsightsQuery interface {
 	BulkUnstarComments(ctx context.Context, userID string, commentIDs []string) (int, error)
 
 	// Insights aggregates.
-	GetTopInsights(ctx context.Context, userID string, channelID *string, since time.Time, limit int) ([]TopInsight, error)
+	GetTopInsights(ctx context.Context, userID string, filters FeedFilters, limit int) ([]TopInsight, error)
 	GetTopCategories(ctx context.Context, userID string, channelID *string, days int) ([]CategoryRow, error)
 	GetTopTopics(ctx context.Context, userID string, channelID *string, days int, limit int) ([]TopicRow, error)
-	GetInsightDistribution(ctx context.Context, userID string, channelID *string, since time.Time) ([]InsightTypeCount, error)
+	GetInsightDistribution(ctx context.Context, userID string, filters FeedFilters) ([]InsightTypeCount, error)
 	GetSentimentSeries(ctx context.Context, userID, channelID string, days int) ([]SentimentDay, error)
 	GetToxicityShield(ctx context.Context, userID string, channelID *string, since time.Time) (ToxicityBucket, error)
 	GetLatestDigest(ctx context.Context, userID string) (*LatestDigest, error)

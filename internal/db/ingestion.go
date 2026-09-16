@@ -19,9 +19,13 @@ func (q *SQLiteQuery) GetChannelsNeedingSync(ctx context.Context, intervalMinute
 		        pc.ingestion_last_error_at, pc.ingestion_backoff_until,
 		        pc.yt_uploads_playlist_id, pc.poll_interval_minutes
 		   FROM platform_channels pc
-		  WHERE (pc.last_synced_at IS NULL
+		  WHERE ((pc.last_synced_at IS NULL
 		         OR pc.last_synced_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now',
 		              '-' || COALESCE(pc.poll_interval_minutes, ?) || ' minutes'))
+		    OR EXISTS (SELECT 1 FROM channel_sync_checkpoints csc
+		                WHERE csc.platform_channel_id = pc.id
+		                  AND csc.phase = 'backfill'
+		                  AND csc.status <> 'complete'))
 		    AND (pc.ingestion_backoff_until IS NULL
 		         OR pc.ingestion_backoff_until < strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 		    AND EXISTS (
@@ -154,12 +158,12 @@ func (q *SQLiteQuery) UpsertVideoSyncState(ctx context.Context, st *VideoSyncSta
 // ErrNotFound when no checkpoint has been recorded yet.
 func (q *SQLiteQuery) GetVideoSyncState(ctx context.Context, platformChannelID, videoID string) (*VideoSyncState, error) {
 	st := &VideoSyncState{PlatformChannelID: platformChannelID, VideoID: videoID}
-	var watermark, checkpoint sql.NullString
+	var watermark, checkpoint, replyCheckpoint, replyChecked sql.NullString
 	err := q.db.QueryRowContext(ctx,
-		`SELECT comment_watermark_at, page_checkpoint, status
+		`SELECT comment_watermark_at, page_checkpoint, status, reply_page_checkpoint, remote_reply_count, last_reply_checked_at
 		   FROM video_sync_state
 		  WHERE platform_channel_id = ? AND video_id = ?`,
-		platformChannelID, videoID).Scan(&watermark, &checkpoint, &st.Status)
+		platformChannelID, videoID).Scan(&watermark, &checkpoint, &st.Status, &replyCheckpoint, &st.RemoteReplyCount, &replyChecked)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -168,7 +172,57 @@ func (q *SQLiteQuery) GetVideoSyncState(ctx context.Context, platformChannelID, 
 	}
 	st.CommentWatermarkAt = parseTimePtr(watermark)
 	st.PageCheckpoint = strPtrOrNull(checkpoint)
+	st.ReplyPageCheckpoint = strPtrOrNull(replyCheckpoint)
+	st.LastReplyCheckedAt = parseTimePtr(replyChecked)
 	return st, nil
+}
+
+func (q *SQLiteQuery) GetChannelSyncCheckpoint(ctx context.Context, channelID, phase string) (*ChannelSyncCheckpoint, error) {
+	c := &ChannelSyncCheckpoint{PlatformChannelID: channelID, Phase: phase}
+	var token, boundary, video, msg, updated string
+	err := q.db.QueryRowContext(ctx, `SELECT page_token,boundary,current_video_id,status,error_message,updated_at FROM channel_sync_checkpoints WHERE platform_channel_id=? AND phase=?`, channelID, phase).Scan(&token, &boundary, &video, &c.Status, &msg, &updated)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	c.PageToken, c.CurrentVideoID, c.ErrorMessage = strPtr(token), strPtr(video), strPtr(msg)
+	if boundary != "" {
+		t := parseTime(boundary)
+		c.Boundary = &t
+	}
+	c.UpdatedAt = parseTime(updated)
+	return c, nil
+}
+
+func (q *SQLiteQuery) AdvanceChannelSyncCheckpoint(ctx context.Context, c *ChannelSyncCheckpoint) error {
+	var token, boundary, video, msg any
+	if c.PageToken != nil {
+		token = *c.PageToken
+	}
+	if c.Boundary != nil {
+		boundary = c.Boundary.UTC().Format(time.RFC3339)
+	}
+	if c.CurrentVideoID != nil {
+		video = *c.CurrentVideoID
+	}
+	if c.ErrorMessage != nil {
+		msg = *c.ErrorMessage
+	}
+	_, err := q.db.ExecContext(ctx, `INSERT INTO channel_sync_checkpoints(platform_channel_id,phase,page_token,boundary,current_video_id,status,error_message,updated_at) VALUES(?,?,?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%SZ','now')) ON CONFLICT(platform_channel_id,phase) DO UPDATE SET page_token=excluded.page_token,boundary=excluded.boundary,current_video_id=excluded.current_video_id,status=excluded.status,error_message=excluded.error_message,updated_at=excluded.updated_at`, c.PlatformChannelID, c.Phase, token, boundary, video, c.Status, msg)
+	return err
+}
+
+func (q *SQLiteQuery) CompleteChannelSyncCheckpoint(ctx context.Context, channelID, phase string) error {
+	return q.updateChannelCheckpointStatus(ctx, channelID, phase, "complete", nil)
+}
+func (q *SQLiteQuery) PauseChannelSyncCheckpoint(ctx context.Context, channelID, phase string, errMsg string) error {
+	return q.updateChannelCheckpointStatus(ctx, channelID, phase, "paused", &errMsg)
+}
+func (q *SQLiteQuery) updateChannelCheckpointStatus(ctx context.Context, channelID, phase, status string, msg *string) error {
+	_, err := q.db.ExecContext(ctx, `UPDATE channel_sync_checkpoints SET status=?,error_message=?,updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE platform_channel_id=? AND phase=?`, status, msg, channelID, phase)
+	return err
 }
 
 func (q *SQLiteQuery) UpdateIngestionError(ctx context.Context, platformChannelID, errMsg string, retryAfter time.Duration) error {

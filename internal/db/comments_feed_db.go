@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -195,32 +196,19 @@ type CategoryRow struct {
 	Count    int64  `json:"count"`
 }
 
-func (q *SQLiteQuery) GetInsightDistribution(ctx context.Context, userID string, channelID *string, since time.Time) ([]InsightTypeCount, error) {
-	args := []any{userID, userID, since.UTC().Format(time.RFC3339)}
-	channelClause := ""
-	if channelID != nil {
-		args = append(args, *channelID)
-		channelClause = " AND c.platform_channel_id = ?"
-	}
+func scopedCommentQuery(userID string, filters FeedFilters) (string, []any) {
+	sqlStr, args := BuildFeedQuery(userID, filters, ModeCount)
+	return strings.Replace(sqlStr, "SELECT COUNT(*)", "SELECT c.id", 1), args
+}
+
+func (q *SQLiteQuery) GetInsightDistribution(ctx context.Context, userID string, filters FeedFilters) ([]InsightTypeCount, error) {
+	scoped, args := scopedCommentQuery(userID, filters)
 	sqlStr := `
 		SELECT json_extract(elem.value, '$.type'), COUNT(*)
-		FROM comments c,
+		FROM (` + scoped + `) scoped
+		JOIN comments c ON c.id = scoped.id,
 		json_each(c.actionable_insights) elem
-		WHERE (EXISTS (
-			SELECT 1 FROM user_channel_tracking uct
-			WHERE uct.platform_channel_id = c.platform_channel_id
-			  AND uct.user_id = ?
-			  AND uct.tracking_status IN ('active','paused')
-		) OR EXISTS (
-			SELECT 1 FROM channel_grants cg
-			JOIN workspace_members wm ON wm.workspace_id = cg.workspace_id
-			WHERE cg.channel_id = c.platform_channel_id
-			  AND wm.user_id = ?
-		))
-		  AND c.processed_at IS NOT NULL
-		  AND c.posted_at >= ?
-		  AND c.category NOT IN ('toxic_criticism','spam')
-		  AND c.actionable_insights != '[]'` + channelClause + `
+		WHERE c.actionable_insights != '[]'
 		GROUP BY json_extract(elem.value, '$.type')
 		ORDER BY COUNT(*) DESC
 	`
@@ -240,34 +228,16 @@ func (q *SQLiteQuery) GetInsightDistribution(ctx context.Context, userID string,
 	return out, rows.Err()
 }
 
-func (q *SQLiteQuery) GetTopInsights(ctx context.Context, userID string, channelID *string, since time.Time, limit int) ([]TopInsight, error) {
-	args := []any{userID, userID, since.UTC().Format(time.RFC3339)}
-	channelClause := ""
-	if channelID != nil {
-		args = append(args, *channelID)
-		channelClause = " AND c.platform_channel_id = ?"
-	}
+func (q *SQLiteQuery) GetTopInsights(ctx context.Context, userID string, filters FeedFilters, limit int) ([]TopInsight, error) {
+	scoped, args := scopedCommentQuery(userID, filters)
 	args = append(args, limit)
 	limitParam := "?"
 	sqlStr := `
 		SELECT json_extract(elem.value, '$.type'), json_extract(elem.value, '$.description'), COUNT(*), AVG(json_extract(elem.value, '$.confidence'))
-		FROM comments c,
+		FROM (` + scoped + `) scoped
+		JOIN comments c ON c.id = scoped.id,
 		json_each(c.actionable_insights) elem
-		WHERE (EXISTS (
-			SELECT 1 FROM user_channel_tracking uct
-			WHERE uct.platform_channel_id = c.platform_channel_id
-			  AND uct.user_id = ?
-			  AND uct.tracking_status IN ('active','paused')
-		) OR EXISTS (
-			SELECT 1 FROM channel_grants cg
-			JOIN workspace_members wm ON wm.workspace_id = cg.workspace_id
-			WHERE cg.channel_id = c.platform_channel_id
-			  AND wm.user_id = ?
-		))
-		  AND c.processed_at IS NOT NULL
-		  AND c.posted_at >= ?
-		  AND c.category NOT IN ('toxic_criticism','spam')
-		  AND c.actionable_insights != '[]'` + channelClause + `
+		WHERE c.actionable_insights != '[]'
 		GROUP BY json_extract(elem.value, '$.type'), json_extract(elem.value, '$.description')
 		ORDER BY COUNT(*) DESC
 		LIMIT ` + limitParam

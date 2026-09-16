@@ -567,6 +567,41 @@ FROM users`); err != nil {
 			return nil
 		},
 	},
+	{
+		version: 20,
+		name:    "durable ingestion scan checkpoints",
+		run: func(ctx context.Context, tx *sql.Tx) error {
+			if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS channel_sync_checkpoints (
+				platform_channel_id TEXT NOT NULL REFERENCES platform_channels(id) ON DELETE CASCADE,
+				phase TEXT NOT NULL CHECK (phase IN ('poll','backfill','reply')),
+				page_token TEXT,
+				boundary TEXT,
+				current_video_id TEXT,
+				status TEXT NOT NULL DEFAULT 'in_progress' CHECK (status IN ('in_progress','complete','paused','error')),
+				error_message TEXT,
+				updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+				PRIMARY KEY (platform_channel_id, phase)
+			)`); err != nil {
+				return fmt.Errorf("create channel_sync_checkpoints: %w", err)
+			}
+			for _, col := range []struct{ name, ddl string }{
+				{"reply_page_checkpoint", "TEXT"},
+				{"remote_reply_count", "INTEGER NOT NULL DEFAULT 0"},
+				{"last_reply_checked_at", "TEXT"},
+			} {
+				has, err := columnExists(ctx, tx, "video_sync_state", col.name)
+				if err != nil {
+					return err
+				}
+				if !has {
+					if _, err := tx.ExecContext(ctx, fmt.Sprintf("ALTER TABLE video_sync_state ADD COLUMN %s %s", col.name, col.ddl)); err != nil {
+						return fmt.Errorf("add video_sync_state.%s: %w", col.name, err)
+					}
+				}
+			}
+			return nil
+		},
+	},
 }
 
 // Migrate applies all pending migrations to the given database inside a

@@ -33,16 +33,18 @@ const (
 // FeedFilters models every query-string parameter accepted by /feed and
 // /saved (with mode-specific overrides applied by the builder).
 type FeedFilters struct {
-	Channels     []string // platform_channels.id (UUID strings)
-	Categories   []string // category enum values
-	InsightType  string   // filter by insight type (JSONB containment)
-	DateFrom     *time.Time
-	DateTo       *time.Time
-	Search       *string
-	IncludeToxic bool
-	Limit        int
-	Offset       int
-	Sort         string // "newest" | "oldest"
+	Channels            []string // platform_channels.id (UUID strings)
+	Categories          []string // category enum values
+	CategoriesSpecified bool
+	InsightType         string // filter by insight type (JSONB containment)
+	Intent              string // all | ideas | actionable
+	DateFrom            *time.Time
+	DateTo              *time.Time
+	Search              *string
+	IncludeToxic        bool
+	Limit               int
+	Offset              int
+	Sort                string // "newest" | "oldest"
 }
 
 // HighSignalCategories is the default category set applied when the caller
@@ -61,8 +63,8 @@ var ToxicCategories = map[string]struct{}{
 // AllowedSorts enumerates the sort modes accepted on /feed. /saved overrides
 // the sort internally and so is not constrained by this set.
 var AllowedSorts = map[string]string{
-	"newest": "ORDER BY c.posted_at DESC",
-	"oldest": "ORDER BY c.posted_at ASC",
+	"newest": "ORDER BY c.posted_at DESC, c.id DESC",
+	"oldest": "ORDER BY c.posted_at ASC, c.id ASC",
 }
 
 // applyToxicLayer enforces the two-layer toxic filter described in
@@ -135,7 +137,7 @@ func (b *feedQueryBuilder) addArg(v any) string {
 func BuildFeedQuery(userID string, filters FeedFilters, mode FeedMode) (string, []any) {
 	b := &feedQueryBuilder{args: []any{userID}}
 	sql := "SELECT " + modeProjections[mode] + " FROM " + b.from(mode)
-	sql += " WHERE " + strings.Join(b.where(filters), " AND ")
+	sql += " WHERE " + strings.Join(b.where(filters, mode), " AND ")
 	if tail := b.tail(mode, filters); tail != "" {
 		sql += " " + tail
 	}
@@ -158,19 +160,37 @@ func (b *feedQueryBuilder) from(mode FeedMode) string {
 		   AND ucs2.user_id = $1`
 }
 
-func (b *feedQueryBuilder) where(filters FeedFilters) []string {
+func (b *feedQueryBuilder) where(filters FeedFilters, mode FeedMode) []string {
 	where := []string{accessControlClause, "c.processed_at IS NOT NULL"}
-	where = b.addCategoryFilter(where, filters)
+	where = b.addCategoryFilter(where, filters, mode == ModeSaved)
 	where = b.addInList(where, "c.platform_channel_id IN (", filters.Channels, ")")
 	where = b.addInsightFilter(where, filters.InsightType)
+	where = b.addIntentFilter(where, filters.Intent)
 	where = b.addDateBounds(where, filters)
 	return b.addSearchFilter(where, filters.Search)
 }
 
+func (b *feedQueryBuilder) addIntentFilter(where []string, intent string) []string {
+	switch intent {
+	case "ideas":
+		return append(where, "(c.category = 'content_idea' OR EXISTS (SELECT 1 FROM json_each(COALESCE(c.actionable_insights, '[]')) i WHERE json_extract(i.value, '$.type') = 'video_idea'))")
+	case "actionable":
+		return append(where, "json_array_length(COALESCE(c.actionable_insights, '[]')) > 0")
+	default:
+		return where
+	}
+}
+
 // addCategoryFilter applies the effective category list after the two-layer
 // toxic rule (Decision 7).
-func (b *feedQueryBuilder) addCategoryFilter(where []string, filters FeedFilters) []string {
+func (b *feedQueryBuilder) addCategoryFilter(where []string, filters FeedFilters, saved bool) []string {
+	if saved && !filters.CategoriesSpecified {
+		return where
+	}
 	effectiveCats, explicitCats := applyToxicLayer(filters.Categories, filters.IncludeToxic)
+	if filters.CategoriesSpecified {
+		explicitCats = true
+	}
 	if !explicitCats {
 		// Default: restrict to the high-signal category set.
 		return b.addInList(where, "c.category IN (", HighSignalCategories, ")")
@@ -200,7 +220,7 @@ func (b *feedQueryBuilder) addInsightFilter(where []string, insightType string) 
 	if insightType == "" {
 		return where
 	}
-	return append(where, "json_extract(c.actionable_insights, '$[0].type') = "+b.addArg(insightType))
+	return append(where, "EXISTS (SELECT 1 FROM json_each(COALESCE(c.actionable_insights, '[]')) i WHERE json_extract(i.value, '$.type') = "+b.addArg(insightType)+")")
 }
 
 func (b *feedQueryBuilder) addDateBounds(where []string, filters FeedFilters) []string {
@@ -208,7 +228,7 @@ func (b *feedQueryBuilder) addDateBounds(where []string, filters FeedFilters) []
 		where = append(where, "c.posted_at >= "+b.addArg(*filters.DateFrom))
 	}
 	if filters.DateTo != nil {
-		where = append(where, "c.posted_at <= "+b.addArg(*filters.DateTo))
+		where = append(where, "c.posted_at < "+b.addArg(*filters.DateTo))
 	}
 	return where
 }
@@ -218,8 +238,9 @@ func (b *feedQueryBuilder) addSearchFilter(where []string, search *string) []str
 	if search == nil || *search == "" {
 		return where
 	}
-	ph := b.addArg(*search)
-	return append(where, "(c.body LIKE '%' || "+ph+" || '%' OR COALESCE(c.topic,'') LIKE '%' || "+ph+" || '%')")
+	escaped := strings.NewReplacer("\\", "\\\\", "%", "\\%", "_", "\\_").Replace(*search)
+	ph := b.addArg(escaped)
+	return append(where, "(c.body LIKE '%' || "+ph+" || '%' OR COALESCE(c.topic,'') LIKE '%' || "+ph+" || '%') ESCAPE '\\'")
 }
 
 // tail selects the ORDER BY / LIMIT / OFFSET shape for the mode.

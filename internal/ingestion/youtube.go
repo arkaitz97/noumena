@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -90,6 +91,7 @@ func FetchChannelInfo(ctx context.Context, accessToken string) (*ChannelInfo, er
 	if len(parsed.Items) == 0 {
 		return nil, errors.New("no youtube channel found for this account")
 	}
+	log.Printf("youtube: fetched authorized channel info id=%s title=%q", parsed.Items[0].ID, parsed.Items[0].Snippet.Title)
 	return &ChannelInfo{
 		ID:          parsed.Items[0].ID,
 		DisplayName: parsed.Items[0].Snippet.Title,

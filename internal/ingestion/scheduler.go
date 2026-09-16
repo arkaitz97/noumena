@@ -14,6 +14,10 @@ type SchedulerDB interface {
 	EnqueueIngestionJob(ctx context.Context, platformChannelID, jobType string) (string, error)
 }
 
+type schedulerCheckpointDB interface {
+	GetChannelSyncCheckpoint(context.Context, string, string) (*db.ChannelSyncCheckpoint, error)
+}
+
 // Scheduler enqueues ingestion jobs for channels that are due. It owns no
 // goroutines itself — the worker loop drives it via Tick(ctx).
 type Scheduler struct {
@@ -45,7 +49,7 @@ func (s *Scheduler) Tick(ctx context.Context) (TickResult, error) {
 	}
 	for _, ch := range channels {
 		jobType := "poll"
-		if ch.LastSyncedAt == nil {
+		if ch.LastSyncedAt == nil || s.backfillIncomplete(ctx, ch.ID) {
 			jobType = "backfill"
 		}
 		jobID, err := s.DB.EnqueueIngestionJob(ctx, ch.ID, jobType)
@@ -58,6 +62,7 @@ func (s *Scheduler) Tick(ctx context.Context) (TickResult, error) {
 			res.Skipped++
 			continue
 		}
+		log.Printf("scheduler: enqueued %s job=%s for channel=%s", jobType, jobID, ch.ID)
 		if jobType == "backfill" {
 			res.Backfills++
 		}
@@ -66,6 +71,15 @@ func (s *Scheduler) Tick(ctx context.Context) (TickResult, error) {
 		}
 	}
 	return res, nil
+}
+
+func (s *Scheduler) backfillIncomplete(ctx context.Context, channelID string) bool {
+	dbWithCheckpoint, ok := s.DB.(schedulerCheckpointDB)
+	if !ok {
+		return false
+	}
+	cp, err := dbWithCheckpoint.GetChannelSyncCheckpoint(ctx, channelID, "backfill")
+	return err == nil && cp != nil && cp.Status != "complete"
 }
 
 // Run drives Tick on a fixed interval until ctx is cancelled.

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -95,6 +96,7 @@ var youtubeMethodUnits = map[string]int64{
 	"channels.list":       1,
 	"commentThreads.list": 1,
 	"comments.list":       1,
+	"videos.list":         1,
 }
 
 // youtubeMethodAndUnits maps a client request path (e.g. "/commentThreads?...")
@@ -442,6 +444,8 @@ func (c *YouTubeClient) ListVideos(ctx context.Context, accessToken, channelID s
 		if !publishedAfter.IsZero() {
 			q.Set("publishedAfter", publishedAfter.UTC().Format(time.RFC3339))
 		}
+		log.Printf("youtube: fetching search.list channel=%s published_after=%s page_token=%q",
+			channelID, publishedAfter.UTC().Format(time.RFC3339), pageToken)
 		body, err := c.doGET(ctx, accessToken, "/search?"+q.Encode())
 		if err != nil {
 			return nil, false, err
@@ -451,7 +455,9 @@ func (c *YouTubeClient) ListVideos(ctx context.Context, accessToken, channelID s
 			return nil, false, fmt.Errorf("decode search.list: %w", err)
 		}
 		pageToken = parsed.NextPageToken
-		return videoRefsFromSearch(parsed.Items), pageToken != "", nil
+		refs := videoRefsFromSearch(parsed.Items)
+		log.Printf("youtube: retrieved %d video refs from search channel=%s", len(refs), channelID)
+		return refs, pageToken != "", nil
 	}
 	return it.next
 }
@@ -493,6 +499,7 @@ type playlistItemsResponse struct {
 // channels.list(part=contentDetails) — 1 unit, resolved once per channel and
 // persisted by the worker.
 func (c *YouTubeClient) ResolveUploadsPlaylist(ctx context.Context, accessToken, channelID string) (string, error) {
+	log.Printf("youtube: resolving uploads playlist channel=%s", channelID)
 	q := url.Values{}
 	q.Set("part", "contentDetails")
 	q.Set("id", channelID)
@@ -516,7 +523,9 @@ func (c *YouTubeClient) ResolveUploadsPlaylist(ctx context.Context, accessToken,
 	if len(parsed.Items) == 0 || parsed.Items[0].ContentDetails.RelatedPlaylists.Uploads == "" {
 		return "", fmt.Errorf("channel %s has no uploads playlist", channelID)
 	}
-	return parsed.Items[0].ContentDetails.RelatedPlaylists.Uploads, nil
+	upl := parsed.Items[0].ContentDetails.RelatedPlaylists.Uploads
+	log.Printf("youtube: resolved uploads playlist %s for channel=%s", upl, channelID)
+	return upl, nil
 }
 
 // ListUploads paginates playlistItems.list for a channel's uploads playlist
@@ -524,13 +533,21 @@ func (c *YouTubeClient) ResolveUploadsPlaylist(ctx context.Context, accessToken,
 // when stopBefore is non-zero the iteration stops early at the first video
 // published before it — the per-sync watermark boundary.
 func (c *YouTubeClient) ListUploads(ctx context.Context, accessToken, playlistID string, stopBefore time.Time) func() (VideoRef, bool, error) {
-	pageToken := ""
+	return c.ListUploadsPaged(ctx, accessToken, playlistID, stopBefore, "", nil)
+}
+
+// ListUploadsPaged resumes playlist discovery from startToken. afterPage is
+// called only after a page was decoded, so callers can persist the cursor.
+func (c *YouTubeClient) ListUploadsPaged(ctx context.Context, accessToken, playlistID string, stopBefore time.Time, startToken string, afterPage func(fetchedWith, nextToken string)) func() (VideoRef, bool, error) {
+	pageToken := startToken
 	it := &pageIterator[VideoRef]{hasMore: true}
 	it.load = func() ([]VideoRef, bool, error) {
+		fetchedWith := pageToken
 		q := url.Values{}
 		q.Set("part", "snippet,contentDetails")
 		q.Set("playlistId", playlistID)
 		pageFields(q, 50, "nextPageToken,items(contentDetails/videoId,snippet/publishedAt,snippet/title)", pageToken)
+		log.Printf("youtube: fetching playlistItems.list playlist=%s page_token=%q", playlistID, pageToken)
 		body, err := c.doGET(ctx, accessToken, "/playlistItems?"+q.Encode())
 		if err != nil {
 			return nil, false, err
@@ -540,7 +557,11 @@ func (c *YouTubeClient) ListUploads(ctx context.Context, accessToken, playlistID
 			return nil, false, fmt.Errorf("decode playlistItems.list: %w", err)
 		}
 		pageToken = parsed.NextPageToken
+		if afterPage != nil {
+			afterPage(fetchedWith, pageToken)
+		}
 		refs, stopped := refsFromPlaylistItems(parsed.Items, stopBefore)
+		log.Printf("youtube: retrieved %d video refs from playlist=%s (stopped_at_watermark=%t)", len(refs), playlistID, stopped)
 		return refs, !stopped && pageToken != "", nil
 	}
 	return it.next
@@ -582,12 +603,15 @@ type ytComment struct {
 	Snippet commentSnippet `json:"snippet"`
 }
 
+type commentThreadSnippet struct {
+	VideoID         string    `json:"videoId,omitempty"`
+	TopLevelComment ytComment `json:"topLevelComment"`
+	TotalReplyCount int       `json:"totalReplyCount"`
+}
+
 type commentThreadItem struct {
-	ID      string `json:"id"`
-	Snippet struct {
-		TopLevelComment ytComment `json:"topLevelComment"`
-		TotalReplyCount int       `json:"totalReplyCount"`
-	} `json:"snippet"`
+	ID      string               `json:"id"`
+	Snippet commentThreadSnippet `json:"snippet"`
 	Replies *struct {
 		Comments []ytComment `json:"comments"`
 	} `json:"replies"`
@@ -612,6 +636,7 @@ func (c *YouTubeClient) ListReplies(ctx context.Context, accessToken, parentComm
 		q.Set("parentId", parentCommentID)
 		q.Set("textFormat", "plainText")
 		pageFields(q, 100, "nextPageToken,items(id,snippet(authorDisplayName,textDisplay,textOriginal,publishedAt,parentId,videoId))", pageToken)
+		log.Printf("youtube: fetching comments.list (replies) parent=%s page_token=%q", parentCommentID, pageToken)
 		body, err := c.doGET(ctx, accessToken, "/comments?"+q.Encode())
 		if err != nil {
 			return nil, false, err
@@ -621,7 +646,9 @@ func (c *YouTubeClient) ListReplies(ctx context.Context, accessToken, parentComm
 			return nil, false, fmt.Errorf("decode comments.list (replies): %w", err)
 		}
 		pageToken = parsed.NextPageToken
-		return repliesFromComments(parsed.Items, parentCommentID), pageToken != "", nil
+		replies := repliesFromComments(parsed.Items, parentCommentID)
+		log.Printf("youtube: retrieved %d replies for parent=%s (has_more=%t)", len(replies), parentCommentID, pageToken != "")
+		return replies, pageToken != "", nil
 	}
 	return it.next
 }
@@ -680,6 +707,7 @@ func (c *YouTubeClient) ListCommentThreadsPaged(ctx context.Context, accessToken
 	it := &pageIterator[CommentThread]{hasMore: true}
 	it.load = func() ([]CommentThread, bool, error) {
 		fetchedWith := pageToken
+		log.Printf("youtube: fetching commentThreads.list video=%s page_token=%q", videoID, pageToken)
 		body, err := c.doGET(ctx, accessToken, "/commentThreads?"+commentThreadsQuery(videoID, pageToken).Encode())
 		if err != nil {
 			return nil, false, err
@@ -692,9 +720,60 @@ func (c *YouTubeClient) ListCommentThreadsPaged(ctx context.Context, accessToken
 		if afterPage != nil {
 			afterPage(fetchedWith, pageToken)
 		}
-		return threadsFromItems(parsed.Items), pageToken != "", nil
+		threads := threadsFromItems(parsed.Items)
+		log.Printf("youtube: retrieved %d comment threads for video=%s (has_more=%t)", len(threads), videoID, pageToken != "")
+		return threads, pageToken != "", nil
 	}
 	return it.next
+}
+
+// ListChannelCommentThreadsPaged paginates commentThreads.list for all threads
+// related to a channel ordered by time (newest first).
+func (c *YouTubeClient) ListChannelCommentThreadsPaged(ctx context.Context, accessToken, channelID, startToken string, afterPage func(fetchedWith, nextToken string)) func() (CommentThread, bool, error) {
+	pageToken := startToken
+	it := &pageIterator[CommentThread]{hasMore: true}
+	it.load = func() ([]CommentThread, bool, error) {
+		fetchedWith := pageToken
+		log.Printf("youtube: fetching channel commentThreads.list channel=%s page_token=%q", channelID, pageToken)
+		body, err := c.doGET(ctx, accessToken, "/commentThreads?"+channelCommentThreadsQuery(channelID, pageToken).Encode())
+		if err != nil {
+			return nil, false, err
+		}
+		var parsed commentThreadsResponse
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			return nil, false, fmt.Errorf("decode commentThreads.list (channel): %w", err)
+		}
+		pageToken = parsed.NextPageToken
+		if afterPage != nil {
+			afterPage(fetchedWith, pageToken)
+		}
+		// allThreadsRelatedToChannelId may return channel-level comments without
+		// videoId. They are outside video-comment corpus; never fabricate ID.
+		threads := videoThreadsOnly(threadsFromItems(parsed.Items))
+		log.Printf("youtube: retrieved %d comment threads for channel=%s (has_more=%t)", len(threads), channelID, pageToken != "")
+		return threads, pageToken != "", nil
+	}
+	return it.next
+}
+
+func videoThreadsOnly(threads []CommentThread) []CommentThread {
+	filtered := make([]CommentThread, 0, len(threads))
+	for _, thread := range threads {
+		if thread.VideoID != "" {
+			filtered = append(filtered, thread)
+		}
+	}
+	return filtered
+}
+
+// channelCommentThreadsQuery queries all comment threads across the channel newest-first.
+func channelCommentThreadsQuery(channelID, pageToken string) url.Values {
+	q := url.Values{}
+	q.Set("part", "snippet,replies")
+	q.Set("allThreadsRelatedToChannelId", channelID)
+	q.Set("order", "time")
+	pageFields(q, 100, "nextPageToken,items(id,snippet(videoId,totalReplyCount,topLevelComment(id,snippet(authorDisplayName,textDisplay,textOriginal,publishedAt,videoId))),replies/comments(id,snippet(authorDisplayName,textDisplay,textOriginal,publishedAt,parentId,videoId)))", pageToken)
+	return q
 }
 
 // commentThreadsQuery is the time-ordered top-level + inline-replies page
@@ -727,6 +806,10 @@ func threadsFromItems(items []commentThreadItem) []CommentThread {
 func topLevelThread(item commentThreadItem) CommentThread {
 	tlc := item.Snippet.TopLevelComment
 	topPosted, _ := time.Parse(time.RFC3339, tlc.Snippet.PublishedAt)
+	videoID := tlc.Snippet.VideoID
+	if videoID == "" {
+		videoID = item.Snippet.VideoID
+	}
 	return CommentThread{
 		CommentID:       tlc.ID,
 		ParentCommentID: nil,
@@ -734,7 +817,7 @@ func topLevelThread(item commentThreadItem) CommentThread {
 		AuthorHandle:    tlc.Snippet.AuthorDisplayName,
 		Body:            commentBody(tlc.Snippet),
 		PostedAt:        topPosted,
-		VideoID:         tlc.Snippet.VideoID,
+		VideoID:         videoID,
 		TotalReplyCount: item.Snippet.TotalReplyCount,
 	}
 }
@@ -747,6 +830,7 @@ func appendInlineReplies(pending []CommentThread, item commentThreadItem, topIdx
 		return pending
 	}
 	parentID := item.Snippet.TopLevelComment.ID
+	parentVideoID := pending[topIdx].VideoID
 	for _, reply := range item.Replies.Comments {
 		if reply.ID == "" {
 			continue
@@ -756,7 +840,14 @@ func appendInlineReplies(pending []CommentThread, item commentThreadItem, topIdx
 		if reply.Snippet.ParentID != "" && reply.Snippet.ParentID != parentID {
 			depth = 2
 		}
-		pid := parentID
+		pid := reply.Snippet.ParentID
+		if pid == "" {
+			pid = parentID
+		}
+		vID := reply.Snippet.VideoID
+		if vID == "" {
+			vID = parentVideoID
+		}
 		pending = append(pending, CommentThread{
 			CommentID:       reply.ID,
 			ParentCommentID: &pid,
@@ -764,11 +855,57 @@ func appendInlineReplies(pending []CommentThread, item commentThreadItem, topIdx
 			AuthorHandle:    reply.Snippet.AuthorDisplayName,
 			Body:            commentBody(reply.Snippet),
 			PostedAt:        rPosted,
-			VideoID:         reply.Snippet.VideoID,
+			VideoID:         vID,
 		})
 		pending[topIdx].EmbeddedReplyCount++
 	}
 	return pending
+}
+
+// GetVideoTitles resolves titles for a batch of video IDs (up to 50 per request)
+// using videos.list(part=snippet,fields=items(id,snippet/title)).
+func (c *YouTubeClient) GetVideoTitles(ctx context.Context, accessToken string, videoIDs []string) (map[string]string, error) {
+	titles := make(map[string]string, len(videoIDs))
+	if len(videoIDs) == 0 {
+		return titles, nil
+	}
+
+	for i := 0; i < len(videoIDs); i += 50 {
+		end := i + 50
+		if end > len(videoIDs) {
+			end = len(videoIDs)
+		}
+		chunk := videoIDs[i:end]
+		log.Printf("youtube: fetching video titles batch size=%d", len(chunk))
+		q := url.Values{}
+		q.Set("part", "snippet")
+		q.Set("id", strings.Join(chunk, ","))
+		q.Set("fields", "items(id,snippet/title)")
+
+		body, err := c.doGET(ctx, accessToken, "/videos?"+q.Encode())
+		if err != nil {
+			return titles, err
+		}
+
+		var parsed struct {
+			Items []struct {
+				ID      string `json:"id"`
+				Snippet struct {
+					Title string `json:"title"`
+				} `json:"snippet"`
+			} `json:"items"`
+		}
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			return titles, fmt.Errorf("decode videos.list: %w", err)
+		}
+		for _, item := range parsed.Items {
+			if item.ID != "" && item.Snippet.Title != "" {
+				titles[item.ID] = item.Snippet.Title
+			}
+		}
+		log.Printf("youtube: resolved %d video titles in batch", len(parsed.Items))
+	}
+	return titles, nil
 }
 
 // ============================================================================
@@ -828,6 +965,7 @@ func (c *YouTubeClient) ResolveChannelRef(ctx context.Context, ref string) (*Cha
 	if c.APIKey == "" {
 		return nil, fmt.Errorf("public channel tracking not configured on this server (YOUTUBE_API_KEY)")
 	}
+	log.Printf("youtube: resolving channel ref %q", ref)
 	q := url.Values{}
 	q.Set("part", "snippet")
 	q.Set("fields", "items(id,snippet/title)")
@@ -851,6 +989,7 @@ func (c *YouTubeClient) ResolveChannelRef(ctx context.Context, ref string) (*Cha
 		return nil, fmt.Errorf("no youtube channel found for %q", ref)
 	}
 	item := parsed.Items[0]
+	log.Printf("youtube: resolved channel ref %q -> id=%s title=%q", ref, item.ID, item.Snippet.Title)
 	return &ChannelInfo{ID: item.ID, DisplayName: item.Snippet.Title, Title: item.Snippet.Title}, nil
 }
 

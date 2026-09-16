@@ -292,6 +292,9 @@ func (w *Worker) processJobNoLock(parent context.Context, job *db.IngestionJob) 
 // jobs do not stop at their own watermark.
 func stubYouTubeServer(t *testing.T) *httptest.Server {
 	freshVideo := time.Now().Add(-30 * time.Minute).UTC().Format(time.RFC3339)
+	freshComment1 := time.Now().Add(-25 * time.Minute).UTC().Format(time.RFC3339)
+	freshReply1 := time.Now().Add(-20 * time.Minute).UTC().Format(time.RFC3339)
+	freshComment2 := time.Now().Add(-15 * time.Minute).UTC().Format(time.RFC3339)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -305,33 +308,33 @@ func stubYouTubeServer(t *testing.T) *httptest.Server {
 			_, _ = w.Write([]byte(`{"items":[
 				{"id":{"videoId":"v1"},"snippet":{"publishedAt":"` + freshVideo + `","title":"Video One"}}
 			]}`))
+		case r.URL.Path == "/videos":
+			_, _ = w.Write([]byte(`{"items":[
+				{"id":"v1","snippet":{"title":"Video One"}}
+			]}`))
 		case r.URL.Path == "/commentThreads":
 			resp := commentThreadsResponse{
 				Items: []commentThreadItem{
 					{
 						ID: "T1",
-						Snippet: struct {
-							TopLevelComment ytComment `json:"topLevelComment"`
-							TotalReplyCount int       `json:"totalReplyCount"`
-						}{
+						Snippet: commentThreadSnippet{
+							VideoID: "v1",
 							TopLevelComment: ytComment{ID: "c1", Snippet: commentSnippet{
-								AuthorDisplayName: "A", TextDisplay: "hi", PublishedAt: "2025-01-01T10:05:00Z",
+								AuthorDisplayName: "A", TextDisplay: "hi", PublishedAt: freshComment1, VideoID: "v1",
 							}},
 						},
 						Replies: &struct {
 							Comments []ytComment `json:"comments"`
 						}{Comments: []ytComment{{ID: "c1r", Snippet: commentSnippet{
-							AuthorDisplayName: "B", TextDisplay: "yo", PublishedAt: "2025-01-01T10:06:00Z",
+							AuthorDisplayName: "B", TextDisplay: "yo", PublishedAt: freshReply1, VideoID: "v1",
 						}}}},
 					},
 					{
 						ID: "T2",
-						Snippet: struct {
-							TopLevelComment ytComment `json:"topLevelComment"`
-							TotalReplyCount int       `json:"totalReplyCount"`
-						}{
+						Snippet: commentThreadSnippet{
+							VideoID: "v1",
 							TopLevelComment: ytComment{ID: "c2", Snippet: commentSnippet{
-								AuthorDisplayName: "C", TextDisplay: "hey", PublishedAt: "2025-01-01T10:07:00Z",
+								AuthorDisplayName: "C", TextDisplay: "hey", PublishedAt: freshComment2, VideoID: "v1",
 							}},
 						},
 					},
@@ -522,7 +525,7 @@ func TestWorker_UploadsPlaylistDiscoveryAndCaching(t *testing.T) {
 	f.tokenA, f.tokenR = "tok", "ref"
 
 	w := newTestWorker(f, srv)
-	job := &db.IngestionJob{ID: "j1", PlatformChannelID: "pc1", JobType: "poll"}
+	job := &db.IngestionJob{ID: "j1", PlatformChannelID: "pc1", JobType: "backfill"}
 	w.processJobNoLock(context.Background(), job)
 
 	if got := f.playlists["pc1"]; got != "UU1" {
@@ -555,6 +558,11 @@ func TestWorker_UploadsPlaylistDiscoveryAndCaching(t *testing.T) {
 
 func TestWorker_ReplyGatingSkipsCommentsList(t *testing.T) {
 	var commentsCalls int
+	freshComment1 := time.Now().Add(-25 * time.Minute).UTC().Format(time.RFC3339)
+	freshReply1 := time.Now().Add(-20 * time.Minute).UTC().Format(time.RFC3339)
+	freshReply2 := time.Now().Add(-18 * time.Minute).UTC().Format(time.RFC3339)
+	freshReply3 := time.Now().Add(-16 * time.Minute).UTC().Format(time.RFC3339)
+	freshComment2 := time.Now().Add(-15 * time.Minute).UTC().Format(time.RFC3339)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -566,17 +574,44 @@ func TestWorker_ReplyGatingSkipsCommentsList(t *testing.T) {
 		case "/playlistItems":
 			_, _ = w.Write([]byte(`{"items":[{"contentDetails":{"videoId":"v1"},"snippet":{"publishedAt":"` +
 				time.Now().Add(-30*time.Minute).UTC().Format(time.RFC3339) + `"}}]}`))
+		case "/videos":
+			_, _ = w.Write([]byte(`{"items":[{"id":"v1","snippet":{"title":"Video One"}}]}`))
 		case "/commentThreads":
 			// T1: 3 replies, 3 embedded inline → complete → no comments.list.
 			// T2: 0 replies → no comments.list.
-			_, _ = w.Write([]byte(`{"items":[
-				{"snippet":{"topLevelComment":{"id":"t1","snippet":{"authorDisplayName":"A","textDisplay":"x","publishedAt":"2025-01-01T10:00:00Z"}},"totalReplyCount":3},
-				 "replies":{"comments":[
-					{"id":"r1","snippet":{"textDisplay":"a","publishedAt":"2025-01-01T11:00:00Z","parentId":"t1"}},
-					{"id":"r2","snippet":{"textDisplay":"b","publishedAt":"2025-01-01T11:01:00Z","parentId":"t1"}},
-					{"id":"r3","snippet":{"textDisplay":"c","publishedAt":"2025-01-01T11:02:00Z","parentId":"t1"}}]}},
-				{"snippet":{"topLevelComment":{"id":"t2","snippet":{"authorDisplayName":"B","textDisplay":"y","publishedAt":"2025-01-01T10:05:00Z"}},"totalReplyCount":0}}
-			]}`))
+			resp := commentThreadsResponse{
+				Items: []commentThreadItem{
+					{
+						ID: "t1",
+						Snippet: commentThreadSnippet{
+							VideoID: "v1",
+							TopLevelComment: ytComment{ID: "t1", Snippet: commentSnippet{
+								AuthorDisplayName: "A", TextDisplay: "x", PublishedAt: freshComment1, VideoID: "v1",
+							}},
+							TotalReplyCount: 3,
+						},
+						Replies: &struct {
+							Comments []ytComment `json:"comments"`
+						}{Comments: []ytComment{
+							{ID: "r1", Snippet: commentSnippet{TextDisplay: "a", PublishedAt: freshReply1, ParentID: "t1", VideoID: "v1"}},
+							{ID: "r2", Snippet: commentSnippet{TextDisplay: "b", PublishedAt: freshReply2, ParentID: "t1", VideoID: "v1"}},
+							{ID: "r3", Snippet: commentSnippet{TextDisplay: "c", PublishedAt: freshReply3, ParentID: "t1", VideoID: "v1"}},
+						}},
+					},
+					{
+						ID: "t2",
+						Snippet: commentThreadSnippet{
+							VideoID: "v1",
+							TopLevelComment: ytComment{ID: "t2", Snippet: commentSnippet{
+								AuthorDisplayName: "B", TextDisplay: "y", PublishedAt: freshComment2, VideoID: "v1",
+							}},
+							TotalReplyCount: 0,
+						},
+					},
+				},
+			}
+			b, _ := json.Marshal(resp)
+			_, _ = w.Write(b)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -627,7 +662,7 @@ func TestWorker_SearchFallbackWhenPlaylistUnresolvable(t *testing.T) {
 	f.tokenA, f.tokenR = "tok", "ref"
 
 	w := newTestWorker(f, srv)
-	w.processJobNoLock(context.Background(), &db.IngestionJob{ID: "j1", PlatformChannelID: "pc1", JobType: "poll"})
+	w.processJobNoLock(context.Background(), &db.IngestionJob{ID: "j1", PlatformChannelID: "pc1", JobType: "backfill"})
 
 	if searchCalls != 1 {
 		t.Fatalf("expected exactly one bounded search.list fallback, got %d", searchCalls)
@@ -673,7 +708,7 @@ func TestWorker_CheckpointResumeAndWatermark(t *testing.T) {
 	}
 
 	w := newTestWorker(f, srv)
-	w.processJobNoLock(context.Background(), &db.IngestionJob{ID: "j1", PlatformChannelID: "pc1", JobType: "poll"})
+	w.processJobNoLock(context.Background(), &db.IngestionJob{ID: "j1", PlatformChannelID: "pc1", JobType: "backfill"})
 
 	if sawPageToken != "P2" {
 		t.Fatalf("resume must start at page checkpoint P2, got %q", sawPageToken)
@@ -721,7 +756,7 @@ func TestWorker_SkippedVideoStaysSkipped(t *testing.T) {
 	f.tokenA, f.tokenR = "tok", "ref"
 
 	w := newTestWorker(f, srv)
-	job := &db.IngestionJob{ID: "j1", PlatformChannelID: "pc1", JobType: "poll"}
+	job := &db.IngestionJob{ID: "j1", PlatformChannelID: "pc1", JobType: "backfill"}
 	w.processJobNoLock(context.Background(), job)
 
 	st := f.videoStates[videoKey("pc1", "v1")]
@@ -746,7 +781,7 @@ func TestWorker_AdaptivePolling(t *testing.T) {
 		switch r.URL.Path {
 		case "/channels":
 			_, _ = w.Write([]byte(`{"items":[{"contentDetails":{"relatedPlaylists":{"uploads":"UU1"}}}]}`))
-		case "/playlistItems":
+		case "/playlistItems", "/commentThreads":
 			_, _ = w.Write([]byte(`{"items":[]}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -787,7 +822,7 @@ func TestWorker_QuotaExhaustedDefersWithoutRetryBurn(t *testing.T) {
 	// Budget of 1: channels.list consumes it, the playlist page is
 	// suppressed locally (never leaves the process).
 	w.Client.Quota = NewQuotaAccounting(1)
-	w.processJobNoLock(context.Background(), &db.IngestionJob{ID: "j1", PlatformChannelID: "pc1", JobType: "poll"})
+	w.processJobNoLock(context.Background(), &db.IngestionJob{ID: "j1", PlatformChannelID: "pc1", JobType: "backfill"})
 
 	if len(f.failedJobs) != 0 {
 		t.Fatalf("quota exhaustion must not consume retry budget, failed=%v", f.failedJobs)
@@ -897,6 +932,101 @@ func TestWorker_PartialBackfillDoesNotAdvanceWatermark(t *testing.T) {
 	// Now the full window is walked, so the channel is promoted to polling.
 	if _, ok := f.lastSyncedSet["pc1"]; !ok {
 		t.Fatalf("completed backfill must advance last_synced_at")
+	}
+}
+
+func TestWorker_ChannelPoll_StopsAtWatermark(t *testing.T) {
+	watermark := time.Now().Add(-60 * time.Minute)
+	newerTime1 := watermark.Add(30 * time.Minute).UTC().Format(time.RFC3339)
+	newerTime2 := watermark.Add(15 * time.Minute).UTC().Format(time.RFC3339)
+	olderTime1 := watermark.Add(-10 * time.Minute).UTC().Format(time.RFC3339)
+	olderTime2 := watermark.Add(-30 * time.Minute).UTC().Format(time.RFC3339)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/videos":
+			_, _ = w.Write([]byte(`{"items":[{"id":"vid1","snippet":{"title":"Resolved Title"}}]}`))
+		case "/commentThreads":
+			if q := r.URL.Query().Get("allThreadsRelatedToChannelId"); q != "UC1" {
+				t.Errorf("expected allThreadsRelatedToChannelId=UC1, got %q", q)
+			}
+			resp := commentThreadsResponse{
+				Items: []commentThreadItem{
+					{
+						ID: "t1",
+						Snippet: commentThreadSnippet{
+							VideoID: "vid1",
+							TopLevelComment: ytComment{ID: "c1", Snippet: commentSnippet{
+								AuthorDisplayName: "User1", TextDisplay: "fresh 1", PublishedAt: newerTime1, VideoID: "vid1",
+							}},
+						},
+					},
+					{
+						ID: "t2",
+						Snippet: commentThreadSnippet{
+							VideoID: "vid1",
+							TopLevelComment: ytComment{ID: "c2", Snippet: commentSnippet{
+								AuthorDisplayName: "User2", TextDisplay: "fresh 2", PublishedAt: newerTime2, VideoID: "vid1",
+							}},
+						},
+					},
+					{
+						ID: "t3",
+						Snippet: commentThreadSnippet{
+							VideoID: "vid1",
+							TopLevelComment: ytComment{ID: "c3", Snippet: commentSnippet{
+								AuthorDisplayName: "User3", TextDisplay: "stale 1", PublishedAt: olderTime1, VideoID: "vid1",
+							}},
+						},
+					},
+					{
+						ID: "t4",
+						Snippet: commentThreadSnippet{
+							VideoID: "vid1",
+							TopLevelComment: ytComment{ID: "c4", Snippet: commentSnippet{
+								AuthorDisplayName: "User4", TextDisplay: "stale 2", PublishedAt: olderTime2, VideoID: "vid1",
+							}},
+						},
+					},
+				},
+			}
+			b, _ := json.Marshal(resp)
+			_, _ = w.Write(b)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	f := newFakeWorkerDB()
+	f.channels["pc1"] = &db.PlatformChannel{ID: "pc1", Platform: "youtube", PlatformChannelID: "UC1", LastSyncedAt: &watermark}
+	f.tokenA, f.tokenR = "tok", "ref"
+
+	w := newTestWorker(f, srv)
+	w.processJobNoLock(context.Background(), &db.IngestionJob{ID: "j1", PlatformChannelID: "pc1", JobType: "poll"})
+
+	if len(f.completedJobs) != 1 {
+		t.Fatalf("expected job completed, got %v", f.completedJobs)
+	}
+	var ids []string
+	var comments []*db.Comment
+	for _, b := range f.insertCalls {
+		for _, c := range b {
+			ids = append(ids, c.PlatformCommentID)
+			comments = append(comments, c)
+		}
+	}
+	if len(ids) != 2 {
+		t.Fatalf("expected exactly 2 comments before watermark, got %d: %v", len(ids), ids)
+	}
+	if ids[0] != "c1" || ids[1] != "c2" {
+		t.Fatalf("expected c1 and c2, got %v", ids)
+	}
+	for _, c := range comments {
+		if c.VideoTitle == nil || *c.VideoTitle != "Resolved Title" {
+			t.Fatalf("expected video title 'Resolved Title', got %+v", c)
+		}
 	}
 }
 

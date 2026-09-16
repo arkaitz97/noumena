@@ -169,7 +169,7 @@ func TestBuildFeedQuery_FilterCombinations(t *testing.T) {
 	if !strings.Contains(sql, "c.platform_channel_id IN") {
 		t.Errorf("channels filter missing")
 	}
-	if !strings.Contains(sql, "json_extract(c.actionable_insights") {
+	if !strings.Contains(sql, "EXISTS (SELECT 1 FROM json_each") {
 		t.Errorf("insight_type filter missing")
 	}
 	if !strings.Contains(sql, "c.posted_at >=") {
@@ -180,6 +180,68 @@ func TestBuildFeedQuery_FilterCombinations(t *testing.T) {
 	}
 	if len(args) < 6 {
 		t.Errorf("expected several args, got %d", len(args))
+	}
+}
+
+func TestBuildFeedQuery_IntentTruthTable(t *testing.T) {
+	for _, tc := range []struct {
+		intent, want string
+	}{
+		{"all", "processed_at IS NOT NULL"},
+		{"ideas", "c.category = 'content_idea' OR EXISTS"},
+		{"actionable", "json_array_length"},
+	} {
+		sql, _ := BuildFeedQuery("u1", FeedFilters{Intent: tc.intent}, ModeFeed)
+		if !strings.Contains(sql, tc.want) {
+			t.Errorf("intent %q missing %q", tc.intent, tc.want)
+		}
+	}
+}
+
+func TestBuildFeedQuery_DateAndSearchBoundaries(t *testing.T) {
+	from := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC)
+	search := `%_\\`
+	sql, args := BuildFeedQuery("u1", FeedFilters{DateFrom: &from, DateTo: &to, Search: &search}, ModeFeed)
+	if !strings.Contains(sql, "c.posted_at >=") || !strings.Contains(sql, "c.posted_at <") || !strings.Contains(sql, `ESCAPE '\'`) {
+		t.Fatalf("boundary predicates missing: %s", sql)
+	}
+	if !containsArg(args, `\%\_\\\\`) {
+		t.Fatalf("search was not escaped: %#v", args)
+	}
+}
+
+func containsArg(args []any, want string) bool {
+	for _, arg := range args {
+		if s, ok := arg.(string); ok && s == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestBuildFeedQuery_SavedDefaultsHaveNoHiddenCategoryFilter(t *testing.T) {
+	sql, args := BuildFeedQuery("u1", FeedFilters{}, ModeSaved)
+	if strings.Contains(sql, "c.category IN") {
+		t.Fatalf("saved default has category filter: %s", sql)
+	}
+	for _, cat := range HighSignalCategories {
+		for _, arg := range args {
+			if arg == cat {
+				t.Fatalf("saved default bound hidden category %q", cat)
+			}
+		}
+	}
+}
+
+func TestInsightAggregatesRespectCompleteScope(t *testing.T) {
+	from := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 9, 3, 0, 0, 0, 0, time.UTC)
+	sql, _ := BuildFeedQuery("u1", FeedFilters{Channels: []string{"ch1", "ch2"}, Categories: []string{"question"}, CategoriesSpecified: true, DateFrom: &from, DateTo: &to}, ModeCount)
+	for _, want := range []string{"c.platform_channel_id IN", "c.category IN", "c.posted_at >=", "c.posted_at <"} {
+		if !strings.Contains(sql, want) {
+			t.Errorf("aggregate scope missing %q", want)
+		}
 	}
 }
 

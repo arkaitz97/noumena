@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log"
 	"strings"
 	"time"
 )
@@ -14,41 +15,45 @@ func (q *SQLiteQuery) EnqueueLLMJob(ctx context.Context, commentIDs []string, pr
 	return id, err
 }
 
-// llmOrphanAge bounds how long a pending/processing job may block its comment
-// set via dedupe. Must exceed the largest configured BatchTimeout so a live
-// (slow) LLM call is never mistaken for an orphan; BatchTimeout caps in-flight
-// at 300s, so 10m is safe. The reaper's 15m sweep is too slow — every tick
-// would batch_deduped against the corpse until then.
+// llmOrphanAge bounds how long a pending job may block its comment set via
+// dedupe. Processing jobs remain protected until restart recovery.
 const llmOrphanAge = 10 * time.Minute
 
 // EnqueueLLMJobIfNotExists dedupes: pending/processing job with identical comment set → return existing id, created=false.
-// Stale orphans (pending, or processing older than llmOrphanAge) are expired
-// to failed first so they cannot wedge their comment set indefinitely.
+// Stale pending orphans are expired to failed first so they cannot wedge their
+// comment set indefinitely. Processing rows may still have a live LLM call;
+// restart recovery handles abandoned processing rows.
 func (q *SQLiteQuery) EnqueueLLMJobIfNotExists(ctx context.Context, commentIDs []string, provider string) (string, bool, error) {
 	commentIDsJSON, _ := json.Marshal(commentIDs)
 	payload := string(commentIDsJSON)
 	cutoff := time.Now().UTC().Add(-llmOrphanAge).Format(time.RFC3339)
 
 	// Expire any stale rows that would otherwise shadow this comment set.
-	if _, err := q.db.ExecContext(ctx,
+	res, err := q.db.ExecContext(ctx,
 		`UPDATE llm_processing_jobs
 		   SET status = 'failed',
 		       error_message = 'stale orphan; expired for re-enqueue',
 		       completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-		 WHERE status IN ('pending','processing')
+         WHERE status = 'pending'
 		   AND comment_ids = ?
 		   AND COALESCE(started_at, created_at) < ?`,
-		payload, cutoff); err != nil {
+		payload, cutoff)
+	if err != nil {
 		return "", false, err
+	}
+	if n, err := res.RowsAffected(); err == nil && n > 0 {
+		log.Printf("event=llm_job_stale_pending_expired count=%d", n)
 	}
 
 	var existing string
-	err := q.db.QueryRowContext(ctx,
-		`SELECT id FROM llm_processing_jobs
+	var status string
+	err = q.db.QueryRowContext(ctx,
+		`SELECT id, status FROM llm_processing_jobs
 		  WHERE status IN ('pending','processing') AND comment_ids = ?
 		  LIMIT 1`,
-		payload).Scan(&existing)
+		payload).Scan(&existing, &status)
 	if err == nil {
+		log.Printf("event=llm_job_deduped job_id=%s status=%s", existing, status)
 		return existing, false, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
@@ -74,6 +79,7 @@ func (q *SQLiteQuery) EnqueueLLMJobIfNotExists(ctx context.Context, commentIDs [
 				  LIMIT 1`,
 				payload).Scan(&existing)
 			if selErr == nil {
+				log.Printf("event=llm_job_deduped_race job_id=%s", existing)
 				return existing, false, nil
 			}
 			if !errors.Is(selErr, sql.ErrNoRows) {
