@@ -62,6 +62,15 @@ Postmortem** shape. Configuration values are referenced from
 - [`ops/runbooks/onboarding.md`](ops/runbooks/onboarding.md)
   — new operator/developer setup and daily operations.
 
+## Compliance
+
+Third-party platform terms review and the YouTube audit application pack.
+
+- [`compliance/platform-tos-compliance.md`](compliance/platform-tos-compliance.md)
+  — platform TOS review, citation matrix, feature × platform matrix, retention/access model, remediation plan.
+- [`compliance/youtube-derived-metrics-audit-application.md`](compliance/youtube-derived-metrics-audit-application.md)
+  — API Compliance Audit narrative and amendment-acceptance checklist.
+
 ## End-user help
 
 Plain-English explanations suitable for customer-facing surfaces.
