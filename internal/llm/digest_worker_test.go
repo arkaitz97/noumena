@@ -860,7 +860,7 @@ func TestCallWithRetry_ExhaustsSchedule(t *testing.T) {
 	})
 	w := &Worker{LLMClient: client, Logger: log.New(io.Discard, "", 0)}
 
-	_, err := w.callWithRetry(context.Background(), "p", truthFixture())
+	_, _, err := w.callWithRetry(context.Background(), "p", truthFixture())
 	if err == nil {
 		t.Fatal("expected error after exhausting retries")
 	}
@@ -885,7 +885,7 @@ func TestCallWithRetry_SucceedsOnFinalAttempt(t *testing.T) {
 	})
 	w := &Worker{LLMClient: client, Logger: log.New(io.Discard, "", 0)}
 
-	out, err := w.callWithRetry(context.Background(), "p", truthFixture())
+	out, _, err := w.callWithRetry(context.Background(), "p", truthFixture())
 	if err != nil {
 		t.Fatalf("expected success on attempt 3, got %v", err)
 	}
@@ -922,7 +922,7 @@ func TestCallWithRetry_ContextCancelAbortsEarly(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		out, err := w.callWithRetry(ctx, "p", truthFixture())
+		out, _, err := w.callWithRetry(ctx, "p", truthFixture())
 		done <- result{out: out, err: err}
 	}()
 

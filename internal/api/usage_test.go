@@ -258,3 +258,99 @@ func TestBillingStatusNoTrialFields(t *testing.T) {
 		t.Errorf("trial.ends_at: want empty when no trial_ends_at, got %q", body.Trial.EndsAt)
 	}
 }
+
+// ============================================================================
+// llm-cost-analytics 2.4: cost fields on usage + status
+// ============================================================================
+
+func TestBillingUsageIncludesLLMCost(t *testing.T) {
+	queries := &MockQuery{}
+	seedTestUser(queries, "test-user-id", billing.PlanCreator)
+	now := time.Now().UTC()
+	queries.billingUsage = map[string][]db.BillingUsage{
+		"test-user-id": {
+			{UserID: "test-user-id", PeriodStart: now.AddDate(0, -1, 0), PeriodEnd: now, CommentsUsed: 12, Quota: 50, LLMCostUSDMicro: 1_234_500, PriceVersion: 1},
+			{UserID: "test-user-id", PeriodStart: now.AddDate(0, -2, 0), PeriodEnd: now.AddDate(0, -1, 0), CommentsUsed: 40, Quota: 50},
+		},
+	}
+	r := setupBillingRouter(queries, billing.NewMockClient())
+
+	access, _, _ := auth.GenerateTokens("test-user-id")
+	req, _ := http.NewRequest("GET", "/api/billing/usage", nil)
+	req.Header.Set("Authorization", bearer(access))
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200 got %d body=%s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Periods []struct {
+			CommentsUsed int     `json:"comments_used"`
+			LLMCostUSD   float64 `json:"llm_cost_usd"`
+		} `json:"periods"`
+	}
+	_ = json.NewDecoder(rr.Body).Decode(&body)
+	if len(body.Periods) != 2 {
+		t.Fatalf("want 2 periods got %d", len(body.Periods))
+	}
+	if got := body.Periods[0].LLMCostUSD; got != 1.2345 {
+		t.Errorf("llm_cost_usd: want 1.2345 (micro→USD at boundary) got %v", got)
+	}
+	if got := body.Periods[1].LLMCostUSD; got != 0 {
+		t.Errorf("absent cost row: want 0 got %v", got)
+	}
+}
+
+func TestBillingStatusIncludesLLMCostMTD(t *testing.T) {
+	queries := &MockQuery{}
+	seedTestUser(queries, "test-user-id", billing.PlanCreator)
+	now := time.Now().UTC()
+	queries.billingUsage = map[string][]db.BillingUsage{
+		"test-user-id": {
+			{UserID: "test-user-id", PeriodStart: now.AddDate(0, 0, -10), PeriodEnd: now.AddDate(0, 0, 20), CommentsUsed: 12, Quota: 50, LLMCostUSDMicro: 456_789, PriceVersion: 1},
+			{UserID: "test-user-id", PeriodStart: now.AddDate(0, -1, -10), PeriodEnd: now.AddDate(0, 0, -10), CommentsUsed: 40, Quota: 50, LLMCostUSDMicro: 9_999_999},
+		},
+	}
+	r := setupBillingRouter(queries, billing.NewMockClient())
+
+	access, _, _ := auth.GenerateTokens("test-user-id")
+	req, _ := http.NewRequest("GET", "/api/billing/status", nil)
+	req.Header.Set("Authorization", bearer(access))
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200 got %d", rr.Code)
+	}
+	var body struct {
+		LLMCostMTDUSD float64 `json:"llm_cost_mtd_usd"`
+	}
+	_ = json.NewDecoder(rr.Body).Decode(&body)
+	if body.LLMCostMTDUSD != 0.456789 {
+		t.Errorf("llm_cost_mtd_usd: want current-period row 0.456789 got %v", body.LLMCostMTDUSD)
+	}
+}
+
+func TestBillingStatusLLMCostMTDAbsentIsZero(t *testing.T) {
+	queries := &MockQuery{}
+	seedTestUser(queries, "test-user-id", billing.PlanCreator)
+	r := setupBillingRouter(queries, billing.NewMockClient())
+
+	access, _, _ := auth.GenerateTokens("test-user-id")
+	req, _ := http.NewRequest("GET", "/api/billing/status", nil)
+	req.Header.Set("Authorization", bearer(access))
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	var body struct {
+		LLMCostMTDUSD *float64 `json:"llm_cost_mtd_usd"`
+	}
+	_ = json.NewDecoder(rr.Body).Decode(&body)
+	if body.LLMCostMTDUSD == nil {
+		t.Fatal("llm_cost_mtd_usd must always be present (additive field)")
+	}
+	if *body.LLMCostMTDUSD != 0 {
+		t.Errorf("no rollup rows: want 0 got %v", *body.LLMCostMTDUSD)
+	}
+}

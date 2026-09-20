@@ -308,12 +308,27 @@ func (w *Worker) runUserDigest(ctx context.Context, user *db.User, weekStart, we
 	// Retries beyond the deadline become deferred rows handled async.
 	userCtx, cancel := context.WithTimeout(ctx, dispatchDeadline)
 	defer cancel()
-	parsed, err := w.callWithRetry(userCtx, prompt, truth)
+	parsed, usage, err := w.callWithRetry(userCtx, prompt, truth)
+	w.recordDigestCost(ctx, user, usage)
 	if err != nil {
 		w.deferDigest(ctx, user, digestID, weekStart, err)
 		return
 	}
 	w.completeDigest(ctx, user, digestID, weekStart, parsed)
+}
+
+// recordDigestCost bills a digest's token usage against the user's current
+// billing period (llm-cost-analytics: digest costs must be included).
+// Channel is empty — a digest spans all of the user's channels.
+func (w *Worker) recordDigestCost(ctx context.Context, user *db.User, usage TokenUsage) {
+	cost := CostMicroUSD("opencode", w.LLMClient.ModelName(), usage)
+	now := time.Now()
+	if w.Now != nil {
+		now = w.Now()
+	}
+	recordCost(ctx, user.ID, "", cost)
+	periodStart, periodEnd := overagePeriod(user, now)
+	persistLLMCost(ctx, w.Queries, user.ID, periodStart, periodEnd, cost)
 }
 
 // claimDigest guards against double dispatch for a (user, week) pair within
@@ -526,8 +541,11 @@ func (w *Worker) computeTruth(ctx context.Context, user *db.User, weekStart time
 // callWithRetry implements the digestRetrySchedule. Each attempt waits
 // (delta from previous element) before firing, giving the chain its
 // cumulative budget. Context cancellation aborts the chain immediately.
-func (w *Worker) callWithRetry(ctx context.Context, prompt string, truth DigestContent) (DigestContent, error) {
+// Token usage is summed across every attempt: failed calls were still
+// billed by the provider.
+func (w *Worker) callWithRetry(ctx context.Context, prompt string, truth DigestContent) (DigestContent, TokenUsage, error) {
 	var lastErr error
+	var total TokenUsage
 	prev := time.Duration(0)
 	for i, when := range digestRetrySchedule {
 		delta := when - prev
@@ -535,13 +553,15 @@ func (w *Worker) callWithRetry(ctx context.Context, prompt string, truth DigestC
 		if delta > 0 {
 			select {
 			case <-ctx.Done():
-				return DigestContent{}, ctx.Err()
+				return DigestContent{}, total, ctx.Err()
 			case <-time.After(delta):
 			}
 		}
-		out, err := CallDigestLLM(ctx, w.LLMClient, prompt, truth)
+		out, usage, err := CallDigestLLM(ctx, w.LLMClient, prompt, truth)
+		total.Input += usage.Input
+		total.Output += usage.Output
 		if err == nil {
-			return out, nil
+			return out, total, nil
 		}
 		lastErr = err
 		w.Logger.Printf("digest worker: LLM attempt %d/%d failed: %v", i+1, len(digestRetrySchedule), err)
@@ -550,11 +570,11 @@ func (w *Worker) callWithRetry(ctx context.Context, prompt string, truth DigestC
 			// uses its own derived context, so a per-call deadline does
 			// not poison the parent and we keep going on those.
 			if ctx.Err() != nil {
-				return DigestContent{}, err
+				return DigestContent{}, total, err
 			}
 		}
 	}
-	return DigestContent{}, lastErr
+	return DigestContent{}, total, lastErr
 }
 
 // recoverStalePending implements the Spec 06 startup recovery scenario.
@@ -654,7 +674,8 @@ func (w *Worker) retryDeferred(ctx context.Context, d *db.WeeklyDigest) {
 	})
 	retryCtx, cancel := context.WithTimeout(ctx, dispatchDeadline)
 	defer cancel()
-	parsed, err := w.callWithRetry(retryCtx, prompt, truth)
+	parsed, usage, err := w.callWithRetry(retryCtx, prompt, truth)
+	w.recordDigestCost(ctx, user, usage)
 	if err != nil {
 		w.Logger.Printf("digest worker: deferred retry failed id=%s: %v", d.ID, err)
 		return

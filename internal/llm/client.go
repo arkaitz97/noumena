@@ -4,6 +4,14 @@ import (
 	"context"
 )
 
+// TokenUsage carries the provider-reported token counts for one batch
+// call (llm-cost-analytics 1.3). Zero values mean the provider omitted a
+// usage object — cost derivation treats those as unbilled, never guessed.
+type TokenUsage struct {
+	Input  int64
+	Output int64
+}
+
 // LLMClient is the narrow interface every classification provider satisfies.
 // Implementations concern themselves only with request building, transport
 // (including 429/Retry-After backoff), response parsing, and returning either
@@ -13,7 +21,7 @@ import (
 // behind the same interface and is the only place where provider-switching
 // policy lives.
 type LLMClient interface {
-	ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, error)
+	ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, TokenUsage, error)
 	// ProviderName returns a stable identifier (e.g. "openai", "anthropic")
 	// used for attribution in comments.llm_provider.
 	ProviderName() string
@@ -29,4 +37,5 @@ type LLMClient interface {
 type classifyOutcome struct {
 	results        []LLMResult
 	missingIndexes []int
+	usage          TokenUsage
 }

@@ -392,3 +392,50 @@ func TestListOverageGroupsUnknownPlanUser(t *testing.T) {
 		t.Errorf("groups: want single 2500-overage group, got %+v", groups)
 	}
 }
+
+// llm-cost-analytics 1.2/1.4: cost accumulation upsert + coexistence with
+// the reset-time snapshot upsert (neither writer may clobber the other's
+// columns).
+func TestAddLLMCostAccumulatesWithoutClobberingSnapshot(t *testing.T) {
+	ctx, q := setupBillingDB(t)
+	u, err := q.CreateUser(ctx, "cost@example.com", "h")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	ps := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	pe := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+
+	// Two batches accumulate onto one open period with no snapshot yet.
+	if err := q.AddLLMCost(ctx, u.ID, ps, pe, 1_000_000, 1); err != nil {
+		t.Fatalf("first AddLLMCost: %v", err)
+	}
+	if err := q.AddLLMCost(ctx, u.ID, ps, pe, 250_000, 1); err != nil {
+		t.Fatalf("second AddLLMCost: %v", err)
+	}
+	// The reset-time snapshot then refreshes quota columns only.
+	if err := q.UpsertBillingUsage(ctx, db.BillingUsage{UserID: u.ID, PeriodStart: ps, PeriodEnd: pe, CommentsUsed: 42, Quota: 1000}); err != nil {
+		t.Fatalf("UpsertBillingUsage: %v", err)
+	}
+	// …and a late batch still finds the existing row.
+	if err := q.AddLLMCost(ctx, u.ID, ps, pe, 125_000, 1); err != nil {
+		t.Fatalf("third AddLLMCost: %v", err)
+	}
+
+	rows, err := q.GetBillingUsage(ctx, u.ID, 10)
+	if err != nil {
+		t.Fatalf("GetBillingUsage: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row for the period, got %d", len(rows))
+	}
+	r := rows[0]
+	if r.LLMCostUSDMicro != 1_375_000 {
+		t.Errorf("LLMCostUSDMicro: want 1375000 got %d", r.LLMCostUSDMicro)
+	}
+	if r.PriceVersion != 1 {
+		t.Errorf("PriceVersion: want 1 got %d", r.PriceVersion)
+	}
+	if r.CommentsUsed != 42 || r.Quota != 1000 {
+		t.Errorf("snapshot columns clobbered: used=%d quota=%d", r.CommentsUsed, r.Quota)
+	}
+}

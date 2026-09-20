@@ -602,6 +602,34 @@ FROM users`); err != nil {
 			return nil
 		},
 	},
+	{
+		version: 21,
+		name:    "billing_usage LLM cost columns",
+		run: func(ctx context.Context, tx *sql.Tx) error {
+			// llm-cost-analytics 1.2: write-time cost rollup columns.
+			// llm_cost_usd_micro stores cumulative micro-USD (integer to
+			// avoid float drift; converted at the API boundary).
+			// price_version snapshots the llm.PriceVersion in effect when
+			// the cost was recorded, so re-pricing never rewrites history.
+			for _, col := range []struct{ name, ddl string }{
+				{"llm_cost_usd_micro", "INTEGER NOT NULL DEFAULT 0"},
+				{"price_version", "INTEGER NOT NULL DEFAULT 0"},
+			} {
+				has, err := columnExists(ctx, tx, "billing_usage", col.name)
+				if err != nil {
+					return err
+				}
+				if has {
+					continue
+				}
+				if _, err := tx.ExecContext(ctx,
+					fmt.Sprintf("ALTER TABLE billing_usage ADD COLUMN %s %s", col.name, col.ddl)); err != nil {
+					return fmt.Errorf("add billing_usage.%s: %w", col.name, err)
+				}
+			}
+			return nil
+		},
+	},
 }
 
 // Migrate applies all pending migrations to the given database inside a

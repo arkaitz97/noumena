@@ -57,7 +57,7 @@ func TestOpenAIClient_SuccessfulClassification(t *testing.T) {
 	defer srv.Close()
 
 	c := newOpenAIClientWithHTTP(srv.Client(), srv.URL, "sk-test-123", "gpt-test")
-	results, _, err := c.ClassifyBatch(context.Background(), []PromptComment{
+	results, _, _, err := c.ClassifyBatch(context.Background(), []PromptComment{
 		{Body: "great"}, {Body: "ok"}, {Body: "meh"},
 	})
 	if err != nil {
@@ -113,7 +113,7 @@ func TestOpenAIClient_429RetryAfterHonored(t *testing.T) {
 
 	c := newOpenAIClientWithHTTP(srv.Client(), srv.URL, "k", "")
 	start := time.Now()
-	results, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "hi"}})
+	results, _, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "hi"}})
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("ClassifyBatch: %v", err)
@@ -142,7 +142,7 @@ func TestOpenAIClient_Persistent5xxReturnsError(t *testing.T) {
 	}
 
 	c := newOpenAIClientWithHTTP(srv.Client(), srv.URL, "k", "")
-	_, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
+	_, _, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
 	if err == nil {
 		t.Fatalf("expected error after exhausted retries")
 	}
@@ -164,7 +164,7 @@ func TestOpenAIClient_400NonRetryable(t *testing.T) {
 	defer srv.Close()
 
 	c := newOpenAIClientWithHTTP(srv.Client(), srv.URL, "k", "")
-	_, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
+	_, _, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
 	if err == nil {
 		t.Fatalf("expected error on 400")
 	}
@@ -187,7 +187,7 @@ func TestOpenAIClient_InvalidCategoryIsPartialNotRetryable(t *testing.T) {
 	defer srv.Close()
 
 	c := newOpenAIClientWithHTTP(srv.Client(), srv.URL, "k", "")
-	results, missing, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
+	results, missing, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
 	if err != nil {
 		t.Fatalf("partial parse must not abort: %v", err)
 	}
@@ -223,7 +223,7 @@ func TestOpenAIClient_Regression_SlowResponseUnderBudget(t *testing.T) {
 	defer cancel()
 
 	c := newOpenAIClientWithHTTP(srv.Client(), srv.URL, "k", "")
-	_, _, err := c.ClassifyBatch(ctx, []PromptComment{{Body: "x"}})
+	_, _, _, err := c.ClassifyBatch(ctx, []PromptComment{{Body: "x"}})
 	if err != nil {
 		t.Fatalf("expected success with 5s budget for 500ms response: %v", err)
 	}
@@ -254,7 +254,7 @@ func TestOpenAIClient_Regression_BudgetAbortsAtOnce(t *testing.T) {
 	defer cancel()
 
 	c := newOpenAIClientWithHTTP(srv.Client(), srv.URL, "k", "")
-	_, _, err := c.ClassifyBatch(ctx, []PromptComment{{Body: "x"}})
+	_, _, _, err := c.ClassifyBatch(ctx, []PromptComment{{Body: "x"}})
 	if err == nil {
 		t.Fatalf("expected deadline exceeded error with 500ms budget for 2s response")
 	}

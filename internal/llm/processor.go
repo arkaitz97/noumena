@@ -347,7 +347,7 @@ func (p *Processor) tickOnce(ctx context.Context) {
 // processClaimedBatch runs the full lifecycle for a single reserved batch.
 func (p *Processor) processClaimedBatch(ctx context.Context, cb claimedBatch) {
 	channelID, batch, primary, jobID := cb.channelID, cb.batch, cb.primary, cb.jobID
-	results, missingIndexes, err := p.classify(ctx, p.buildPrompts(ctx, channelID, primary, batch))
+	results, missingIndexes, usage, err := p.classify(ctx, p.buildPrompts(ctx, channelID, primary, batch))
 	if err != nil {
 		p.failBatch(ctx, channelID, jobID, "", err)
 		terminal := IsTerminal(err)
@@ -364,6 +364,9 @@ func (p *Processor) processClaimedBatch(ctx context.Context, cb claimedBatch) {
 		parked := p.recordRetryState(ctx, channelID, jobID, commentIDs(batch), IsTerminal(err))
 		recordLLMJobAttempt(ctx, p.Client.ProviderName(), failureOutcome(IsTerminal(err), parked))
 		return
+	}
+	if persisted > 0 {
+		p.recordBatchCost(ctx, primary, channelID, usage)
 	}
 	if len(missing) > 0 {
 		log.Printf("event=batch_partial channel_id=%s job_id=%s persisted=%d missing_indexes=%v",
@@ -596,7 +599,7 @@ func (p *Processor) parentContext(ctx context.Context, c *db.Comment) string {
 
 // classify runs the LLM call under the batch timeout. The caller holds the
 // inflight counter for the whole batch so graceful shutdown waits for it.
-func (p *Processor) classify(ctx context.Context, prompts []PromptComment) ([]LLMResult, []int, error) {
+func (p *Processor) classify(ctx context.Context, prompts []PromptComment) ([]LLMResult, []int, TokenUsage, error) {
 	llmCtx, cancel := context.WithTimeout(ctx, p.BatchTimeout)
 	defer cancel()
 	// otel-instrumentation: wrap each LLM call in a tracer span and
@@ -609,9 +612,10 @@ func (p *Processor) classify(ctx context.Context, prompts []PromptComment) ([]LL
 	traced, span := llmTracer.Start(llmCtx, "llm.classify_batch", traceWithAttrs(provider, model, len(prompts)))
 	defer span.End()
 	llmStart := time.Now()
-	results, missingIndexes, err := p.Client.ClassifyBatch(traced, prompts)
+	results, missingIndexes, usage, err := p.Client.ClassifyBatch(traced, prompts)
 	recordLLMRequest(llmCtx, provider, model, llmStart, err)
-	return results, missingIndexes, err
+	recordLLMTokens(llmCtx, provider, model, usage.Input+usage.Output)
+	return results, missingIndexes, usage, err
 }
 
 // failBatch records the truncated error on the job row and logs the
@@ -706,6 +710,22 @@ func (p *Processor) persistBatch(ctx context.Context, batch []*db.Comment, resul
 		return persisted, missing, fmt.Errorf("mark job completed: %w", err)
 	}
 	return persisted, missing, nil
+}
+
+// recordBatchCost prices a completed batch's reported usage against the
+// active price card and accumulates it on the primary's billing-period
+// rollup (llm-cost-analytics 1.3). Attribution follows the quota-
+// decrementing user, matching the overage rule. Non-fatal.
+//
+// ponytail: only successful classifications are billed; a failed batch
+// still burned provider tokens but rolls up zero cost. Upgrade path:
+// persist usage inside each provider client on every 2xx response if
+// failed-attempt spend starts mattering.
+func (p *Processor) recordBatchCost(ctx context.Context, primary *db.User, channelID string, usage TokenUsage) {
+	cost := CostMicroUSD(p.Client.ProviderName(), p.Client.ModelName(), usage)
+	recordCost(ctx, primary.ID, channelID, cost)
+	periodStart, periodEnd := overagePeriod(primary, p.clock())
+	persistLLMCost(ctx, p.Q, primary.ID, periodStart, periodEnd, cost)
 }
 
 // sortedInts returns the map's keys in ascending order for stable logs/tests.

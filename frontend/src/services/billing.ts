@@ -26,6 +26,8 @@ export interface UsagePeriod {
   period_end: string
   comments_used: number
   quota: number
+  /** LLM spend for the period (USD). Absent on backends without cost analytics. */
+  llm_cost_usd?: number
 }
 
 export interface UsageResponse {
@@ -41,6 +43,8 @@ export interface BillingTrial {
 /** `BillingStatus` + the additive `trial` block (`/api/billing/status`). */
 export interface BillingStatusWithTrial extends BillingStatus {
   trial?: BillingTrial
+  /** Month-to-date LLM spend (USD). Absent on backends without cost analytics. */
+  llm_cost_mtd_usd?: number
 }
 
 export async function status(): Promise<BillingStatusWithTrial> {

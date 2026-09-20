@@ -75,9 +75,16 @@ func newOpenCodeClientWithHTTP(client *http.Client, baseURL, apiKey, model strin
 func (c *opencodeClient) ProviderName() string { return "opencode" }
 func (c *opencodeClient) ModelName() string    { return c.model }
 
+// digestOutcome shuttles (content, usage) through the digest retry loop.
+type digestOutcome struct {
+	content string
+	usage   TokenUsage
+}
+
 // GenerateDigestRaw sends a digest prompt to the OpenCode chat completions
-// endpoint. Returns the raw model content string.
-func (c *opencodeClient) GenerateDigestRaw(ctx context.Context, prompt string) (string, error) {
+// endpoint. Returns the raw model content string and the provider-reported
+// token usage (zero counts when the gateway omits the usage object).
+func (c *opencodeClient) GenerateDigestRaw(ctx context.Context, prompt string) (string, TokenUsage, error) {
 	reqBody := opencodeChatRequest{
 		Model: c.model,
 		Messages: []opencodeChatMessage{
@@ -88,21 +95,22 @@ func (c *opencodeClient) GenerateDigestRaw(ctx context.Context, prompt string) (
 	}
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", fmt.Errorf("opencode: marshal digest request: %w", err)
+		return "", TokenUsage{}, fmt.Errorf("opencode: marshal digest request: %w", err)
 	}
 
 	endpoint := c.baseURL + "/chat/completions"
-	return retryTransient(ctx, "opencode", "opencode: digest", func(attemptCtx context.Context) (string, time.Duration, bool, error) {
+	out, err := retryTransient(ctx, "opencode", "opencode: digest", func(attemptCtx context.Context) (digestOutcome, time.Duration, bool, error) {
 		return c.doOnceDigest(attemptCtx, endpoint, bodyBytes)
 	})
+	return out.content, out.usage, err
 }
 
 // doOnceDigest performs a single HTTP attempt for digest generation.
-// Returns (content, retryAfter, retryable, err).
-func (c *opencodeClient) doOnceDigest(ctx context.Context, endpoint string, body []byte) (string, time.Duration, bool, error) {
+// Returns (outcome, retryAfter, retryable, err).
+func (c *opencodeClient) doOnceDigest(ctx context.Context, endpoint string, body []byte) (digestOutcome, time.Duration, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return "", 0, false, fmt.Errorf("opencode: build digest request: %w", err)
+		return digestOutcome{}, 0, false, fmt.Errorf("opencode: build digest request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -113,28 +121,28 @@ func (c *opencodeClient) doOnceDigest(ctx context.Context, endpoint string, body
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", 0, true, fmt.Errorf("opencode: digest transport: %w", err)
+		return digestOutcome{}, 0, true, fmt.Errorf("opencode: digest transport: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == 429 || resp.StatusCode >= 500 {
 		retryAfter := parseRetryAfterSeconds(resp.Header.Get("Retry-After"))
 		_, _ = io.Copy(io.Discard, resp.Body)
-		return "", retryAfter, true, fmt.Errorf("opencode: digest HTTP %d", resp.StatusCode)
+		return digestOutcome{}, retryAfter, true, fmt.Errorf("opencode: digest HTTP %d", resp.StatusCode)
 	}
 	if resp.StatusCode >= 400 {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return "", 0, false, fmt.Errorf("opencode: digest HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet)))
+		return digestOutcome{}, 0, false, fmt.Errorf("opencode: digest HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet)))
 	}
 
 	var parsed opencodeChatResponse
 	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
-		return "", 0, false, fmt.Errorf("opencode: digest decode response: %w", err)
+		return digestOutcome{}, 0, false, fmt.Errorf("opencode: digest decode response: %w", err)
 	}
 	if len(parsed.Choices) == 0 {
-		return "", 0, false, fmt.Errorf("opencode: digest empty response choices")
+		return digestOutcome{}, 0, false, fmt.Errorf("opencode: digest empty response choices")
 	}
-	return parsed.Choices[0].Message.Content, 0, false, nil
+	return digestOutcome{content: parsed.Choices[0].Message.Content, usage: parsed.Usage.tokenUsage()}, 0, false, nil
 }
 
 // chatCompletionRequest mirrors the small subset of the OpenAI-compatible
@@ -150,18 +158,30 @@ type opencodeChatMessage struct {
 	Content string `json:"content"`
 }
 
+// opencodeUsage is the OpenAI-compatible usage object. Absent/null in
+// responses decodes to zero counts (never guessed, per llm-cost-analytics).
+type opencodeUsage struct {
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
+}
+
+func (u opencodeUsage) tokenUsage() TokenUsage {
+	return TokenUsage{Input: u.PromptTokens, Output: u.CompletionTokens}
+}
+
 type opencodeChatResponse struct {
 	Choices []struct {
 		Message opencodeChatMessage `json:"message"`
 	} `json:"choices"`
+	Usage opencodeUsage `json:"usage"`
 }
 
 // ClassifyBatch builds the classification prompt, POSTs it to the OpenCode
 // chat-completions endpoint, and returns the parsed []LLMResult. Retries are
 // handled by retryTransient (shared with OpenAI/Anthropic clients).
-func (c *opencodeClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, error) {
+func (c *opencodeClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, TokenUsage, error) {
 	if len(comments) == 0 {
-		return nil, nil, nil
+		return nil, nil, TokenUsage{}, nil
 	}
 
 	system, user := BuildClassificationPrompt(comments)
@@ -175,14 +195,14 @@ func (c *opencodeClient) ClassifyBatch(ctx context.Context, comments []PromptCom
 	}
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, nil, fmt.Errorf("opencode: marshal request: %w", err)
+		return nil, nil, TokenUsage{}, fmt.Errorf("opencode: marshal request: %w", err)
 	}
 
 	endpoint := c.baseURL + "/chat/completions"
 	out, err := retryTransient(ctx, "opencode", "opencode", func(attemptCtx context.Context) (classifyOutcome, time.Duration, bool, error) {
 		return c.doOnce(attemptCtx, endpoint, bodyBytes, len(comments))
 	})
-	return out.results, out.missingIndexes, err
+	return out.results, out.missingIndexes, out.usage, err
 }
 
 // doOnce performs a single HTTP attempt. It returns:
@@ -233,5 +253,5 @@ func (c *opencodeClient) doOnce(ctx context.Context, endpoint string, body []byt
 	if perr != nil {
 		return classifyOutcome{}, 0, false, terminal(fmt.Errorf("opencode: parse: %w", perr))
 	}
-	return classifyOutcome{results: results, missingIndexes: missingIndexes}, 0, false, nil
+	return classifyOutcome{results: results, missingIndexes: missingIndexes, usage: parsed.Usage.tokenUsage()}, 0, false, nil
 }

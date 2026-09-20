@@ -61,7 +61,7 @@ func TestCallDigestLLM_Success(t *testing.T) {
 		"total_comments_analyzed":0,
 		"filtered_comments":0
 	}`
-	got, err := CallDigestLLM(context.Background(), newMockOpenCode(t, raw, "", 0), "p", truthFixture())
+	got, _, err := CallDigestLLM(context.Background(), newMockOpenCode(t, raw, "", 0), "p", truthFixture())
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestCallDigestLLM_TruncatesToFive(t *testing.T) {
 		sb.WriteString(`{"question":"q","count":1,"unanswered":false}`)
 	}
 	sb.WriteString(`]}`)
-	got, err := CallDigestLLM(context.Background(), newMockOpenCode(t, sb.String(), "", 0), "p", truthFixture())
+	got, _, err := CallDigestLLM(context.Background(), newMockOpenCode(t, sb.String(), "", 0), "p", truthFixture())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -110,7 +110,7 @@ func TestCallDigestLLM_TruncatesToFive(t *testing.T) {
 }
 
 func TestCallDigestLLM_MalformedJSON(t *testing.T) {
-	_, err := CallDigestLLM(context.Background(), newMockOpenCode(t, "this is not json", "", 0), "p", truthFixture())
+	_, _, err := CallDigestLLM(context.Background(), newMockOpenCode(t, "this is not json", "", 0), "p", truthFixture())
 	if err == nil {
 		t.Fatal("expected error on malformed JSON")
 	}
@@ -119,7 +119,7 @@ func TestCallDigestLLM_MalformedJSON(t *testing.T) {
 func TestCallDigestLLM_MissingRequiredField(t *testing.T) {
 	// Empty idea string fails validation.
 	raw := `{"top_ideas":[{"idea":"","evidence":"e","sample_comments":[]}],"top_questions":[]}`
-	_, err := CallDigestLLM(context.Background(), newMockOpenCode(t, raw, "", 0), "p", truthFixture())
+	_, _, err := CallDigestLLM(context.Background(), newMockOpenCode(t, raw, "", 0), "p", truthFixture())
 	if err == nil {
 		t.Fatal("expected validation error for empty idea")
 	}
@@ -128,7 +128,7 @@ func TestCallDigestLLM_MissingRequiredField(t *testing.T) {
 func TestCallDigestLLM_TimeoutFromCaller(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	_, err := CallDigestLLM(ctx, newMockOpenCode(t, "{}", "", 200*time.Millisecond), "p", truthFixture())
+	_, _, err := CallDigestLLM(ctx, newMockOpenCode(t, "{}", "", 200*time.Millisecond), "p", truthFixture())
 	if err == nil {
 		t.Fatal("expected error on timeout")
 	}

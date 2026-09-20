@@ -77,9 +77,9 @@ func (c *openaiClient) ModelName() string    { return c.model }
 // ClassifyBatch mirrors opencodeClient.ClassifyBatch: build the shared
 // classification prompt, POST one request to /chat/completions, retry with
 // the shared transient schedule, parse via ParseClassificationResponse.
-func (c *openaiClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, error) {
+func (c *openaiClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, TokenUsage, error) {
 	if len(comments) == 0 {
-		return nil, nil, nil
+		return nil, nil, TokenUsage{}, nil
 	}
 
 	system, user := BuildClassificationPrompt(comments)
@@ -93,7 +93,7 @@ func (c *openaiClient) ClassifyBatch(ctx context.Context, comments []PromptComme
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, nil, fmt.Errorf("openai: marshal request: %w", err)
+		return nil, nil, TokenUsage{}, fmt.Errorf("openai: marshal request: %w", err)
 	}
 
 	endpoint := c.baseURL + "/chat/completions"
@@ -116,8 +116,8 @@ func (c *openaiClient) ClassifyBatch(ctx context.Context, comments []PromptComme
 				if perr != nil {
 					return classifyOutcome{}, terminal(fmt.Errorf("openai: parse: %w", perr))
 				}
-				return classifyOutcome{results: results, missingIndexes: missingIndexes}, nil
+				return classifyOutcome{results: results, missingIndexes: missingIndexes, usage: parsed.Usage.tokenUsage()}, nil
 			})
 	})
-	return out.results, out.missingIndexes, err
+	return out.results, out.missingIndexes, out.usage, err
 }

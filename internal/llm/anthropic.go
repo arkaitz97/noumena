@@ -45,6 +45,10 @@ type anthropicMessagesResponse struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
 	} `json:"content"`
+	Usage struct {
+		InputTokens  int64 `json:"input_tokens"`
+		OutputTokens int64 `json:"output_tokens"`
+	} `json:"usage"`
 }
 
 // anthropicClient is an optional Anthropic Messages API LLMClient with the
@@ -97,9 +101,9 @@ func (c *anthropicClient) ModelName() string    { return c.model }
 // ClassifyBatch mirrors opencodeClient.ClassifyBatch: build the shared
 // classification prompt, POST one Messages API request, retry with the
 // shared transient schedule, parse via ParseClassificationResponse.
-func (c *anthropicClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, error) {
+func (c *anthropicClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, TokenUsage, error) {
 	if len(comments) == 0 {
-		return nil, nil, nil
+		return nil, nil, TokenUsage{}, nil
 	}
 
 	system, user := BuildClassificationPrompt(comments)
@@ -114,7 +118,7 @@ func (c *anthropicClient) ClassifyBatch(ctx context.Context, comments []PromptCo
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, nil, fmt.Errorf("anthropic: marshal request: %w", err)
+		return nil, nil, TokenUsage{}, fmt.Errorf("anthropic: marshal request: %w", err)
 	}
 
 	endpoint := c.baseURL + "/v1/messages"
@@ -145,8 +149,12 @@ func (c *anthropicClient) ClassifyBatch(ctx context.Context, comments []PromptCo
 				if perr != nil {
 					return classifyOutcome{}, terminal(fmt.Errorf("anthropic: parse: %w", perr))
 				}
-				return classifyOutcome{results: results, missingIndexes: missingIndexes}, nil
+				return classifyOutcome{
+					results:        results,
+					missingIndexes: missingIndexes,
+					usage:          TokenUsage{Input: parsed.Usage.InputTokens, Output: parsed.Usage.OutputTokens},
+				}, nil
 			})
 	})
-	return out.results, out.missingIndexes, err
+	return out.results, out.missingIndexes, out.usage, err
 }

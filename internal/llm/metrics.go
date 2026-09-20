@@ -25,6 +25,7 @@ var llmTracer = otel.Tracer("noumena/llm")
 var (
 	llmRequestsTotal       metric.Int64Counter
 	llmTokensTotal         metric.Int64Counter
+	llmCostUSDTTotal       metric.Int64Counter
 	llmRequestDurationSecs metric.Float64Histogram
 	llmFailoverTotal       metric.Int64Counter
 	llmProviderCallsTotal  metric.Int64Counter
@@ -46,6 +47,12 @@ func init() {
 		metric.WithDescription("Total LLM tokens reported by provider responses"),
 	); err != nil {
 		panic("noumena_llm_tokens_total: " + err.Error())
+	}
+	if llmCostUSDTTotal, err = llmMeter.Int64Counter(
+		"noumena_llm_cost_usd_total",
+		metric.WithDescription("Cumulative LLM cost per tenant in micro-USD (divide by 1e6 for USD)"),
+	); err != nil {
+		panic("noumena_llm_cost_usd_total: " + err.Error())
 	}
 	if llmRequestDurationSecs, err = llmMeter.Float64Histogram(
 		"noumena_llm_request_duration_seconds",
@@ -133,6 +140,20 @@ func recordLLMTokens(ctx context.Context, provider, model string, tokens int64) 
 	llmTokensTotal.Add(ctx, tokens, metric.WithAttributes(
 		attribute.String(telemetry.AttrProvider, provider),
 		attribute.String(telemetry.AttrModel, model),
+	))
+}
+
+// recordLLMCost increments noumena_llm_cost_usd_total by `costMicro`
+// (micro-USD) with the (user, channel, price_version) labels. Zero cost is
+// a no-op so unreported usage never pollutes the counter.
+func recordLLMCost(ctx context.Context, userID, channelID, priceVersion string, costMicro int64) {
+	if costMicro <= 0 {
+		return
+	}
+	llmCostUSDTTotal.Add(ctx, costMicro, metric.WithAttributes(
+		attribute.String("user", userID),
+		attribute.String("channel", channelID),
+		attribute.String("price_version", priceVersion),
 	))
 }
 

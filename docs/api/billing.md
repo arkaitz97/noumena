@@ -76,13 +76,47 @@ visit the customer portal to stop billing on their way out.
     "channels_limit":     3,
     "comments_used":      18234,
     "comments_limit":     50000,
-    "overage_cost":       0.0
+    "overage_cost":       0.0,
+    "llm_cost_mtd_usd":   1.234,
+    "trial":              { "active": false, "ends_at": "", "days_remaining": 0 }
   }
   ```
   `status` is the local 4-state machine (`active`, `past_due`,
   `canceled`, `paused`). `interval` and `current_period_end` are
   omitted (`null`) when the user is on the free plan.
+  `llm_cost_mtd_usd` is the month-to-date LLM processing cost for the
+  current billing period (see `GET /api/billing/usage`).
 - **Errors:** `404 user not found`, `500 internal error`.
+
+### GET /api/billing/usage
+
+- **Auth:** access JWT.
+- **Query:** `periods` (optional, integer `1..12`, default `6`).
+  Invalid values → `400 invalid periods`.
+- **Response:** `200 OK`,
+  ```json
+  {
+    "periods": [
+      {
+        "period_start": "2026-05-01T00:00:00Z",
+        "period_end":   "2026-06-01T00:00:00Z",
+        "comments_used": 18234,
+        "quota":         50000,
+        "llm_cost_usd":  1.2345
+      }
+    ]
+  }
+  ```
+  Newest period first. `llm_cost_usd` is the accumulated LLM processing
+  cost for that period (classification + weekly digests), stored
+  internally in integer micro-USD and converted at this boundary. It is
+  shown for **all plans including Free** (transparency); overage
+  invoicing remains comment-count based. Costs follow the same
+  attribution rule as overage: a shared channel's cost is billed to the
+  primary tracker whose quota decremented. Prices are snapshotted per
+  batch (`price_version`), so later price-card changes never rewrite
+  historical rows.
+- **Errors:** `400 invalid periods`; `500 internal error`.
 
 ### POST /webhooks/stripe (public)
 

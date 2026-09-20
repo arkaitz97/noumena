@@ -79,7 +79,7 @@ func TestOpenCodeClient_SuccessfulClassification(t *testing.T) {
 	defer srv.Close()
 
 	c := newOpenCodeClientWithHTTP(srv.Client(), srv.URL, "test-key", "opencode/test")
-	results, _, err := c.ClassifyBatch(context.Background(), []PromptComment{
+	results, _, _, err := c.ClassifyBatch(context.Background(), []PromptComment{
 		{Body: "great"}, {Body: "ok"}, {Body: "meh"},
 	})
 	if err != nil {
@@ -121,7 +121,7 @@ func TestOpenCodeClient_429RetryAfterHonored(t *testing.T) {
 
 	c := newOpenCodeClientWithHTTP(srv.Client(), srv.URL, "k", "")
 	start := time.Now()
-	results, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "hi"}})
+	results, _, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "hi"}})
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("ClassifyBatch: %v", err)
@@ -154,7 +154,7 @@ func TestOpenCodeClient_Persistent5xxReturnsError(t *testing.T) {
 	}
 
 	c := newOpenCodeClientWithHTTP(srv.Client(), srv.URL, "k", "")
-	_, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
+	_, _, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
 	if err == nil {
 		t.Fatalf("expected error after exhausted retries")
 	}
@@ -173,7 +173,7 @@ func TestOpenCodeClient_400NonRetryable(t *testing.T) {
 	defer srv.Close()
 
 	c := newOpenCodeClientWithHTTP(srv.Client(), srv.URL, "k", "")
-	_, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
+	_, _, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
 	if err == nil {
 		t.Fatalf("expected error on 400")
 	}
@@ -195,7 +195,7 @@ func TestOpenCodeClient_BearerHeaderSent(t *testing.T) {
 	defer srv.Close()
 
 	c := newOpenCodeClientWithHTTP(srv.Client(), srv.URL, "sk-secret-123", "")
-	if _, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "hi"}}); err != nil {
+	if _, _, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "hi"}}); err != nil {
 		t.Fatalf("ClassifyBatch: %v", err)
 	}
 	if seenAuth != "Bearer sk-secret-123" {

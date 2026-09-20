@@ -287,6 +287,12 @@ type BillingUsage struct {
 	PeriodEnd    time.Time
 	CommentsUsed int
 	Quota        int
+	// LLMCostUSDMicro is the cumulative LLM cost for the period in
+	// micro-USD (llm-cost-analytics). Converted at the API boundary.
+	LLMCostUSDMicro int64
+	// PriceVersion is the llm.PriceVersion snapshot of the last cost write
+	// in this period; 0 means no cost recorded yet.
+	PriceVersion int
 }
 
 // UpsertBillingUsage records (or refreshes) a user's current-period usage
@@ -301,6 +307,30 @@ func (q *SQLiteQuery) UpsertBillingUsage(ctx context.Context, u BillingUsage) er
 		     quota = excluded.quota`,
 		generateUUID(), u.UserID, u.PeriodStart.UTC().Format(time.RFC3339),
 		u.PeriodEnd.UTC().Format(time.RFC3339), u.CommentsUsed, u.Quota)
+	return err
+}
+
+// AddLLMCost accumulates a batch's LLM cost (micro-USD) onto the user's
+// billing-period rollup row, creating the row when the period is still
+// open. Write-time accumulation replaces a daily rollup job (design D2);
+// the row is deliberately NOT seeded with comments_used/quota — the
+// reset-time UpsertBillingUsage owns those and only overwrites its own
+// columns, so the two writers never clobber each other.
+//
+// ponytail: ceiling is (user, period) granularity — no per-channel DB
+// breakdown and no daily rows. Upgrade path: add a channel_id column with
+// its own unique key (or a side table) once the dashboard actually shows
+// per-channel spend; the ops metric already carries the channel label.
+func (q *SQLiteQuery) AddLLMCost(ctx context.Context, userID string, periodStart, periodEnd time.Time, costUSDMicro int64, priceVersion int) error {
+	_, err := q.db.ExecContext(ctx,
+		`INSERT INTO billing_usage (id, user_id, period_start, period_end, comments_used, quota, llm_cost_usd_micro, price_version)
+		 VALUES (?, ?, ?, ?, 0, 0, ?, ?)
+		 ON CONFLICT(user_id, period_start) DO UPDATE SET
+		     period_end = excluded.period_end,
+		     llm_cost_usd_micro = llm_cost_usd_micro + excluded.llm_cost_usd_micro,
+		     price_version = excluded.price_version`,
+		generateUUID(), userID, periodStart.UTC().Format(time.RFC3339),
+		periodEnd.UTC().Format(time.RFC3339), costUSDMicro, priceVersion)
 	return err
 }
 
@@ -365,7 +395,7 @@ func (q *SQLiteQuery) RecordCurrentPeriodUsage(ctx context.Context) (int64, erro
 // first. limit must be >= 1.
 func (q *SQLiteQuery) GetBillingUsage(ctx context.Context, userID string, limit int) ([]BillingUsage, error) {
 	rows, err := q.db.QueryContext(ctx,
-		`SELECT user_id, period_start, period_end, comments_used, quota
+		`SELECT user_id, period_start, period_end, comments_used, quota, llm_cost_usd_micro, price_version
 		   FROM billing_usage
 		  WHERE user_id = ?
 		  ORDER BY period_start DESC
@@ -379,7 +409,7 @@ func (q *SQLiteQuery) GetBillingUsage(ctx context.Context, userID string, limit 
 	for rows.Next() {
 		var u BillingUsage
 		var ps, pe string
-		if err := rows.Scan(&u.UserID, &ps, &pe, &u.CommentsUsed, &u.Quota); err != nil {
+		if err := rows.Scan(&u.UserID, &ps, &pe, &u.CommentsUsed, &u.Quota, &u.LLMCostUSDMicro, &u.PriceVersion); err != nil {
 			return nil, err
 		}
 		u.PeriodStart = parseTime(ps)

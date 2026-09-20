@@ -21,6 +21,7 @@ type fakeClient struct {
 	calls    [][]PromptComment
 	results  []LLMResult // returned for every call (length must match input)
 	missing  []int       // indexes the fake reports as missing/invalid
+	usage    TokenUsage  // reported back alongside success
 	err      error
 	provider string
 	model    string
@@ -32,19 +33,19 @@ type fakeClient struct {
 func (f *fakeClient) ProviderName() string { return f.provider }
 func (f *fakeClient) ModelName() string    { return f.model }
 
-func (f *fakeClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, error) {
+func (f *fakeClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, TokenUsage, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, append([]PromptComment(nil), comments...))
 	f.mu.Unlock()
 	if f.resultsFn != nil {
 		results, err := f.resultsFn(comments)
-		return results, f.missing, err
+		return results, f.missing, f.usage, err
 	}
 	if f.err != nil {
-		return nil, nil, f.err
+		return nil, nil, TokenUsage{}, f.err
 	}
 	if len(f.results) > 0 {
-		return f.results, f.missing, nil
+		return f.results, f.missing, f.usage, nil
 	}
 	out := make([]LLMResult, len(comments))
 	for i := range comments {
@@ -56,7 +57,7 @@ func (f *fakeClient) ClassifyBatch(ctx context.Context, comments []PromptComment
 			ActionableInsights: []Insight{},
 		}
 	}
-	return out, nil, nil
+	return out, nil, f.usage, nil
 }
 
 // fakeQuery implements the slice of DBQuery the processor uses.
@@ -439,6 +440,14 @@ type usageLogCall struct {
 type fakeQueryBilling struct {
 	*fakeQuery
 	usageLogs []usageLogCall
+	costCalls []llmCostCall
+}
+
+// llmCostCall captures AddLLMCost invocations for cost assertions.
+type llmCostCall struct {
+	UserID       string
+	CostMicro    int64
+	PriceVersion int
 }
 
 func (q *fakeQueryBilling) InsertCommentUsageLog(ctx context.Context, tx *sql.Tx, userID string, count int, periodStart, periodEnd time.Time) error {
@@ -446,6 +455,60 @@ func (q *fakeQueryBilling) InsertCommentUsageLog(ctx context.Context, tx *sql.Tx
 	defer q.fakeQuery.mu.Unlock()
 	q.usageLogs = append(q.usageLogs, usageLogCall{UserID: userID, Count: count})
 	return nil
+}
+
+func (q *fakeQueryBilling) AddLLMCost(ctx context.Context, userID string, periodStart, periodEnd time.Time, costUSDMicro int64, priceVersion int) error {
+	q.fakeQuery.mu.Lock()
+	defer q.fakeQuery.mu.Unlock()
+	q.costCalls = append(q.costCalls, llmCostCall{UserID: userID, CostMicro: costUSDMicro, PriceVersion: priceVersion})
+	return nil
+}
+
+// llm-cost-analytics 1.3 — a successful batch prices its reported usage
+// against the active card and accumulates it on the quota-decrementing
+// user's period rollup (attribution follows the overage rule).
+func TestProcessor_BatchCostAccumulated(t *testing.T) {
+	inner := newFakeQuery()
+	q := &fakeQueryBilling{fakeQuery: inner}
+	channel := "ch-cost"
+	q.grouped[channel] = makeBatch(channel, 3)
+	q.primaryByChannel[channel] = withinQuotaUser("u-cost")
+
+	// gpt-4o-mini @ v1: 1000 in * $0.15/M + 500 out * $0.60/M = 450 micro-USD.
+	cli := &fakeClient{provider: "openai", model: "gpt-4o-mini", usage: TokenUsage{Input: 1000, Output: 500}}
+	p := NewProcessor(cli, q)
+	p.tickOnce(context.Background())
+
+	if len(q.costCalls) != 1 {
+		t.Fatalf("want 1 cost call, got %d", len(q.costCalls))
+	}
+	got := q.costCalls[0]
+	if got.UserID != "u-cost" {
+		t.Errorf("cost attributed to %s, want u-cost (quota-decrementing user)", got.UserID)
+	}
+	if got.CostMicro != 450 {
+		t.Errorf("cost: want 450 micro-USD got %d", got.CostMicro)
+	}
+	if got.PriceVersion != PriceVersion {
+		t.Errorf("price_version: want %d got %d", PriceVersion, got.PriceVersion)
+	}
+}
+
+// Zero/unreported usage must not write cost rows at all (absent = zero).
+func TestProcessor_UnreportedUsageWritesNoCost(t *testing.T) {
+	inner := newFakeQuery()
+	q := &fakeQueryBilling{fakeQuery: inner}
+	channel := "ch-nocost"
+	q.grouped[channel] = makeBatch(channel, 2)
+	q.primaryByChannel[channel] = withinQuotaUser("u-nocost")
+
+	cli := &fakeClient{provider: "openai", model: "gpt-4o-mini"} // usage stays zero
+	p := NewProcessor(cli, q)
+	p.tickOnce(context.Background())
+
+	if len(q.costCalls) != 0 {
+		t.Errorf("want no cost rows for unreported usage, got %d", len(q.costCalls))
+	}
 }
 
 // 10.5.2 — paused users are skipped entirely (no LLM call, no DB writes).
@@ -812,7 +875,7 @@ type blockingClient struct {
 func (c *blockingClient) ProviderName() string { return "test" }
 func (c *blockingClient) ModelName() string    { return "test-model" }
 
-func (c *blockingClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, error) {
+func (c *blockingClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, TokenUsage, error) {
 	c.mu.Lock()
 	c.active++
 	c.calls++
@@ -837,7 +900,7 @@ func (c *blockingClient) ClassifyBatch(ctx context.Context, comments []PromptCom
 	for i := range comments {
 		out[i] = LLMResult{CommentIndex: i, Category: "praise", Confidence: 0.9, Topic: "topic", ActionableInsights: []Insight{}}
 	}
-	return out, nil, nil
+	return out, nil, TokenUsage{}, nil
 }
 
 func (c *blockingClient) max() int {
@@ -1055,7 +1118,7 @@ type scriptedClient struct {
 func (c *scriptedClient) ProviderName() string { return "test" }
 func (c *scriptedClient) ModelName() string    { return "test" }
 
-func (c *scriptedClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, error) {
+func (c *scriptedClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, TokenUsage, error) {
 	if len(comments) > 0 && comments[0].Body == "b1" {
 		select {
 		case <-c.releaseB:
@@ -1072,7 +1135,7 @@ func (c *scriptedClient) ClassifyBatch(ctx context.Context, comments []PromptCom
 	for i := range comments {
 		out[i] = LLMResult{CommentIndex: i, Category: "praise", Confidence: 0.9, Topic: "topic", ActionableInsights: []Insight{}}
 	}
-	return out, nil, nil
+	return out, nil, TokenUsage{}, nil
 }
 
 // 6.1 — a freed worker takes the next claimed batch immediately instead of

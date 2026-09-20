@@ -21,12 +21,12 @@ type recordingClient struct {
 func (r *recordingClient) ProviderName() string { return r.provider }
 func (r *recordingClient) ModelName() string    { return r.model }
 
-func (r *recordingClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, error) {
+func (r *recordingClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, TokenUsage, error) {
 	r.calls++
 	if r.err != nil {
-		return nil, nil, r.err
+		return nil, nil, TokenUsage{}, r.err
 	}
-	return nil, nil, nil
+	return nil, nil, TokenUsage{}, nil
 }
 
 func TestFailover_FlipsAfterConsecutiveThreshold(t *testing.T) {
@@ -36,7 +36,7 @@ func TestFailover_FlipsAfterConsecutiveThreshold(t *testing.T) {
 	fc := NewFailoverClient(primary, fallback, 3)
 
 	for i := 0; i < 3; i++ {
-		if _, _, err := fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}}); err == nil {
+		if _, _, _, err := fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}}); err == nil {
 			t.Fatalf("call %d: expected error from failing primary", i+1)
 		}
 	}
@@ -47,7 +47,7 @@ func TestFailover_FlipsAfterConsecutiveThreshold(t *testing.T) {
 		t.Errorf("post-flip attribution: got %s/%s, want openai/gpt-4o-mini", fc.ProviderName(), fc.ModelName())
 	}
 
-	if _, _, err := fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}}); err != nil {
+	if _, _, _, err := fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}}); err != nil {
 		t.Fatalf("post-flip call: expected fallback success, got %v", err)
 	}
 	if fallback.calls != 1 {
@@ -64,11 +64,11 @@ func TestFailover_FlipIsPermanent(t *testing.T) {
 
 	fc := NewFailoverClient(primary, fallback, 3)
 	for i := 0; i < 3; i++ {
-		_, _, _ = fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
+		_, _, _, _ = fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
 	}
 
 	for i := 0; i < 20; i++ {
-		if _, _, err := fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}}); err == nil {
+		if _, _, _, err := fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}}); err == nil {
 			t.Fatalf("call %d: expected fallback error to propagate", i+1)
 		}
 	}
@@ -90,7 +90,7 @@ func TestFailover_SlowFailureCadenceStillFlips(t *testing.T) {
 	fc := NewFailoverClient(primary, fallback, 3)
 
 	for i := 0; i < 3; i++ {
-		if _, _, err := fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}}); err == nil {
+		if _, _, _, err := fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}}); err == nil {
 			t.Fatalf("call %d: expected error", i+1)
 		}
 		time.Sleep(2 * time.Millisecond) // errors minutes apart in production; timing irrelevant
@@ -113,15 +113,15 @@ func TestFailover_SuccessResetsCounter(t *testing.T) {
 
 	// 2 failures, a success, then 2 failures → counter never reaches 3.
 	for i := 0; i < 2; i++ {
-		_, _, _ = fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
+		_, _, _, _ = fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
 	}
 	primary.err = nil
-	if _, _, err := fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}}); err != nil {
+	if _, _, _, err := fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}}); err != nil {
 		t.Fatalf("success call: %v", err)
 	}
 	primary.err = errors.New("flaky")
 	for i := 0; i < 2; i++ {
-		_, _, _ = fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
+		_, _, _, _ = fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
 	}
 	if fc.flipped {
 		t.Errorf("flipped after non-consecutive failures; success must reset the counter")
@@ -129,7 +129,7 @@ func TestFailover_SuccessResetsCounter(t *testing.T) {
 
 	// Three consecutive failures now flip.
 	for i := 0; i < 3; i++ {
-		_, _, _ = fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
+		_, _, _, _ = fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
 	}
 	if !fc.flipped {
 		t.Errorf("3 consecutive errors must flip")
@@ -142,7 +142,7 @@ func TestFailover_NilFallbackNeverFlipsAndPropagates(t *testing.T) {
 	fc := NewFailoverClient(primary, nil, 3)
 
 	for i := 0; i < 10; i++ {
-		if _, _, err := fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}}); err == nil {
+		if _, _, _, err := fc.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}}); err == nil {
 			t.Fatalf("call %d: expected error to propagate (no fallback configured)", i+1)
 		}
 	}

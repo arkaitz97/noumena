@@ -45,6 +45,19 @@ function usagePct(p: UsagePeriod): string {
   return `${Math.min(100, Math.round((p.comments_used / p.quota) * 100))}%`
 }
 
+const fmtUSD = (v: number): string => `$${v.toFixed(2)}`
+
+// Cost analytics (llm-cost-analytics 3.1): additive API fields. Older
+// backends omit them — the column and MTD line disappear gracefully.
+const hasCostData = computed(() =>
+  billing.usagePeriods.some((p) => typeof p.llm_cost_usd === 'number'),
+)
+
+const llmCostMTD = computed<number | null>(() => {
+  const v = billing.status?.llm_cost_mtd_usd
+  return typeof v === 'number' ? v : null
+})
+
 function scrollToPlans(): void {
   document.getElementById('plan-picker')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
@@ -203,6 +216,10 @@ onBeforeUnmount(() => {
         >
           Overage this period: ${{ billing.status.overage_cost_usd.toFixed(2) }}
         </p>
+
+        <p v-if="llmCostMTD !== null" class="mt-2 text-xs text-zinc-500 dark:text-zinc-400" data-testid="llm-cost-mtd">
+          AI processing spend this period: {{ fmtUSD(llmCostMTD) }}
+        </p>
       </Card>
 
       <!-- Usage history -->
@@ -235,6 +252,7 @@ onBeforeUnmount(() => {
                 <th scope="col" class="py-2 pr-4 font-medium">Period</th>
                 <th scope="col" class="py-2 pr-4 font-medium text-right">Comments used</th>
                 <th scope="col" class="py-2 pr-4 font-medium text-right">Quota</th>
+                <th v-if="hasCostData" scope="col" class="py-2 pr-4 font-medium text-right">AI cost</th>
                 <th scope="col" class="py-2 font-medium">Usage</th>
               </tr>
             </thead>
@@ -248,6 +266,13 @@ onBeforeUnmount(() => {
                 </td>
                 <td class="py-3 pr-4 text-right text-zinc-700 dark:text-zinc-300 font-mono tabular-nums whitespace-nowrap">
                   {{ p.quota }}
+                </td>
+                <td
+                  v-if="hasCostData"
+                  class="py-3 pr-4 text-right text-zinc-700 dark:text-zinc-300 font-mono tabular-nums whitespace-nowrap"
+                  data-testid="llm-cost-cell"
+                >
+                  {{ typeof p.llm_cost_usd === 'number' ? fmtUSD(p.llm_cost_usd) : '—' }}
                 </td>
                 <td class="py-3">
                   <div class="w-24 h-2 bg-zinc-100 dark:bg-zinc-800 rounded-full overflow-hidden">

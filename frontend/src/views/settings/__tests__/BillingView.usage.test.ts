@@ -163,3 +163,47 @@ describe('billing store usage/trial mapping', () => {
     })
   })
 })
+// llm-cost-analytics 3.2: the cost column + MTD line render when the
+// additive API fields are present and disappear without error when an
+// older backend omits them.
+describe('BillingView LLM cost display', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+    vi.mocked(billingApi.getUsage).mockResolvedValue({ periods: [] })
+  })
+
+  it('renders the cost column and the MTD line when cost fields are present', async () => {
+    vi.mocked(billingApi.status).mockResolvedValue({ ...makeStatus(), llm_cost_mtd_usd: 0.42 })
+    vi.mocked(billingApi.getUsage).mockResolvedValue({
+      periods: [makePeriod({ llm_cost_usd: 1.23 }), makePeriod({ llm_cost_usd: 0, period_start: '2026-08-01T00:00:00Z' })],
+    })
+
+    const wrapper = mount(BillingView, { global: { plugins: [createPinia()] } })
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('AI cost')
+    const cells = wrapper.findAll('[data-testid="llm-cost-cell"]')
+    expect(cells).toHaveLength(2)
+    expect(cells[0].text()).toBe('$1.23')
+    expect(cells[1].text()).toBe('$0.00')
+    const mtd = wrapper.find('[data-testid="llm-cost-mtd"]')
+    expect(mtd.exists()).toBe(true)
+    expect(mtd.text()).toContain('$0.42')
+  })
+
+  it('falls back to the plain table when the backend omits cost fields', async () => {
+    vi.mocked(billingApi.status).mockResolvedValue(makeStatus())
+    vi.mocked(billingApi.getUsage).mockResolvedValue({ periods: [makePeriod()] })
+
+    const wrapper = mount(BillingView, { global: { plugins: [createPinia()] } })
+    await flushPromises()
+
+    expect(wrapper.text()).not.toContain('AI cost')
+    expect(wrapper.find('[data-testid="llm-cost-cell"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="llm-cost-mtd"]').exists()).toBe(false)
+    // The original columns must still render.
+    expect(wrapper.findAll('tbody tr')).toHaveLength(1)
+    expect(wrapper.text()).toContain('12')
+  })
+})

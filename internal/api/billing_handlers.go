@@ -159,6 +159,9 @@ type statusResponse struct {
 	CommentsUsed      int        `json:"comments_used"`
 	CommentsLimit     int        `json:"comments_limit"`
 	OverageCost       float64    `json:"overage_cost"`
+	// LLMCostMTDUSD is month-to-date LLM spend for the current billing
+	// period (llm-cost-analytics 2.2). Additive; 0 when no rollup exists.
+	LLMCostMTDUSD float64 `json:"llm_cost_mtd_usd"`
 	// Trial (implement-missing-product-features 5.2): derived, additive.
 	Trial trialInfo `json:"trial"`
 }
@@ -201,7 +204,36 @@ func (h *BillingHandler) Status(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, buildStatusResponse(user, plan, limits, channelCount, overage))
+	writeJSON(w, http.StatusOK, buildStatusResponse(user, plan, limits, channelCount, overage, h.llmCostMTD(r, user.ID)))
+}
+
+// microUSDToUSD converts a stored micro-USD integer to the API's USD
+// float at the response boundary (the only place floats touch money here).
+func microUSDToUSD(micro int64) float64 {
+	return float64(micro) / 1e6
+}
+
+// llmCostMTD reads the current billing period's accumulated LLM cost from
+// the usage rollup. Best-effort by design: a store that predates the
+// feature (mock-mode doubles) or a read error yields 0 rather than
+// failing the whole status endpoint — cost display is additive.
+func (h *BillingHandler) llmCostMTD(r *http.Request, userID string) float64 {
+	store, ok := h.Queries.(BillingUsageStore)
+	if !ok {
+		return 0
+	}
+	rows, err := store.GetBillingUsage(r.Context(), userID, usageMaxPeriods)
+	if err != nil {
+		log.Printf("billing: llmCostMTD user=%s err=%v", userID, err)
+		return 0
+	}
+	now := time.Now().UTC()
+	for _, u := range rows {
+		if !now.Before(u.PeriodStart.UTC()) && now.Before(u.PeriodEnd.UTC()) {
+			return microUSDToUSD(u.LLMCostUSDMicro)
+		}
+	}
+	return 0
 }
 
 // requireBillingUser resolves the caller and loads their user row.
@@ -273,7 +305,7 @@ func statusTrial(user *db.User, plan string) trialInfo {
 	return trial
 }
 
-func buildStatusResponse(user *db.User, plan string, limits billing.PlanLimits, channelCount int, overage float64) statusResponse {
+func buildStatusResponse(user *db.User, plan string, limits billing.PlanLimits, channelCount int, overage, llmCostMTD float64) statusResponse {
 	resp := statusResponse{
 		Plan:              plan,
 		Status:            user.SubscriptionStatus,
@@ -285,6 +317,7 @@ func buildStatusResponse(user *db.User, plan string, limits billing.PlanLimits, 
 		CommentsUsed:      user.CommentsUsedThisPeriod,
 		CommentsLimit:     limits.CommentQuotaMonthly,
 		OverageCost:       overage,
+		LLMCostMTDUSD:     llmCostMTD,
 		Trial:             statusTrial(user, plan),
 	}
 	if resp.Status == "" {
@@ -304,10 +337,11 @@ type BillingUsageStore interface {
 }
 
 type usagePeriod struct {
-	PeriodStart  string `json:"period_start"`
-	PeriodEnd    string `json:"period_end"`
-	CommentsUsed int    `json:"comments_used"`
-	Quota        int    `json:"quota"`
+	PeriodStart  string  `json:"period_start"`
+	PeriodEnd    string  `json:"period_end"`
+	CommentsUsed int     `json:"comments_used"`
+	Quota        int     `json:"quota"`
+	LLMCostUSD   float64 `json:"llm_cost_usd"`
 }
 
 type usageResponse struct {
@@ -362,6 +396,7 @@ func (h *BillingHandler) Usage(w http.ResponseWriter, r *http.Request) {
 			PeriodEnd:    u.PeriodEnd.UTC().Format(time.RFC3339),
 			CommentsUsed: u.CommentsUsed,
 			Quota:        u.Quota,
+			LLMCostUSD:   microUSDToUSD(u.LLMCostUSDMicro),
 		})
 	}
 	writeJSON(w, http.StatusOK, resp)

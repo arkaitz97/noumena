@@ -86,7 +86,7 @@ func TestClient_HTTP4xxIsTerminal(t *testing.T) {
 	defer srv.Close()
 
 	c := newOpenCodeClientWithHTTP(srv.Client(), srv.URL, "k", "")
-	_, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
+	_, _, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -106,7 +106,7 @@ func TestClient_HTTP429IsTransient(t *testing.T) {
 	defer srv.Close()
 
 	c := newOpenCodeClientWithHTTP(srv.Client(), srv.URL, "k", "")
-	_, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
+	_, _, _, err := c.ClassifyBatch(context.Background(), []PromptComment{{Body: "x"}})
 	if err == nil {
 		t.Fatal("expected error after retries")
 	}

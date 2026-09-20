@@ -124,15 +124,15 @@ func (f *failoverClient) activeLocked() LLMClient {
 // `threshold` (and a fallback exists) the wrapper flips permanently. Errors
 // from the fallback after a flip, and errors with no fallback configured,
 // propagate unchanged.
-func (f *failoverClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, error) {
+func (f *failoverClient) ClassifyBatch(ctx context.Context, comments []PromptComment) ([]LLMResult, []int, TokenUsage, error) {
 	f.mu.Lock()
 	active := f.activeLocked()
 	f.mu.Unlock()
 	if active == nil {
-		return nil, nil, fmt.Errorf("failover: no active client (nil primary, no fallback)")
+		return nil, nil, TokenUsage{}, fmt.Errorf("failover: no active client (nil primary, no fallback)")
 	}
 
-	results, missing, err := active.ClassifyBatch(ctx, comments)
+	results, missing, usage, err := active.ClassifyBatch(ctx, comments)
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -140,23 +140,24 @@ func (f *failoverClient) ClassifyBatch(ctx context.Context, comments []PromptCom
 		if !f.flipped {
 			f.consecutive = 0
 		}
-		return results, missing, nil
+		return results, missing, usage, nil
 	}
 	// Only the primary's failures feed the flip decision; post-flip fallback
-	// errors and the nil-fallback case propagate without state change.
+	// errors and the nil-fallback case propagate without state change. Usage
+	// is dropped: failed HTTP attempts report no billable token counts.
 	if f.flipped || f.fallback == nil {
-		return nil, nil, err
+		return nil, nil, usage, err
 	}
 	f.consecutive++
 	if f.consecutive < f.threshold {
-		return nil, nil, err
+		return nil, nil, usage, err
 	}
 	f.flipped = true
 	f.consecutive = 0
 	log.Printf("event=provider_failover from=%s to=%s consecutive_errors=%d — permanent for process lifetime",
 		f.primary.ProviderName(), f.fallback.ProviderName(), f.threshold)
 	recordLLMFailover(ctx, f.primary.ProviderName(), f.fallback.ProviderName())
-	return nil, nil, err
+	return nil, nil, usage, err
 }
 
 // ProviderName reports the active provider (pre-flip primary, post-flip

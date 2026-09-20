@@ -170,18 +170,20 @@ RULES:
 // top_questions to 5 entries, and authoritatively overwrites the numeric
 // fields with the application-computed values from `truth`. On any error
 // the digest is treated as a failed attempt by the caller's retry loop.
-func CallDigestLLM(ctx context.Context, client *opencodeClient, prompt string, truth DigestContent) (DigestContent, error) {
+// It also returns the provider-reported token usage for cost accounting
+// (llm-cost-analytics 1.3).
+func CallDigestLLM(ctx context.Context, client *opencodeClient, prompt string, truth DigestContent) (DigestContent, TokenUsage, error) {
 	cctx, cancel := context.WithTimeout(ctx, digestCallTimeout)
 	defer cancel()
 
-	raw, err := client.GenerateDigestRaw(cctx, prompt)
+	raw, usage, err := client.GenerateDigestRaw(cctx, prompt)
 	if err != nil {
-		return DigestContent{}, fmt.Errorf("digest LLM call failed: %w", err)
+		return DigestContent{}, usage, fmt.Errorf("digest LLM call failed: %w", err)
 	}
 
 	parsed, err := parseDigestContent(raw)
 	if err != nil {
-		return DigestContent{}, err
+		return DigestContent{}, usage, err
 	}
 
 	// Truncate qualitative arrays to the documented max (Spec 06: at most 5).
@@ -201,7 +203,7 @@ func CallDigestLLM(ctx context.Context, client *opencodeClient, prompt string, t
 	parsed.TotalCommentsAnalyzed = truth.TotalCommentsAnalyzed
 	parsed.FilteredComments = truth.FilteredComments
 
-	return parsed, nil
+	return parsed, usage, nil
 }
 
 // parseDigestContent strips optional markdown fences, locates the first JSON
