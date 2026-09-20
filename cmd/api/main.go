@@ -367,10 +367,13 @@ func main() {
 	})
 
 	r.Group(func(r chi.Router) {
-		// Invite acceptance is a one-time-token endpoint; protect it with
-		// the always-on anonymous limiter like the auth endpoints.
+		// The legacy invite link is a 302 shim to the SPA deep link, and the
+		// public invite preview is a read-only token lookup. Both are
+		// one-time-token endpoints; protect them with the always-on
+		// anonymous limiter like the auth endpoints.
 		r.Use(api.AuthRateLimitMiddleware(queries, config.Default))
 		r.Get("/invites/accept", workspaceHandler.AcceptInvite)
+		r.Get("/api/invites/preview", workspaceHandler.InvitePreview)
 		// Unsubscribe is self-authenticating (HMAC-signed link in the
 		// email); the anonymous limiter protects it from link-spam.
 		r.Get("/unsubscribe", digestHandler.Unsubscribe)
@@ -398,6 +401,10 @@ func main() {
 		r.Get("/workspaces", workspaceHandler.ListWorkspaces)
 		r.Post("/workspaces", workspaceHandler.CreateWorkspace)
 		r.Put("/workspaces/{id}/activate", workspaceHandler.ActivateWorkspace)
+
+		// Authenticated invite acceptance: the account email must match the
+		// invited email (the /api group already enforces a verified email).
+		r.Post("/invites/accept", workspaceHandler.AcceptInviteJSON)
 
 		if config.Default.AccountLifecycleAPIEnabled {
 			r.Delete("/user/account", accountHandler.DeleteAccount)

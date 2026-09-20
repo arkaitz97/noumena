@@ -71,3 +71,29 @@ export async function removeMember(workspaceId: string, userId: string): Promise
     `/workspaces/${encodeURIComponent(workspaceId)}/members/${encodeURIComponent(userId)}`,
   )
 }
+
+/** Public invite lookup (`GET /invites/preview?token=`). No account signal. */
+export interface InvitePreview {
+  workspace_name: string
+  email: string
+  role: MemberRole
+}
+
+/** Authenticated acceptance (`POST /invites/accept`). */
+export interface AcceptInviteResult {
+  workspace_id: string
+  workspace_name: string
+  role: MemberRole
+}
+
+export async function previewInvite(token: string): Promise<InvitePreview> {
+  const { data } = await apiClient.get<InvitePreview>('/invites/preview', {
+    params: { token },
+  })
+  return data
+}
+
+export async function acceptInvite(token: string): Promise<AcceptInviteResult> {
+  const { data } = await apiClient.post<AcceptInviteResult>('/invites/accept', { token })
+  return data
+}

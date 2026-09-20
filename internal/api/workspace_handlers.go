@@ -9,6 +9,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -329,7 +330,7 @@ func (h *WorkspaceHandler) InviteMember(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	inviteURL := h.Cfg.AppBaseURL + "/invites/accept?token=" + token
+	inviteURL := h.Cfg.AppBaseURL + "/invite?token=" + token
 
 	_ = h.Queries.InsertAuditLog(r.Context(), userID, "workspace.invite_created",
 		`{"workspace_id":"`+workspaceID+`","email":"`+req.Email+`","role":"`+req.Role+`"}`, clientIP(r, h.Cfg))
@@ -343,54 +344,136 @@ func (h *WorkspaceHandler) InviteMember(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+// AcceptInvite is the legacy invite link handler. Identity is not available
+// on a top-level browser navigation (the access token is in memory and the
+// refresh cookie is scoped to /auth), so this is a pure 302 shim to the SPA
+// deep link; acceptance itself happens over XHR in AcceptInviteJSON.
 func (h *WorkspaceHandler) AcceptInvite(w http.ResponseWriter, r *http.Request) {
-	token := r.URL.Query().Get("token")
-	if token == "" {
+	target := strings.TrimRight(h.Cfg.AppBaseURL, "/") + "/invite"
+	if token := r.URL.Query().Get("token"); token != "" {
+		target += "?token=" + token
+	}
+	http.Redirect(w, r, target, http.StatusFound)
+}
+
+// loadInvite loads an invite by its raw token and enforces the 7-day TTL.
+// Unknown and expired tokens are indistinguishable (false) so the token
+// cannot be used as an oracle. Consumption is checked by callers because a
+// replayed token still resolves idempotently for an existing member.
+func (h *WorkspaceHandler) loadInvite(ctx context.Context, rawToken string) (*db.WorkspaceInvite, bool) {
+	if rawToken == "" {
+		return nil, false
+	}
+	tokenHash := sha256.Sum256([]byte(rawToken))
+	tokenHashHex := hex.EncodeToString(tokenHash[:])
+	invite, err := h.Queries.GetWorkspaceInviteByToken(ctx, tokenHashHex)
+	if err != nil || invite == nil {
+		return nil, false
+	}
+	if time.Now().After(invite.ExpiresAt) {
+		return nil, false
+	}
+	return invite, true
+}
+
+// inviteTokenValid is loadInvite plus the single-use check, for callers with
+// no membership context (the public preview).
+func (h *WorkspaceHandler) inviteTokenValid(ctx context.Context, rawToken string) (*db.WorkspaceInvite, bool) {
+	invite, ok := h.loadInvite(ctx, rawToken)
+	if !ok || invite.ConsumedAt != nil {
+		return nil, false
+	}
+	return invite, true
+}
+
+// workspaceName resolves the display name for an invite target. A workspace
+// that cannot be loaded is treated as an invalid invite.
+func (h *WorkspaceHandler) workspaceName(ctx context.Context, workspaceID string) (string, error) {
+	ws, err := h.Queries.GetWorkspace(ctx, workspaceID)
+	if err != nil || ws == nil {
+		return "", db.ErrNotFound
+	}
+	return ws.Name, nil
+}
+
+// AcceptInviteJSON is the authenticated acceptance endpoint (POST
+// /api/invites/accept, body {"token": "..."}). The token is the capability;
+// the authenticated account email must match the invited email. Admission
+// uses the atomic seat-guarded insert so concurrent accepts cannot exceed the
+// plan cap. Acceptance is idempotent for an existing member.
+func (h *WorkspaceHandler) AcceptInviteJSON(w http.ResponseWriter, r *http.Request) {
+	userID, ok := r.Context().Value(UserIDKey).(string)
+	if !ok || userID == "" {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	var req struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Token == "" {
 		writeError(w, http.StatusBadRequest, "token is required")
 		return
 	}
 
-	tokenHash := sha256.Sum256([]byte(token))
-	tokenHashHex := hex.EncodeToString(tokenHash[:])
-
-	invite, err := h.Queries.GetWorkspaceInviteByToken(r.Context(), tokenHashHex)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "invalid or expired invite")
-		return
-	}
-
-	if invite.ConsumedAt != nil {
-		writeError(w, http.StatusGone, "invite already consumed")
-		return
-	}
-
-	if time.Now().After(invite.ExpiresAt) {
-		writeError(w, http.StatusGone, "invite expired")
-		return
-	}
-
-	userID, ok := r.Context().Value(UserIDKey).(string)
-	if !ok || userID == "" {
-		http.Redirect(w, r, h.Cfg.AppBaseURL+"/register?invite="+token, http.StatusFound)
+	invite, valid := h.loadInvite(r.Context(), req.Token)
+	if !valid {
+		writeError(w, http.StatusGone, "invite expired or already used")
 		return
 	}
 
 	user, err := h.Queries.GetUserByID(r.Context(), userID)
 	if err != nil || user == nil {
-		writeError(w, http.StatusNotFound, "user not found")
+		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-
-	if user.Email != invite.Email {
+	if !strings.EqualFold(user.Email, invite.Email) {
 		writeError(w, http.StatusForbidden, "invite email does not match your account email")
 		return
 	}
 
+	name, err := h.workspaceName(r.Context(), invite.WorkspaceID)
+	if err != nil {
+		writeError(w, http.StatusGone, "invite expired or already used")
+		return
+	}
+
+	// Already a member: accept idempotently, including a replay after the
+	// invite was consumed. No duplicate row is inserted and the existing
+	// role is preserved.
+	if existing, err := h.Queries.GetWorkspaceMember(r.Context(), invite.WorkspaceID, userID); err == nil && existing != nil {
+		if err := h.Queries.ConsumeWorkspaceInvite(r.Context(), invite.ID); err != nil {
+			log.Printf("workspace: consume invite %s: %v", invite.ID, err)
+		}
+		if err := h.Queries.SetUserActiveWorkspace(r.Context(), userID, invite.WorkspaceID); err != nil {
+			log.Printf("workspace: set active workspace: %v", err)
+		}
+		_ = h.Queries.InsertAuditLog(r.Context(), userID, "workspace.invite_accepted",
+			`{"workspace_id":"`+invite.WorkspaceID+`","email":"`+invite.Email+`"}`, clientIP(r, h.Cfg))
+		writeJSON(w, http.StatusOK, map[string]string{
+			"workspace_id":   invite.WorkspaceID,
+			"workspace_name": name,
+			"role":           existing.Role,
+		})
+		return
+	}
+
+	// A consumed token is terminal for anyone who is not already a member.
+	if invite.ConsumedAt != nil {
+		writeError(w, http.StatusGone, "invite expired or already used")
+		return
+	}
+
+	// Over-cap legacy workspaces are only logged; the atomic insert below is
+	// the authority and returns ErrSeatLimit when no seat is free.
 	if err := h.checkSeatCapacity(r.Context(), invite.WorkspaceID); err != nil && !errors.Is(err, errSeatLimit) {
 		writeError(w, http.StatusInternalServerError, "failed to check seat capacity")
 		return
 	}
-
 	seats, err := h.seatUsageFor(r.Context(), invite.WorkspaceID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load seat usage")
@@ -413,15 +496,40 @@ func (h *WorkspaceHandler) AcceptInvite(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if err := h.Queries.ConsumeWorkspaceInvite(r.Context(), invite.ID); err != nil {
+		log.Printf("workspace: consume invite %s: %v", invite.ID, err)
 	}
-
 	if err := h.Queries.SetUserActiveWorkspace(r.Context(), userID, invite.WorkspaceID); err != nil {
+		log.Printf("workspace: set active workspace: %v", err)
 	}
-
 	_ = h.Queries.InsertAuditLog(r.Context(), userID, "workspace.invite_accepted",
 		`{"workspace_id":"`+invite.WorkspaceID+`","email":"`+invite.Email+`"}`, clientIP(r, h.Cfg))
 
-	http.Redirect(w, r, h.Cfg.AppBaseURL+"/dashboard", http.StatusFound)
+	writeJSON(w, http.StatusOK, map[string]string{
+		"workspace_id":   invite.WorkspaceID,
+		"workspace_name": name,
+		"role":           invite.Role,
+	})
+}
+
+// InvitePreview is the public, rate-limited invite lookup (GET
+// /api/invites/preview?token=...). It returns just enough for the SPA to say
+// "Join <workspace> as <role>" and carries no account-existence signal.
+func (h *WorkspaceHandler) InvitePreview(w http.ResponseWriter, r *http.Request) {
+	invite, valid := h.inviteTokenValid(r.Context(), r.URL.Query().Get("token"))
+	if !valid {
+		writeError(w, http.StatusGone, "invite expired or already used")
+		return
+	}
+	name, err := h.workspaceName(r.Context(), invite.WorkspaceID)
+	if err != nil {
+		writeError(w, http.StatusGone, "invite expired or already used")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"workspace_name": name,
+		"email":          invite.Email,
+		"role":           invite.Role,
+	})
 }
 
 func (h *WorkspaceHandler) RemoveMember(w http.ResponseWriter, r *http.Request) {

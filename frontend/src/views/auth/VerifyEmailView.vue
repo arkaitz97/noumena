@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter, RouterLink } from 'vue-router'
 import { useAuthStore } from '../../stores/auth'
+import { getPendingInviteToken } from '../../lib/inviteToken'
 import { toast } from '../../lib/toast'
 import SecondaryButton from '../../components/forms/SecondaryButton.vue'
 import AppLogo from '../../components/AppLogo.vue'
@@ -25,7 +26,8 @@ onMounted(async () => {
   try {
     await auth.verifyEmail(token)
     phase.value = 'success'
-    setTimeout(() => router.push('/onboarding'), 1200)
+    // A pending invite token resumes acceptance after verification.
+    setTimeout(() => router.push(getPendingInviteToken() ? '/invite' : '/onboarding'), 1200)
   } catch {
     phase.value = 'invalid'
   }

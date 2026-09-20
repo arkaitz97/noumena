@@ -33,6 +33,8 @@ type wsMockQuery struct {
 	membersList       []*db.WorkspaceMemberWithEmail
 	addedMember       bool
 	updatedRole       bool
+	consumed          bool
+	auditAction       string
 
 	mu              sync.Mutex
 	trackedChannels map[string]bool
@@ -150,6 +152,12 @@ func (m *wsMockQuery) GetWorkspaceInviteByToken(ctx context.Context, tokenHash s
 }
 
 func (m *wsMockQuery) ConsumeWorkspaceInvite(ctx context.Context, inviteID string) error {
+	m.consumed = true
+	return nil
+}
+
+func (m *wsMockQuery) InsertAuditLog(ctx context.Context, userID, action, details, ipAddress string) error {
+	m.auditAction = action
 	return nil
 }
 
@@ -276,7 +284,7 @@ func TestWorkspaceHandler_InviteMember_TokensRandom(t *testing.T) {
 		var resp map[string]any
 		_ = json.Unmarshal(rr.Body.Bytes(), &resp)
 		url, _ := resp["invite_url"].(string)
-		const prefix = "http://localhost:3000/invites/accept?token="
+		const prefix = "http://localhost:3000/invite?token="
 		token := strings.TrimPrefix(url, prefix)
 		if token == "" || token == url {
 			t.Fatalf("could not extract token from invite_url %q", url)
@@ -431,42 +439,94 @@ func TestWorkspaceHandler_ChangeMemberRole(t *testing.T) {
 	}
 }
 
-func TestWorkspaceHandler_AcceptInvite_EmailMismatch(t *testing.T) {
-	q := &wsMockQuery{
-		createdInvite: &db.WorkspaceInvite{
-			ID:          "inv-1",
-			WorkspaceID: "ws-1",
-			Email:       "other@example.com",
-			Role:        "viewer",
-			ConsumedAt:  nil,
-			ExpiresAt:   time.Now().Add(24 * time.Hour),
-		},
-	}
+// acceptInviteJSON drives the authenticated POST handler directly.
+func acceptInviteJSON(q *wsMockQuery, token, userID string) *httptest.ResponseRecorder {
 	h := &api.WorkspaceHandler{Queries: q, Cfg: &config.Config{AppBaseURL: "http://localhost:3000"}}
-
-	req := httptest.NewRequest("GET", "/invites/accept?token=abc123", nil)
-	ctx := context.WithValue(req.Context(), api.UserIDKey, "user-1")
-	req = req.WithContext(ctx)
+	body := `{"token":"` + token + `"}`
+	req := httptest.NewRequest("POST", "/api/invites/accept", bytes.NewBufferString(body))
+	req = req.WithContext(context.WithValue(req.Context(), api.UserIDKey, userID))
 	rr := httptest.NewRecorder()
+	h.AcceptInviteJSON(rr, req)
+	return rr
+}
 
-	h.AcceptInvite(rr, req)
+func TestAcceptInviteJSON_WrongAccount(t *testing.T) {
+	q := &wsMockQuery{createdInvite: &db.WorkspaceInvite{
+		ID:          "inv-1",
+		WorkspaceID: "ws-1",
+		Email:       "other@example.com",
+		Role:        "viewer",
+		ExpiresAt:   time.Now().Add(24 * time.Hour),
+	}}
+	rr := acceptInviteJSON(q, "abc123", "user-1")
 
 	if rr.Code != http.StatusForbidden {
-		t.Errorf("expected 403 (email mismatch), got %d", rr.Code)
+		t.Fatalf("expected 403 (email mismatch), got %d (%s)", rr.Code, rr.Body.String())
+	}
+	if q.consumed {
+		t.Error("must not consume the invite on an account mismatch")
+	}
+	if q.addedMember {
+		t.Error("must not admit a member on an account mismatch")
 	}
 }
 
-func TestWorkspaceHandler_AcceptInvite_NoToken(t *testing.T) {
+func TestAcceptInviteJSON_InvalidTokens(t *testing.T) {
+	cases := []struct {
+		name   string
+		invite *db.WorkspaceInvite
+	}{
+		{"unknown", nil},
+		{"expired", &db.WorkspaceInvite{ID: "inv-1", WorkspaceID: "ws-1", Email: "test@example.com", Role: "viewer", ExpiresAt: time.Now().Add(-time.Hour)}},
+		{"consumed", func() *db.WorkspaceInvite {
+			at := time.Now().Add(-time.Minute)
+			return &db.WorkspaceInvite{ID: "inv-1", WorkspaceID: "ws-1", Email: "test@example.com", Role: "viewer", ExpiresAt: time.Now().Add(time.Hour), ConsumedAt: &at}
+		}()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			q := &wsMockQuery{createdInvite: tc.invite}
+			rr := acceptInviteJSON(q, "abc123", "user-1")
+			if rr.Code != http.StatusGone {
+				t.Fatalf("expected 410 for %s token, got %d (%s)", tc.name, rr.Code, rr.Body.String())
+			}
+			if q.addedMember || q.consumed {
+				t.Errorf("%s token must not mutate membership", tc.name)
+			}
+		})
+	}
+}
+
+func TestAcceptInviteJSON_NoToken(t *testing.T) {
 	q := &wsMockQuery{}
 	h := &api.WorkspaceHandler{Queries: q, Cfg: &config.Config{AppBaseURL: "http://localhost:3000"}}
 
-	req := httptest.NewRequest("GET", "/invites/accept", nil)
+	req := httptest.NewRequest("POST", "/api/invites/accept", bytes.NewBufferString(`{}`))
+	req = req.WithContext(context.WithValue(req.Context(), api.UserIDKey, "user-1"))
 	rr := httptest.NewRecorder()
-
-	h.AcceptInvite(rr, req)
+	h.AcceptInviteJSON(rr, req)
 
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("expected 400, got %d", rr.Code)
+	}
+}
+
+func TestWorkspaceHandler_AcceptInvite_ShimRedirects(t *testing.T) {
+	q := &wsMockQuery{createdInvite: makeValidInvite()}
+	h := &api.WorkspaceHandler{Queries: q, Cfg: &config.Config{AppBaseURL: "http://localhost:3000"}}
+
+	req := httptest.NewRequest("GET", "/invites/accept?token=abc123", nil)
+	rr := httptest.NewRecorder()
+	h.AcceptInvite(rr, req)
+
+	if rr.Code != http.StatusFound {
+		t.Fatalf("expected 302 shim, got %d", rr.Code)
+	}
+	if loc := rr.Header().Get("Location"); loc != "http://localhost:3000/invite?token=abc123" {
+		t.Errorf("expected SPA deep link, got %q", loc)
+	}
+	if q.addedMember || q.consumed || q.activeWorkspaceID != "" {
+		t.Error("the legacy shim must not mutate membership")
 	}
 }
 
@@ -627,37 +687,97 @@ func makeValidInvite() *db.WorkspaceInvite {
 	}
 }
 
-func TestWorkspaceHandler_AcceptInvite_SeatUnderCap(t *testing.T) {
-	// Studio plan (5 seats), 4 members used -> 1 seat free: accept succeeds.
-	q := &wsMockQuery{createdInvite: makeValidInvite(), ownerPlan: "studio", memberCount: 4}
-	h := &api.WorkspaceHandler{Queries: q, Cfg: &config.Config{AppBaseURL: "http://localhost:3000"}}
+func TestAcceptInviteJSON_ExistingUser(t *testing.T) {
+	// Studio plan (5 seats), 1 member used -> accept succeeds and records the
+	// full acceptance side effects.
+	q := &wsMockQuery{createdInvite: makeValidInvite(), ownerPlan: "studio", memberCount: 1}
+	rr := acceptInviteJSON(q, "abc123", "user-1")
 
-	req := httptest.NewRequest("GET", "/invites/accept?token=abc123", nil)
-	ctx := context.WithValue(req.Context(), api.UserIDKey, "user-1")
-	req = req.WithContext(ctx)
-	rr := httptest.NewRecorder()
-
-	h.AcceptInvite(rr, req)
-
-	if rr.Code != http.StatusFound {
-		t.Fatalf("expected 302 redirect, got %d (%s)", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (%s)", rr.Code, rr.Body.String())
 	}
 	if !q.addedMember {
-		t.Error("expected member to be added when under the seat cap")
+		t.Error("expected the member to be admitted")
+	}
+	if !q.consumed {
+		t.Error("expected the invite to be consumed")
+	}
+	if q.activeWorkspaceID != "ws-1" {
+		t.Errorf("expected active workspace ws-1, got %q", q.activeWorkspaceID)
+	}
+	if q.auditAction != "workspace.invite_accepted" {
+		t.Errorf("expected invite_accepted audit, got %q", q.auditAction)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `"workspace_id":"ws-1"`) ||
+		!strings.Contains(body, `"workspace_name":"WS"`) ||
+		!strings.Contains(body, `"role":"viewer"`) {
+		t.Errorf("expected workspace id/name/role in response, got %s", body)
 	}
 }
 
-func TestWorkspaceHandler_AcceptInvite_SeatLimit(t *testing.T) {
-	// Studio plan (5 seats), 5 members -> at cap: accept rejected.
-	q := &wsMockQuery{createdInvite: makeValidInvite(), ownerPlan: "studio", memberCount: 5}
-	h := &api.WorkspaceHandler{Queries: q, Cfg: &config.Config{AppBaseURL: "http://localhost:3000"}}
+func TestAcceptInviteJSON_IdempotentForExistingMember(t *testing.T) {
+	// The caller already belongs to the workspace: accept twice, both 200,
+	// and never insert a duplicate membership row.
+	q := &wsMockQuery{
+		createdInvite: makeValidInvite(),
+		ownerPlan:     "studio",
+		member:        &db.WorkspaceMember{WorkspaceID: "ws-1", Role: "analyst"},
+		memberCount:   1,
+	}
+	first := acceptInviteJSON(q, "abc123", "user-1")
+	second := acceptInviteJSON(q, "abc123", "user-1")
 
-	req := httptest.NewRequest("GET", "/invites/accept?token=abc123", nil)
-	ctx := context.WithValue(req.Context(), api.UserIDKey, "user-1")
-	req = req.WithContext(ctx)
+	if first.Code != http.StatusOK || second.Code != http.StatusOK {
+		t.Fatalf("expected 200 twice, got %d then %d", first.Code, second.Code)
+	}
+	if q.addedMember {
+		t.Error("must not insert a duplicate membership row")
+	}
+	if q.memberCount != 1 {
+		t.Errorf("expected member count to stay 1, got %d", q.memberCount)
+	}
+	if q.activeWorkspaceID != "ws-1" {
+		t.Errorf("expected active workspace ws-1, got %q", q.activeWorkspaceID)
+	}
+	if !strings.Contains(first.Body.String(), `"role":"analyst"`) {
+		t.Errorf("expected the existing role to be preserved, got %s", first.Body.String())
+	}
+}
+
+func TestInvitePreview(t *testing.T) {
+	valid := &wsMockQuery{createdInvite: makeValidInvite()}
 	rr := httptest.NewRecorder()
+	h := &api.WorkspaceHandler{Queries: valid, Cfg: &config.Config{AppBaseURL: "http://localhost:3000"}}
+	h.InvitePreview(rr, httptest.NewRequest("GET", "/api/invites/preview?token=abc123", nil))
 
-	h.AcceptInvite(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 for a valid invite, got %d (%s)", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `"workspace_name":"WS"`) ||
+		!strings.Contains(body, `"email":"test@example.com"`) ||
+		!strings.Contains(body, `"role":"viewer"`) {
+		t.Errorf("expected workspace name, email, and role, got %s", body)
+	}
+	if strings.Contains(strings.ToLower(body), "account") || strings.Contains(body, "exists") {
+		t.Errorf("preview must not leak account existence, got %s", body)
+	}
+
+	unknown := &wsMockQuery{}
+	rr2 := httptest.NewRecorder()
+	h2 := &api.WorkspaceHandler{Queries: unknown, Cfg: &config.Config{AppBaseURL: "http://localhost:3000"}}
+	h2.InvitePreview(rr2, httptest.NewRequest("GET", "/api/invites/preview?token=nope", nil))
+	if rr2.Code != http.StatusGone {
+		t.Fatalf("expected generic 410 for an unknown token, got %d (%s)", rr2.Code, rr2.Body.String())
+	}
+}
+
+func TestAcceptInviteJSON_SeatLimit(t *testing.T) {
+	// Studio plan (5 seats), 5 members -> at cap: accept rejected, invite
+	// left unconsumed.
+	q := &wsMockQuery{createdInvite: makeValidInvite(), ownerPlan: "studio", memberCount: 5}
+	rr := acceptInviteJSON(q, "abc123", "user-1")
 
 	if rr.Code != http.StatusConflict {
 		t.Fatalf("expected 409, got %d (%s)", rr.Code, rr.Body.String())
@@ -667,6 +787,9 @@ func TestWorkspaceHandler_AcceptInvite_SeatLimit(t *testing.T) {
 	}
 	if q.addedMember {
 		t.Error("must not add a member when at the seat cap")
+	}
+	if q.consumed {
+		t.Error("must not consume the invite when at the seat cap")
 	}
 }
 
@@ -784,22 +907,16 @@ func TestWorkspaceHandler_OverCapLegacy_ExistingMembersUnaffected(t *testing.T) 
 	}
 }
 
-func TestWorkspaceHandler_OverCapLegacy_EnforcementLogsAndBlocks(t *testing.T) {
+func TestAcceptInviteJSON_OverCapLegacyLogsAndBlocks(t *testing.T) {
 	// Over-cap legacy workspace: invite accept stays blocked (at/over cap)
-	// and a warning is logged; no member is added.
+	// and a warning is logged; no member is added and the invite is kept.
 	q := &wsMockQuery{createdInvite: makeValidInvite(), ownerPlan: "free", memberCount: 3}
-	h := &api.WorkspaceHandler{Queries: q, Cfg: &config.Config{AppBaseURL: "http://localhost:3000"}}
 
 	var buf bytes.Buffer
 	log.SetOutput(&buf)
 	defer log.SetOutput(os.Stderr)
 
-	req := httptest.NewRequest("GET", "/invites/accept?token=abc123", nil)
-	ctx := context.WithValue(req.Context(), api.UserIDKey, "user-1")
-	req = req.WithContext(ctx)
-	rr := httptest.NewRecorder()
-
-	h.AcceptInvite(rr, req)
+	rr := acceptInviteJSON(q, "abc123", "user-1")
 	log.SetOutput(os.Stderr)
 
 	if rr.Code != http.StatusConflict {
@@ -808,8 +925,8 @@ func TestWorkspaceHandler_OverCapLegacy_EnforcementLogsAndBlocks(t *testing.T) {
 	if !strings.Contains(rr.Body.String(), "seat limit reached") {
 		t.Errorf("expected seat-limit message, got %s", rr.Body.String())
 	}
-	if q.addedMember {
-		t.Error("must not add a member to an over-cap workspace")
+	if q.addedMember || q.consumed {
+		t.Error("must not add a member to an over-cap workspace or consume the invite")
 	}
 	if !strings.Contains(buf.String(), "over seat capacity") {
 		t.Errorf("expected over-cap warning log, got %q", buf.String())
@@ -886,9 +1003,73 @@ func TestWorkspaceHandler_GrantChannel_TrackedSucceeds(t *testing.T) {
 	}
 }
 
-// --- AcceptInvite atomic seat admission ---
+// --- Invite preview rate limiting + verified-email gate ---
 
-func TestWorkspaceHandler_AcceptInvite_ConcurrentSeatLimit(t *testing.T) {
+func TestInvitePreview_RateLimited(t *testing.T) {
+	q := &wsMockQuery{createdInvite: makeValidInvite()}
+	h := &api.WorkspaceHandler{Queries: q, Cfg: &config.Config{AppBaseURL: "http://localhost:3000"}}
+	cfg := *config.Default
+	cfg.RateLimitUnauthMaxPerMin = 2
+
+	r := chi.NewRouter()
+	r.Group(func(r chi.Router) {
+		r.Use(api.AuthRateLimitMiddleware(q, &cfg))
+		r.Get("/api/invites/preview", h.InvitePreview)
+	})
+
+	call := func() int {
+		req := httptest.NewRequest("GET", "/api/invites/preview?token=abc123", nil)
+		req.RemoteAddr = "203.0.113.7:1234"
+		rr := httptest.NewRecorder()
+		r.ServeHTTP(rr, req)
+		return rr.Code
+	}
+
+	if code := call(); code != http.StatusOK {
+		t.Fatalf("call 1: expected 200, got %d", code)
+	}
+	if code := call(); code != http.StatusOK {
+		t.Fatalf("call 2: expected 200, got %d", code)
+	}
+	if code := call(); code != http.StatusTooManyRequests {
+		t.Fatalf("call 3: expected 429, got %d", code)
+	}
+}
+
+func TestAcceptInviteJSON_UnverifiedRejected(t *testing.T) {
+	// wsMockQuery.GetUserByID returns a user with no EmailVerifiedAt, so the
+	// verified-email guard must reject before the handler ever runs.
+	q := &wsMockQuery{createdInvite: makeValidInvite()}
+	h := &api.WorkspaceHandler{Queries: q, Cfg: &config.Config{AppBaseURL: "http://localhost:3000"}}
+
+	r := chi.NewRouter()
+	r.Route("/api", func(r chi.Router) {
+		r.Use(func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				ctx := context.WithValue(req.Context(), api.UserIDKey, "user-1")
+				next.ServeHTTP(w, req.WithContext(ctx))
+			})
+		})
+		r.Use(api.RequireVerifiedEmail(q))
+		r.Post("/invites/accept", h.AcceptInviteJSON)
+	})
+
+	req := httptest.NewRequest("POST", "/api/invites/accept", bytes.NewBufferString(`{"token":"abc123"}`))
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 before acceptance, got %d (%s)", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "email_not_verified") {
+		t.Errorf("expected email_not_verified code, got %s", rr.Body.String())
+	}
+	if q.addedMember || q.consumed {
+		t.Error("unverified session must not accept the invite")
+	}
+}
+
+func TestAcceptInviteJSON_ConcurrentSeatLimit(t *testing.T) {
 	// Studio plan (5 seats), 4 members, two valid invites accepted at the
 	// same time: exactly one may consume the last seat; the other gets 409.
 	// The atomic guarded insert is the authority, so the cap is never
@@ -898,7 +1079,6 @@ func TestWorkspaceHandler_AcceptInvite_ConcurrentSeatLimit(t *testing.T) {
 		ownerPlan:     "studio",
 		memberCount:   4,
 	}
-	h := &api.WorkspaceHandler{Queries: q, Cfg: &config.Config{AppBaseURL: "http://localhost:3000"}}
 
 	type result struct {
 		code int
@@ -910,21 +1090,18 @@ func TestWorkspaceHandler_AcceptInvite_ConcurrentSeatLimit(t *testing.T) {
 		wg.Add(1)
 		go func(uid string) {
 			defer wg.Done()
-			req := httptest.NewRequest("GET", "/invites/accept?token=tok-"+uid, nil)
-			req = req.WithContext(context.WithValue(req.Context(), api.UserIDKey, uid))
-			rr := httptest.NewRecorder()
-			h.AcceptInvite(rr, req)
+			rr := acceptInviteJSON(q, "tok-"+uid, uid)
 			results <- result{code: rr.Code, body: rr.Body.String()}
 		}(uid)
 	}
 	wg.Wait()
 	close(results)
 
-	var redirects, conflicts int
+	var oks, conflicts int
 	for r := range results {
 		switch r.code {
-		case http.StatusFound:
-			redirects++
+		case http.StatusOK:
+			oks++
 		case http.StatusConflict:
 			conflicts++
 			if !strings.Contains(r.body, "seat limit reached") {
@@ -934,8 +1111,8 @@ func TestWorkspaceHandler_AcceptInvite_ConcurrentSeatLimit(t *testing.T) {
 			t.Errorf("unexpected status %d (%s)", r.code, r.body)
 		}
 	}
-	if redirects != 1 || conflicts != 1 {
-		t.Fatalf("expected exactly one 302 and one 409, got %d redirects and %d conflicts", redirects, conflicts)
+	if oks != 1 || conflicts != 1 {
+		t.Fatalf("expected exactly one 200 and one 409, got %d OKs and %d conflicts", oks, conflicts)
 	}
 
 	q.mu.Lock()

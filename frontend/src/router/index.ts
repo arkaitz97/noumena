@@ -53,6 +53,12 @@ const router = createRouter({
       component: () => import('../views/auth/OAuthCallbackView.vue'),
     },
     {
+      path: '/invite',
+      name: 'invite',
+      meta: { title: 'Accept invite' },
+      component: () => import('../views/auth/AcceptInviteView.vue'),
+    },
+    {
       path: '/dashboard',
       component: () => import('../views/dashboard/DashboardLayout.vue'),
       meta: { requiresAuth: true, requiresVerified: true, requiresOnboarded: true },
@@ -147,6 +153,21 @@ router.afterEach((to) => {
   if (typeof document === 'undefined') return
   const title = to.meta.title as string | undefined
   document.title = title ? `${title} · Noumena` : 'Noumena'
+
+  // Strip the invite token from outbound Referer headers while the invite
+  // route (or its login handoff) is on screen.
+  const existing = document.head.querySelector('meta[name="referrer"]')
+  if (to.name === 'invite') {
+    if (!existing) {
+      const meta = document.createElement('meta')
+      meta.setAttribute('name', 'referrer')
+      meta.setAttribute('content', 'no-referrer')
+      meta.setAttribute('data-invite-referrer', '')
+      document.head.appendChild(meta)
+    }
+  } else if (existing && existing.getAttribute('data-invite-referrer') !== null) {
+    existing.remove()
+  }
 })
 
 export default router

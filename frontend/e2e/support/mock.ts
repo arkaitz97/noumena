@@ -214,6 +214,27 @@ function handleApi(route: Route, state: MockState): boolean {
     ])
   }
 
+  // ---- invites -------------------------------------------------------------
+  // Token contract: `valid` → success, `seatfull` → 409 seat cap, anything
+  // else → the generic 410 the backend returns for unknown/expired/consumed.
+  if (path === '/api/invites/preview') {
+    const token = query.get('token')
+    if (token === 'valid' || token === 'seatfull') {
+      return respond(route, 200, { workspace_name: 'Studio', email: 'invitee@example.com', role: 'viewer' })
+    }
+    return respond(route, 410, { error: 'invite expired or already used' })
+  }
+  if (method === 'POST' && path === '/api/invites/accept') {
+    const token = String(bodyOf(route)?.token ?? '')
+    if (token === 'valid') {
+      return respond(route, 200, { workspace_id: 'ws-1', workspace_name: 'Studio', role: 'viewer' })
+    }
+    if (token === 'seatfull') {
+      return respond(route, 409, { error: 'seat limit reached, upgrade your plan' })
+    }
+    return respond(route, 410, { error: 'invite expired or already used' })
+  }
+
   // ---- channels ------------------------------------------------------------
   if (path === '/api/channels') {
     if (method === 'GET') return respond(route, 200, state.channels)

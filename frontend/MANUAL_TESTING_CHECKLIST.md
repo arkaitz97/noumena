@@ -96,3 +96,35 @@
 - [ ] Verify the onboarding flow works end-to-end with the new 10s polling interval
 - [ ] Verify no console errors appear during any of the above tests
 - [ ] Verify all new components are responsive on mobile viewports
+
+## 14. Workspace invite acceptance (fix-workspace-invite-acceptance)
+
+### 14.1 Invite link opens the SPA (existing user)
+
+- [ ] As an Admin, invite an email that already has an account
+- [ ] Open the link from the invite email — verify it lands on `/invite?token=…` and the token disappears from the address bar
+- [ ] Verify the invitee is sent to `/login` with `next=/invite?token=…`
+- [ ] Sign in as the invited account — verify acceptance completes and lands on the workspace dashboard
+- [ ] Verify the workspace switcher lists the joined workspace and it is active
+
+### 14.2 Invite link (new user)
+
+- [ ] As an Admin, invite a brand-new email
+- [ ] Open the invite link — verify the handoff to signup/login preserves the pending token
+- [ ] Register, then complete email verification — verify the flow resumes at `/invite` and joins the workspace
+- [ ] Verify the pending token is gone from `sessionStorage` after success
+
+### 14.3 Error states
+
+- [ ] Sign in with a *different* account, open the invite link — verify 403 messaging offers "Switch account" and the pending token is kept
+- [ ] Invite with the workspace at its plan seat cap, then accept — verify the "No free seats" message and that the token is cleared
+- [ ] Open an expired/already-used/unknown token — verify "Invite expired or already used" and that the token is cleared
+
+### 14.4 Legacy link compatibility
+
+- [ ] Open an older `/invites/accept?token=…` link — verify it 302-redirects to `/invite?token=…` and performs no membership change
+
+### 14.5 Security
+
+- [ ] Verify the `/invite` route sends `Referrer-Policy: no-referrer` (no token in outbound `Referer`)
+- [ ] Verify `GET /api/invites/preview?token=…` returns only `{workspace_name, email, role}` or a generic 410 (no account-existence signal)
