@@ -29,7 +29,7 @@
 
 ## 5. Validation
 
-- [ ] 5.1 Verify default activation does not change job/dedupe logs (no `batch_deduped` spike) on a multi-channel backlog
+- [x] 5.1 Verify default activation does not change job/dedupe logs (no `batch_deduped` spike) on a multi-channel backlog
 - [x] 5.2 Confirm `LLM_MAX_CONCURRENCY=1` reproduces current behavior and is the documented rollback
 - [x] 5.3 Note failover interaction: confirm the error threshold does not spuriously flip under concurrent load (or file a follow-up)
 
