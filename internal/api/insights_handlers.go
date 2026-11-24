@@ -449,7 +449,9 @@ func (h *InsightsHandler) buildAggregate(ctx context.Context, userID string, cha
 
 func aggregateFilters(channelID *string, days int) db.FeedFilters {
 	f := db.FeedFilters{Categories: db.HighSignalCategories, CategoriesSpecified: true, DateFrom: ptrTime(windowStart(days))}
-	if channelID != nil { f.Channels = []string{*channelID} }
+	if channelID != nil {
+		f.Channels = []string{*channelID}
+	}
 	return f
 }
 

@@ -453,7 +453,9 @@ func TestYouTubeClient_ChannelRowsWithoutVideoAreExcluded(t *testing.T) {
 func TestYouTubeClient_InlineReplyPreservesActualParent(t *testing.T) {
 	items := []commentThreadItem{{
 		Snippet: commentThreadSnippet{TopLevelComment: ytComment{ID: "top", Snippet: commentSnippet{PublishedAt: "2025-01-01T10:00:00Z", VideoID: "v1"}}},
-		Replies: &struct{ Comments []ytComment `json:"comments"` }{Comments: []ytComment{{
+		Replies: &struct {
+			Comments []ytComment `json:"comments"`
+		}{Comments: []ytComment{{
 			ID: "nested", Snippet: commentSnippet{ParentID: "reply-parent", PublishedAt: "2025-01-01T11:00:00Z", VideoID: "v1"},
 		}}},
 	}}
