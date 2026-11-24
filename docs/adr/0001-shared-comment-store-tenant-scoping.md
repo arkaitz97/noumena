@@ -50,8 +50,8 @@ OR EXISTS (grant row joined to a workspace membership for the user)
 
 `BuildFeedQuery` emits it unconditionally for `ModeFeed`, `ModeSaved`,
 `ModeCount`, and `ModeStream`. `WorkspaceMiddleware` and
-`RequireWorkspaceRole` guard write routes and reject non-members with 403
-(`internal/api/workspace_middleware.go`).
+`RequireWorkspaceRole` guard workspace-scoped routes and reject non-members
+with 403 (`internal/api/workspace_middleware.go`).
 
 Billing and quota stay on `users`. A workspace is a sharing overlay; seat
 limits come from the owner's plan.
