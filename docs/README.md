@@ -8,6 +8,16 @@ For source-of-truth requirements, see
 [`../specs/`](../specs/). For the developer onboarding entry point,
 see the root [`../README.md`](../README.md).
 
+## Engineering docs
+
+- [`design.md`](design.md) — context, design, alternatives, and cross-cutting
+  concerns.
+- [`architecture.md`](architecture.md) — C4 container view and the comment
+  read-path component zoom.
+- [`drivers.md`](drivers.md) — quality drivers, scenarios, and the CI job that
+  enforces each one.
+- [`adr/`](adr/) — architecture decision records.
+
 ## API reference
 
 HTTP-level reference for each capability surface. Each page links
@@ -90,3 +100,5 @@ Plain-English explanations suitable for customer-facing surfaces.
 - Capability specs under [`../specs/`](../specs/) are the source of
   truth for behaviour; documentation here is a navigation layer
   over them.
+- Older pages cite `openspec/` change proposals. That planning tree is not
+  published; the citation records where a decision came from, not a live link.
