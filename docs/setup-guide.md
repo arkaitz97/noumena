@@ -18,7 +18,7 @@ Manual steps required to configure Noumena for development or production.
 
 ## 1. Prerequisites
 
-- Go 1.25+
+- Go 1.26+
 - Node.js 20+
 - A domain name (production only)
 - HTTPS certificate / reverse proxy (production only; Coolify handles this)

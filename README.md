@@ -27,7 +27,7 @@ Personal project, in active development. Not a hosted service.
 
 | Layer | Choice |
 |---|---|
-| Backend | Go 1.25, chi router, SQLite |
+| Backend | Go 1.26, chi router, SQLite |
 | Frontend | Vue 3, Vite, TypeScript |
 | Auth | JWT access/refresh, Google SSO, AES-GCM encrypted provider tokens |
 | Billing | Stripe subscriptions + metered overage |

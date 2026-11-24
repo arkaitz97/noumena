@@ -4,7 +4,7 @@ Getting a new operator/developer productive on Noumena.
 
 ## Prerequisites
 
-- Go 1.25+, Node 20+ (frontend), `sqlite3` CLI (backups).
+- Go 1.26+, Node 20+ (frontend), `sqlite3` CLI (backups).
 - A copy of `.env.example` → `.env`, filled in per
   [`../../setup-guide.md`](../../setup-guide.md).
 
