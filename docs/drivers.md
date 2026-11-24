@@ -89,12 +89,19 @@ scenario says `Gap`.
 
 ## CI mapping
 
-| CI job | Scenario enforced |
+Every scenario names the job that fails if it regresses.
+
+| Scenario | Enforced by |
 |---|---|
-| `fitness-tenant-isolation` | S-2 cross-tenant read isolation |
-| `fitness-webhook-idempotency` | S-3 webhook replay |
-| `go` (`go test ./...`) | S-4 erasure, S-6 ingestion replay, S-1 failover |
-| `frontend` | Dashboard rendering and unit contracts |
+| S-1 provider failover | `go` job: `go test ./...` runs `TestFailover_*` |
+| S-2 cross-tenant read isolation | `fitness-tenant-isolation` job |
+| S-3 webhook replay | `fitness-webhook-idempotency` job |
+| S-4 account erasure | `go` job: `go test ./...` runs the GDPR db tests |
+| S-5 feed latency | none. `Gap`: the timeout and page cap exist, but no load test asserts p95 |
+| S-6 ingestion replay | none. `Gap`: schema and transaction invariant only |
+
+The `frontend` job enforces dashboard rendering and unit contracts. It does
+not map to a quality scenario in this sheet.
 
 ## Open gaps
 

@@ -66,6 +66,17 @@ the system of record; there is no Redis, broker, or second database.
 - [docs/adr/](docs/adr/) — five decision records, including tenant scoping,
   webhook idempotency, and the SQLite choice.
 
+## Documentation
+
+Design and decision records:
+
+- [docs/design.md](docs/design.md) — context, design, alternatives, and
+  cross-cutting concerns.
+- [docs/adr/](docs/adr/) — five architecture decision records.
+- [docs/architecture.md](docs/architecture.md) — C4 container view and the
+  comment read-path component zoom.
+- [SECURITY.md](SECURITY.md) — private vulnerability reporting.
+
 ## Run it
 
 ```sh
