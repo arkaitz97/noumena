@@ -54,6 +54,44 @@ jobs:
         working-directory: frontend
         run: npm run build
 
+  fitness-tenant-isolation:
+    name: Fitness - cross-tenant comment isolation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+
+      - name: Cross-tenant read isolation
+        run: |
+          go test ./internal/db/ ./internal/api/ -v \
+            -run 'TestGrantChannel_|TestBulkStar_ForeignDenied|TestSentiment_AccessControlIsolation'
+
+  fitness-webhook-idempotency:
+    name: Fitness - Stripe webhook replay idempotency
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+
+      - name: Duplicate Stripe event applies no side effect
+        run: |
+          go test ./internal/api/ -v \
+            -run 'TestStripeWebhookDuplicateShortCircuits'
+
   audit:
     name: Dependency audit (npm + Go)
     runs-on: ubuntu-latest
