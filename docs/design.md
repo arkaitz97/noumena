@@ -243,7 +243,9 @@ user in a separate transaction.
 
 - SQLite serializes writes. One long export read uses a separate read-only
   handle to avoid holding the main connection, but a write burst still queues.
-- The deletion default is 720 hours in code while `.env.example` documents 48.
+- The deletion default is 720 hours (30 days). `.env.example` and the
+  account-deletion runbooks state the same value, and
+  `TestLoadDeletionReversibleHoursDefault` guards it.
   The code wins; the example is wrong.
 - The feed latency budget (S-5) is enforced by a timeout, not measured by a
   load test.

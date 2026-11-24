@@ -70,9 +70,6 @@ A failed job is not retried automatically; it stays visible for an operator.
 
 #### Bad
 
-- The default window (30 days) disagrees with `.env.example`, which documents
-  48 hours. Operators following the example get a shorter window than the code
-  intends. The code is authoritative; the example is wrong.
 - The wipe is split across two transactions. A crash between the GDPR wipe and
   the hard delete leaves a user row without related data and the job stuck in
   `deleting`. `ClaimNextDeletionJob` only claims `pending` jobs, so recovery is
@@ -102,3 +99,10 @@ A failed job is not retried automatically; it stays visible for an operator.
 - `internal/db/lifecycle.go`
 - `docs/ops/runbooks/account-deletion-and-gdpr.md`
 - `docs/design.md` section 3.6
+
+Resolution (2026-11-24): 720 hours (30 days) is authoritative. The config
+default, `docs/api/user.md`, `docs/api/billing.md`, and the README already said
+30 days. `.env.example` and the two account-deletion runbooks were corrected
+from 48 hours. The 30-day figures in `docs/compliance/` govern YouTube raw-data
+retention, not the account-deletion grace window. `TestLoadDeletionReversibleHoursDefault`
+asserts the default.

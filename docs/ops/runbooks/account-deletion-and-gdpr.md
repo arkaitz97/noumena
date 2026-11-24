@@ -17,7 +17,7 @@ Support workflow for account deletion requests and GDPR data export.
 ## Recovery
 
 Deletion is **not** a hard delete on request. It is reversible within
-`DELETION_REVERSIBLE_HOURS` (default 48h) while the job is still
+`DELETION_REVERSIBLE_HOURS` (default 720 h, 30 days) while the job is still
 `pending`. To reverse:
 
 ```sh

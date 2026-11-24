@@ -417,6 +417,32 @@ func TestLoadHTTPHardeningDefaults(t *testing.T) {
 	}
 }
 
+// TestLoadDeletionReversibleHoursDefault guards the account-deletion grace
+// window. 720 hours (30 days) is the product policy, stated in
+// docs/api/user.md, docs/api/billing.md, the README, .env.example, and the
+// account-deletion runbooks. The value can be overridden per deployment.
+func TestLoadDeletionReversibleHoursDefault(t *testing.T) {
+	_ = os.Unsetenv("DELETION_REVERSIBLE_HOURS")
+	setValidJWTSecret(t)
+
+	c, err := Load(false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.DeletionReversibleHours != 720 {
+		t.Errorf("DeletionReversibleHours default: want 720 (30 days), got %d", c.DeletionReversibleHours)
+	}
+
+	t.Setenv("DELETION_REVERSIBLE_HOURS", "48")
+	c2, err := Load(false)
+	if err != nil {
+		t.Fatalf("Load (override): %v", err)
+	}
+	if c2.DeletionReversibleHours != 48 {
+		t.Errorf("DeletionReversibleHours override: want 48, got %d", c2.DeletionReversibleHours)
+	}
+}
+
 // TestLoadSignedURLSecretRequirement asserts that the signed-URL signing
 // secret is mandatory whenever the signed-URL endpoints can be reached, i.e.
 // when either the lifecycle workers or the account lifecycle API is enabled.
