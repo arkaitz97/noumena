@@ -1,1 +1,0 @@
-/home/arkaitz/Documents/world_kb/agents/andrew-kelley.md

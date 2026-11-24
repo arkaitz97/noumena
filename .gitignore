@@ -47,9 +47,15 @@ test-results/
 .opencode/bun.lock
 
 # Agent/tool local configs
+.agent/
 .claude/
 .codex/
 .cursor/
+.gemini/
+.opencode/
+openspec/
+AGENTS.md
+CLAUDE.md
 
 # OS and editor files
 .DS_Store
