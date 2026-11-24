@@ -34,6 +34,10 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 3
+    # A major base image change needs its own change with a passing suite.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
       docker-minor-and-patch:
         patterns: ["*"]
