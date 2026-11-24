@@ -1,5 +1,8 @@
 # Noumena
 
+[![integration](https://github.com/arkaitz97/noumena/actions/workflows/integration.yml/badge.svg)](https://github.com/arkaitz97/noumena/actions/workflows/integration.yml)
+[![security](https://github.com/arkaitz97/noumena/actions/workflows/security.yml/badge.svg)](https://github.com/arkaitz97/noumena/actions/workflows/security.yml)
+
 Growth intelligence for content creators. Noumena ingests the comment stream
 from a creator's connected channels, classifies it with LLMs, and returns
 structured insight — recurring questions, audience pain points, content gaps,
@@ -24,7 +27,7 @@ Personal project, in active development. Not a hosted service.
 
 | Layer | Choice |
 |---|---|
-| Backend | Go 1.25, standard library HTTP, SQLite |
+| Backend | Go 1.25, chi router, SQLite |
 | Frontend | Vue 3, Vite, TypeScript |
 | Auth | JWT access/refresh, Google SSO, AES-GCM encrypted provider tokens |
 | Billing | Stripe subscriptions + metered overage |
@@ -46,10 +49,22 @@ internal/db        schema, migrations, queries
 internal/dbtest    database test harness
 internal/telemetry logs, metrics, tracing hooks
 tools              operational CLIs (seeding, deletion reversal)
-openspec           specifications and change proposals
 ```
 
-Design notes and product requirements live in `PRD.md` and `openspec/`.
+## Architecture
+
+One Go binary serves the HTTP API and runs the background workers (scheduler,
+ingestion, LLM processor, digests, exports, lifecycle). SQLite in WAL mode is
+the system of record; there is no Redis, broker, or second database.
+
+- [docs/design.md](docs/design.md) — context, design, alternatives, and
+  cross-cutting concerns.
+- [docs/architecture.md](docs/architecture.md) — C4 container view and the
+  comment read-path component zoom.
+- [docs/drivers.md](docs/drivers.md) — quality drivers and the scenarios CI
+  enforces.
+- [docs/adr/](docs/adr/) — five decision records, including tenant scoping,
+  webhook idempotency, and the SQLite choice.
 
 ## Run it
 
@@ -70,6 +85,22 @@ make fmt-check          # gofmt gate
 ```
 
 88 test files cover ingestion, classification, billing, auth and lifecycle.
+The suite uses an in-memory SQLite database and needs no external services.
+
+CI runs `gofmt`, `go vet`, the Go suite, the frontend unit suite, a dependency
+audit, a full-history secret scan, and two named fitness jobs:
+`fitness-tenant-isolation` and `fitness-webhook-idempotency`.
+
+## Deploy
+
+See [docs/deploy-coolify.md](docs/deploy-coolify.md) and the operational
+runbooks under [docs/ops/runbooks/](docs/ops/runbooks/). The deployment is a
+single process with one SQLite file and one export volume. Running more than
+one writer is unsupported.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
 
 ## Notes
 
