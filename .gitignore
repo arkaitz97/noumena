@@ -58,3 +58,6 @@ Thumbs.db
 *.swp
 *.swo
 *~
+# compiled CLI binaries
+/backfill_stripe_subscription_id
+/cancel_deletion
